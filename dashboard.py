@@ -138,7 +138,7 @@ except ImportError:
     metrics_service_pb2 = None
     trace_service_pb2 = None
 
-__version__ = "0.12.162"
+__version__ = "0.12.163"
 
 # Extensions (Phase 2) — load plugins at import time; safe no-op if package not installed
 try:
@@ -1298,6 +1298,21 @@ def _budget_monitor_loop():
                     if avg_hourly > 0 and hour_cost > avg_hourly * threshold:
                         msg = f"Spending spike: ${hour_cost:.2f} in last hour ({(hour_cost / avg_hourly):.1f}x average)"
                         fired = True
+                elif rtype == "token_spike":
+                    try:
+                        vel = _compute_velocity_status()
+                    except Exception:
+                        vel = None
+                    if vel:
+                        tokens_per_min = vel.get("tokensIn2Min", 0) / 2.0
+                        if tokens_per_min >= threshold:
+                            sid = vel.get("triggeringSession") or ""
+                            sid_hint = f" (session: {sid[:12]}...)" if sid else ""
+                            msg = (
+                                f"Token spike: {int(tokens_per_min):,} tokens/min "
+                                f"(threshold: {int(threshold):,}/min){sid_hint}"
+                            )
+                            fired = True
 
                 if fired:
                     _budget_alert_cooldowns[rule_id] = now
@@ -3372,6 +3387,7 @@ function clawmetryLogout(){
           <select id="alert-type" style="padding:8px;border:1px solid var(--border-primary);border-radius:6px;background:var(--bg-tertiary);color:var(--text-primary);">
             <option value="threshold">Threshold (daily $ amount)</option>
             <option value="spike">Spike (hourly rate multiplier)</option>
+            <option value="token_spike">Token spike (tokens/min)</option>
           </select>
           <input id="alert-threshold" type="number" step="0.01" min="0" placeholder="Threshold value" style="padding:8px;border:1px solid var(--border-primary);border-radius:6px;background:var(--bg-tertiary);color:var(--text-primary);">
           <div style="display:flex;gap:8px;flex-wrap:wrap;">
@@ -4742,7 +4758,7 @@ async function loadAlertRules() {
       try { channels = JSON.parse(r.channels); } catch(e) { channels = [r.channels]; }
       html += '<div style="padding:10px;border-bottom:1px solid var(--border-secondary);display:flex;align-items:center;gap:8px;">';
       html += '<span style="font-weight:600;">' + escHtml(r.type) + '</span>';
-      html += '<span style="color:var(--text-accent);">' + (r.type==='spike' ? r.threshold+'x' : '$'+r.threshold) + '</span>';
+      html += '<span style="color:var(--text-accent);">' + (r.type==='spike' ? r.threshold+'x' : (r.type==='token_spike' ? r.threshold.toLocaleString()+' tok/min' : '$'+r.threshold)) + '</span>';
       html += '<span style="color:var(--text-muted);font-size:11px;">' + channels.join(', ') + '</span>';
       html += '<span style="color:var(--text-muted);font-size:11px;">' + r.cooldown_min + 'min cooldown</span>';
       html += '<span style="margin-left:auto;cursor:pointer;color:var(--text-error);font-size:16px;" data-rule-id="'+r.id+'" onclick="deleteAlertRule(this.dataset.ruleId)" title="Delete">&#x1f5d1;</span>';
@@ -7706,6 +7722,21 @@ def _budget_monitor_loop():
                     if avg_hourly > 0 and hour_cost > avg_hourly * threshold:
                         msg = f"Spending spike: ${hour_cost:.2f} in last hour ({(hour_cost / avg_hourly):.1f}x average)"
                         fired = True
+                elif rtype == "token_spike":
+                    try:
+                        vel = _compute_velocity_status()
+                    except Exception:
+                        vel = None
+                    if vel:
+                        tokens_per_min = vel.get("tokensIn2Min", 0) / 2.0
+                        if tokens_per_min >= threshold:
+                            sid = vel.get("triggeringSession") or ""
+                            sid_hint = f" (session: {sid[:12]}...)" if sid else ""
+                            msg = (
+                                f"Token spike: {int(tokens_per_min):,} tokens/min "
+                                f"(threshold: {int(threshold):,}/min){sid_hint}"
+                            )
+                            fired = True
 
                 if fired:
                     _budget_alert_cooldowns[rule_id] = now
@@ -9008,7 +9039,7 @@ def _auto_discover_gateway(token):
                         "instanceId": "clawmetry-discover",
                     },
                     "role": "operator",
-                    "scopes": ["operator.admin"],
+                    "scopes": ["operator.admin", "operator.read"],
                     "auth": {"token": token},
                 },
             }
