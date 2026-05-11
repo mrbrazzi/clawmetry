@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 ClawMetry - See your agent think 🦞
 
@@ -112,6 +111,7 @@ from routes.autonomy import bp_autonomy
 from routes.selfconfig import bp_selfconfig
 from routes.reasoning import bp_reasoning
 from routes.plugins import bp_plugins
+from routes.agents import bp_agents
 from routes.local_query import bp_local_query
 from helpers.openapi import bp_openapi
 
@@ -8493,7 +8493,14 @@ def detect_config(args=None):
     app.register_blueprint(bp_selfconfig)
     app.register_blueprint(bp_reasoning)
     app.register_blueprint(bp_plugins)
+    app.register_blueprint(bp_agents)
     app.register_blueprint(bp_local_query)
+
+    # Register built-in agent adapters. External plugins can register more
+    # via clawmetry.extensions entry points — see clawmetry/adapters/.
+    from clawmetry.adapters import registry as _adapter_registry
+    from clawmetry.adapters.openclaw import OpenClawAdapter
+    _adapter_registry.register(OpenClawAdapter())
     app.register_blueprint(bp_openapi)
 
     # Local-OSS shims for cloud-only endpoints. Return empty arrays so the
