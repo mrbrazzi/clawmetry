@@ -5,6 +5,41 @@ import sys
 import os
 from pathlib import Path
 
+
+def _post_json(url, body, timeout=15):
+    """POST JSON and return (result_dict, status).
+
+    On 2xx: returns (parsed_json, 200).
+    On HTTPError: returns ({"error": msg, "retry_after": int|None}, status_code).
+    On other errors: returns ({"error": str(e)}, 0).
+    """
+    import urllib.request
+    import urllib.error
+    import json as _json
+
+    data = _json.dumps(body).encode()
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return _json.loads(resp.read()), 200
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode()
+        try:
+            payload = _json.loads(raw)
+        except Exception:
+            payload = {}
+        return (
+            {
+                "error": payload.get("error") or raw[:200],
+                "retry_after": payload.get("retry_after"),
+            },
+            e.code,
+        )
+    except Exception as e:
+        return {"error": str(e)}, 0
+
 # Auto-activate HTTP interceptor when CLAWMETRY_INTERCEPT=1
 if os.environ.get("CLAWMETRY_INTERCEPT") == "1":
     try:
@@ -251,18 +286,10 @@ def _get_api_key_interactive() -> str:
     INGEST_URL = os.environ.get("CLAWMETRY_INGEST_URL", "https://ingest.clawmetry.com")
 
     def _api_call(path, body):
-        url = INGEST_URL.rstrip("/") + path
-        data = _json.dumps(body).encode()
-        req = urllib.request.Request(
-            url, data=data, headers={"Content-Type": "application/json"}, method="POST"
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return _json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            return {"error": e.read().decode()[:200]}
-        except Exception as e:
-            return {"error": str(e)}
+        result, status = _post_json(INGEST_URL.rstrip("/") + path, body)
+        if isinstance(result, dict) and status and status >= 400:
+            result["_status"] = status
+        return result
 
     print()
     entry = _input("  📧 Enter your email: ").strip()
@@ -281,6 +308,23 @@ def _get_api_key_interactive() -> str:
     email = entry.lower()
     print(f"\n  📨 Sending code to {email}…", end="", flush=True)
     r = _api_call("/api/auth/email-otp", {"action": "send", "email": email})
+    if r.get("_status") == 503:
+        import time as _time
+
+        retry_after = r.get("retry_after") or 5
+        try:
+            retry_after = max(1, min(int(retry_after), 30))
+        except (TypeError, ValueError):
+            retry_after = 5
+        print(f"\n  ⏳ Server's busy — retrying in {retry_after}s…", flush=True)
+        _time.sleep(retry_after)
+        print(f"  📨 Sending code to {email}…", end="", flush=True)
+        r = _api_call("/api/auth/email-otp", {"action": "send", "email": email})
+        if r.get("_status") == 503:
+            print(" ❌")
+            print("\n  Couldn't reach our servers right now.")
+            print("  Please try `clawmetry connect` again in a minute.\n")
+            sys.exit(1)
     if r.get("error"):
         print(f" ❌  {r['error']}")
         print("  Visit https://clawmetry.com/connect to get your API key.")
@@ -342,23 +386,32 @@ def _verify_key_ownership(api_key: str) -> None:
     INGEST_URL = os.environ.get("CLAWMETRY_INGEST_URL", "https://ingest.clawmetry.com")
 
     def _api(path, body):
-        url = INGEST_URL.rstrip("/") + path
-        data = _json.dumps(body).encode()
-        req = urllib.request.Request(
-            url, data=data, headers={"Content-Type": "application/json"}, method="POST"
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return _json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            return {"error": e.read().decode()[:200]}
-        except Exception as e:
-            return {"error": str(e)}
+        result, status = _post_json(INGEST_URL.rstrip("/") + path, body)
+        if isinstance(result, dict) and status and status >= 400:
+            result["_status"] = status
+        return result
 
     print()
     print("  🔐 Verify account ownership")
     print("  📨 Sending verification code…", end="", flush=True)
     r = _api("/api/auth/email-otp", {"action": "send_by_key", "api_key": api_key})
+    if r.get("_status") == 503:
+        import time as _time
+
+        retry_after = r.get("retry_after") or 5
+        try:
+            retry_after = max(1, min(int(retry_after), 30))
+        except (TypeError, ValueError):
+            retry_after = 5
+        print(f"\n  ⏳ Server's busy — retrying in {retry_after}s…", flush=True)
+        _time.sleep(retry_after)
+        print("  📨 Sending verification code…", end="", flush=True)
+        r = _api("/api/auth/email-otp", {"action": "send_by_key", "api_key": api_key})
+        if r.get("_status") == 503:
+            print(" ❌")
+            print("\n  Couldn't reach our servers right now.")
+            print("  Please try this command again in a minute.\n")
+            sys.exit(1)
     if r.get("error"):
         print(f" ❌  {r['error']}")
         sys.exit(1)
@@ -1736,18 +1789,10 @@ def _cmd_account(args) -> None:
     INGEST_URL = _os.environ.get("CLAWMETRY_INGEST_URL", "https://ingest.clawmetry.com")
 
     def _api_call(path, body):
-        url = INGEST_URL.rstrip("/") + path
-        data = _json.dumps(body).encode()
-        req = urllib.request.Request(
-            url, data=data, headers={"Content-Type": "application/json"}, method="POST"
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return _json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            return {"error": e.read().decode()[:200]}
-        except Exception as e:
-            return {"error": str(e)}
+        result, status = _post_json(INGEST_URL.rstrip("/") + path, body)
+        if isinstance(result, dict) and status and status >= 400:
+            result["_status"] = status
+        return result
 
     # Show account info
     print()
@@ -1782,6 +1827,21 @@ def _cmd_account(args) -> None:
     # Send OTP
     print(f"\n  Sending verification code to {email_input}...", end="", flush=True)
     r = _api_call("/api/auth/email-otp", {"action": "send", "email": email_input})
+    if r.get("_status") == 503:
+        import time as _time
+
+        retry_after = r.get("retry_after") or 5
+        try:
+            retry_after = max(1, min(int(retry_after), 30))
+        except (TypeError, ValueError):
+            retry_after = 5
+        print(f"\n  {DIM(f'Server busy — retrying in {retry_after}s…')}", flush=True)
+        _time.sleep(retry_after)
+        print(f"  Sending verification code to {email_input}...", end="", flush=True)
+        r = _api_call("/api/auth/email-otp", {"action": "send", "email": email_input})
+        if r.get("_status") == 503:
+            print(f" {DIM('could not reach servers — try again in a minute')}")
+            return
     if r.get("error"):
         print(f" {DIM(r['error'])}")
         return
