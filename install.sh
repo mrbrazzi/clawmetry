@@ -16,6 +16,115 @@ echo -e "  ${BOLD}🦞 ClawMetry${NC}  ${DIM}AI Observability for OpenClaw${NC}"
 echo -e "  $(printf '%.0s─' {1..50})"
 echo ""
 
+# Overall wall-clock so the final "✓ installed" line can show "(Xs total)".
+_T0=$(date +%s)
+
+# ── Spinner helper for silent stages ────────────────────────────────────────
+# Curl-bash users used to stare at "Installing clawmetry from PyPI…" for 5+
+# seconds with no feedback while pip ran. ``_step`` wraps any silent command
+# with a labeled spinner that shows elapsed-vs-expected seconds, surfaces
+# captured stdout+stderr if the command fails, and obeys ``set -e``.
+#
+# Usage: ``_step "Label" <expected_seconds> cmd args...``
+# (Note: no ``--`` separator — args are passed through as-is, so unset
+# variables like an empty $USE_SUDO flatten cleanly via word-splitting at
+# the call site, then ``"$@"`` inside the function preserves quoting.)
+#
+# Non-TTY (CI, logfile redirect): degrades to a plain echo + foreground run.
+_step() {
+  local label="$1"; shift
+  local expected="$1"; shift
+  local logfile
+  logfile=$(mktemp -t clawmetry-step.XXXXXX 2>/dev/null || mktemp)
+
+  # Non-interactive output: plain log line, foreground exec, no spinner.
+  if ! [ -t 1 ]; then
+    echo "  → ${label}..."
+    if "$@" >"$logfile" 2>&1; then
+      rm -f "$logfile"
+      return 0
+    else
+      local _rc=$?
+      echo "  ✗ ${label} (exit ${_rc})" >&2
+      cat "$logfile" >&2
+      rm -f "$logfile"
+      return "$_rc"
+    fi
+  fi
+
+  # Interactive: run the command in the background, redraw a spinner line
+  # every 100ms. Frames cycle through Braille dots; pct climbs toward 95%
+  # using the caller-supplied ``expected`` budget, then we switch to a
+  # neutral "still working…" once we overshoot so we never lie about 99%.
+  local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  local frame_count=${#frames}
+  local i=0
+  local start_ms
+  start_ms=$(date +%s)
+
+  ( "$@" >"$logfile" 2>&1 ) &
+  local pid=$!
+
+  # Spin until the worker exits. ``kill -0`` is the cheap "is it alive?"
+  # probe; busy-loop is fine at 10Hz.
+  while kill -0 "$pid" 2>/dev/null; do
+    local now elapsed pct frame
+    now=$(date +%s)
+    elapsed=$(( now - start_ms ))
+    frame="${frames:$(( i % frame_count )):1}"
+    if [ "$elapsed" -lt "$expected" ]; then
+      # Cap displayed pct at 95 so we never claim 100% before we're done.
+      pct=$(( elapsed * 95 / (expected > 0 ? expected : 1) ))
+      [ "$pct" -gt 95 ] && pct=95
+      printf "\r  → %s %s %ds/~%ds (%d%%)        " "$label" "$frame" "$elapsed" "$expected" "$pct"
+    else
+      printf "\r  → %s %s %ds (still working…)        " "$label" "$frame" "$elapsed"
+    fi
+    i=$(( i + 1 ))
+    sleep 0.1 2>/dev/null || sleep 1  # POSIX sleep fallback
+  done
+
+  # Reap the worker so $? reflects its exit code (set -e wants this clean).
+  if wait "$pid"; then
+    local total
+    total=$(( $(date +%s) - start_ms ))
+    # Pad with spaces to overwrite the longest possible spinner line.
+    printf "\r  ${GREEN}✓${NC} %s ${DIM}(%ds)${NC}%-40s\n" "$label" "$total" ""
+    rm -f "$logfile"
+    return 0
+  else
+    local _rc=$?
+    local total
+    total=$(( $(date +%s) - start_ms ))
+    printf "\r  ${RED}✗${NC} %s ${DIM}(%ds, exit %d)${NC}%-30s\n" "$label" "$total" "$_rc" "" >&2
+    # Surface captured output so users see the actual error, not a vague spinner.
+    cat "$logfile" >&2
+    rm -f "$logfile"
+    return "$_rc"
+  fi
+}
+
+# ── Pre-flight: detect existing daemon ──────────────────────────────────────
+# Re-running ``curl install.sh | bash`` against an already-installed copy used
+# to leave the OLD pip-launched daemon (running stale code) alive next to the
+# fresh venv binary. Both processes raced for the DuckDB write lock and every
+# internal query 500'd with "Conflicting lock is held in <python> (PID …)".
+# The launchctl/systemd restart blocks below only kick OS-managed jobs — they
+# do nothing for daemons that the user started by hand. We track the
+# pre-existing daemon here so the post-install cleanup block (further down)
+# can ``pkill -f`` it after the new code is in place.
+CLAWMETRY_RESTART_AFTER=0
+_existing_pids=$(pgrep -f "clawmetry\.sync|clawmetry --port|clawmetry$" 2>/dev/null || true)
+if [ -n "$_existing_pids" ]; then
+  _count=$(echo "$_existing_pids" | wc -l | tr -d ' ')
+  echo -e "  ${DIM}↻ Detected ${_count} existing clawmetry process(es) — will restart after upgrade:${NC}"
+  for _p in $_existing_pids; do
+    _cmd=$(ps -p "$_p" -o command= 2>/dev/null | cut -c1-90 || echo "(gone)")
+    echo -e "    ${DIM}  pid $_p: $_cmd${NC}"
+  done
+  CLAWMETRY_RESTART_AFTER=1
+fi
+
 # ── Detect OS ───────────────────────────────────────────────────────────────
 
 OS="$(uname -s)"
@@ -57,11 +166,24 @@ case "$OS" in
     echo -e "${RED}  ✗ Unsupported OS: $OS (macOS and Linux only)${NC}"
     exit 1
     ;;
-esac
+esac 
+
+# ── Early exit: already up to date ──────────────────────────────────────────
+if [ -x "$INSTALL_DIR/bin/clawmetry" ]; then
+  _CURRENT=$("$INSTALL_DIR/bin/clawmetry" --version 2>/dev/null | awk '{print $NF}')
+  _LATEST=$("$INSTALL_DIR/bin/python3" -c "
+import json, urllib.request
+r = urllib.request.urlopen('https://pypi.org/pypi/clawmetry/json', timeout=2)
+print(json.loads(r.read())['info']['version'])
+" 2>/dev/null)
+  if [ -n "$_CURRENT" ] && [ "$_CURRENT" = "$_LATEST" ] && [ -n "$_existing_pids" ]; then
+    echo -e "  ${GREEN}${BOLD}✓ ClawMetry $_CURRENT already up to date${NC}"
+    exit 0
+  fi
+fi
 
 # ── Install into venv ────────────────────────────────────────────────────────
 
-echo -e "  → Creating virtual environment..."
 # Preserve config before wiping venv (contains node_id, encryption_key)
 _CM_CFG_BAK=""
 if [ -f "$INSTALL_DIR/config.json" ]; then
@@ -72,17 +194,52 @@ elif [ -f "$HOME/.clawmetry/config.json" ] && [ "$INSTALL_DIR" = "$HOME/.clawmet
   cp "$HOME/.clawmetry/config.json" "$_CM_CFG_BAK"
 fi
 $USE_SUDO rm -rf "$INSTALL_DIR"
-$USE_SUDO python3 -m venv "$INSTALL_DIR"
-$USE_SUDO "$INSTALL_DIR/bin/pip" install --upgrade pip >/dev/null 2>&1
+
+# Try `uv` (Astral's Rust-based pip replacement) for ~5x faster installs.
+# Bootstrap a copy if missing; on any failure, silently fall back to pip so
+# corporate proxies / restrictive networks still work.
+if ! command -v uv >/dev/null 2>&1; then
+  # Bootstrapping uv ships ~12MB; ~4s on a warm connection. ``|| true`` so
+  # network blockage falls through to the pip path below instead of aborting.
+  _step "Bootstrapping uv (faster installer)" 4 \
+    bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh' || true
+  # uv installs to ~/.local/bin (default) or ~/.cargo/bin (older)
+  export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+fi
+
+if command -v uv >/dev/null 2>&1; then
+  # Capture full path so `sudo uv` works even when sudo uses a restricted
+  # PATH that doesn't include ~/.local/bin (the default uv install location).
+  _UV_BIN="$(command -v uv)"
+  # Estimates from observed timings on PyPI cold-cache + Apple Silicon /
+  # mid-range Linux. uv handles the heavy lifting; --quiet suppresses uv's
+  # native progress bar so OUR spinner is the only thing on screen.
+  _step "Creating virtual environment (uv)" 2 \
+    $USE_SUDO "$_UV_BIN" venv "$INSTALL_DIR" --quiet
+  # --refresh forces uv to re-fetch the PyPI index even if a cached copy
+  # exists. Without this, running install.sh seconds after a [RELEASE]
+  # auto-publish silently no-ops ("already at latest" against a stale
+  # index that doesn't list the just-published version), leaving the
+  # daemon on the OLD wheel even after the launchctl kicks below fire.
+  # Verified locally on 2026-05-15 via PR #1260 → 0.12.197 publish race.
+  _step "Installing clawmetry from PyPI (uv)" 5 \
+    $USE_SUDO "$_UV_BIN" pip install --python "$INSTALL_DIR/bin/python3" --quiet --upgrade --refresh clawmetry
+else
+  # pip path is much slower (~30s for the install alone) — make sure the
+  # spinner conveys that so users don't think the script is wedged.
+  _step "Bootstrapping pip fallback venv" 5 \
+    $USE_SUDO python3 -m venv "$INSTALL_DIR"
+  _step "Upgrading pip" 5 \
+    $USE_SUDO "$INSTALL_DIR/bin/pip" install --upgrade pip
+  _step "Installing clawmetry from PyPI (pip)" 30 \
+    $USE_SUDO "$INSTALL_DIR/bin/pip" install --no-cache-dir --upgrade clawmetry
+fi
 
 # Restore config if it was backed up
 if [ -n "$_CM_CFG_BAK" ] && [ -f "$_CM_CFG_BAK" ]; then
   $USE_SUDO cp "$_CM_CFG_BAK" "$INSTALL_DIR/config.json"
   rm -f "$_CM_CFG_BAK"
 fi
-
-echo -e "  → Installing clawmetry from PyPI..."
-$USE_SUDO "$INSTALL_DIR/bin/pip" install --no-cache-dir --upgrade clawmetry >/dev/null 2>&1
 
 # Create symlink
 mkdir -p "$BIN_DIR" 2>/dev/null || $USE_SUDO mkdir -p "$BIN_DIR"
@@ -91,8 +248,160 @@ $USE_SUDO ln -sf "$INSTALL_DIR/bin/clawmetry" "$BIN_DIR/clawmetry"
 CLAWMETRY_BIN="$BIN_DIR/clawmetry"
 CLAWMETRY_VERSION=$("$INSTALL_DIR/bin/python3" -c "import importlib.metadata; print(importlib.metadata.version('clawmetry'))" 2>/dev/null || echo "installed")
 
+# ── Restart launchd jobs (macOS) ─────────────────────────────────────────────
+# After a venv reinstall, the dashboard/sync daemons launched at boot are
+# still running against the old (now deleted) venv. They'll either keep
+# serving stale code or crash-loop until reboot. `launchctl kickstart -k`
+# restarts them cleanly. Issue #1127.
+#
+# We also detect any plist whose ProgramArguments[0] points at a stale path
+# (e.g. a previous Homebrew clawmetry or ~/.local) and rewrite it to the
+# fresh venv binary so the next reboot picks up the right interpreter.
+if [ "$OS" = "Darwin" ]; then
+  echo -e "  → Refreshing macOS launchd jobs..."
+  _LA_DIR="$HOME/Library/LaunchAgents"
+  _UID=$(id -u)
+  _DARWIN_PLIST_FOUND=0
+  # Step 1: rewrite stale ProgramArguments[0] in any com.clawmetry.* plist.
+  for _plist in "$_LA_DIR"/com.clawmetry.*.plist; do
+    [ -f "$_plist" ] || continue
+    _DARWIN_PLIST_FOUND=1
+    _current=$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" "$_plist" 2>/dev/null || echo "")
+    _label=$(basename "$_plist" .plist)
+    case "$_current" in
+      "$INSTALL_DIR/bin/"*)
+        # Already pointing at the fresh venv — no rewrite needed.
+        ;;
+      *)
+        # Sync daemon plists invoke `python3 -m clawmetry.sync`; the
+        # dashboard plist runs the `clawmetry` console script. Pick the
+        # matching target binary inside the new venv.
+        if [ "$_label" = "com.clawmetry.sync" ] || [[ "$_current" == *python* ]]; then
+          _new="$INSTALL_DIR/bin/python3"
+        else
+          _new="$INSTALL_DIR/bin/clawmetry"
+        fi
+        if [ -n "$_current" ] && [ "$_current" != "$_new" ]; then
+          /usr/libexec/PlistBuddy -c "Set :ProgramArguments:0 $_new" "$_plist" 2>/dev/null || true
+        fi
+        ;;
+    esac
+
+    # Issue #1310 — ensure CLAWMETRY_ENABLE_WS_TAP=1 is set on the sync
+    # plist so Telegram/Signal/Slack channel messages reach DuckDB. The
+    # gateway WS tap was flipped opt-in by PR #1228 (gateway_tap.py:589
+    # gated on this env var); without it operators see an empty Brain
+    # feed despite active channel traffic. Idempotent — Add fails if the
+    # key already exists, then Set updates it. Sync plist only.
+    if [ "$_label" = "com.clawmetry.sync" ]; then
+      /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" "$_plist" 2>/dev/null || true
+      /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:CLAWMETRY_ENABLE_WS_TAP string 1" "$_plist" 2>/dev/null \
+        || /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:CLAWMETRY_ENABLE_WS_TAP 1" "$_plist" 2>/dev/null || true
+    fi
+  done
+
+  # Step 2: kickstart any registered com.clawmetry.* job in the BACKGROUND.
+  #
+  # ``launchctl kickstart -k`` is *synchronous* — it blocks until the daemon
+  # process is alive again. For NemoClaw sandbox plists that run
+  # ``docker exec <container> kubectl exec ...``, "alive" means the docker+
+  # kubectl handshake has completed, which routinely costs 30-50s per plist.
+  # On a machine with two sandbox plists installed that's 60-100s of dead
+  # time install.sh used to wait for. The user's job here is to put fresh
+  # files on disk; the daemon respawn is best-effort and doesn't need to
+  # block the prompt return. (#1215)
+  #
+  # `|| true` so systems without launchd running (CI containers, Linux
+  # subprocess) don't abort the installer.
+  for _plist in "$_LA_DIR"/com.clawmetry.*.plist; do
+    [ -f "$_plist" ] || continue
+    _label=$(basename "$_plist" .plist)
+    ( launchctl kickstart -k "gui/$_UID/$_label" >/dev/null 2>&1 || true ) &
+  done
+  # Detach the backgrounded kicks so install.sh can exit without waiting
+  # for them. ``disown -a`` clears bash's job table; the kernel keeps the
+  # children alive (their parent reparents to launchd/init).
+  disown -a 2>/dev/null || true
+
+  if [ "$_DARWIN_PLIST_FOUND" = "1" ]; then
+    echo -e "  ${DIM}  ↺ launchd jobs restarting in background${NC}"
+  fi
+
+  # Cross-platform sanity: no plist means user installed via pip directly
+  # without running `clawmetry connect`, so there is no managed daemon to
+  # restart. Print a manual hint instead of staying silent.
+  if [ "$_DARWIN_PLIST_FOUND" = "0" ]; then
+    echo -e "  ${DIM}Hint: no managed daemon found. If clawmetry was already running,${NC}"
+    echo -e "  ${DIM}restart it with: pkill -f clawmetry && nohup clawmetry &${NC}"
+  fi
+fi
+
+# ── Restart user daemon (Linux + WSL) ────────────────────────────────────────
+# Same stale-venv problem as macOS (#1182). Linux uses systemd --user units
+# registered as `clawmetry-sync.service` (see clawmetry/cli.py::_register_systemd).
+# WSL ships without systemd by default, so we fall back to a pkill hint.
+if [ "$OS" = "Linux" ]; then
+  echo -e "  → Refreshing systemd user services..."
+  _IS_WSL=0
+  if grep -qi microsoft /proc/version 2>/dev/null; then
+    _IS_WSL=1
+  fi
+
+  _RESTARTED=0
+  # Prefer systemd --user when both systemctl is present AND a clawmetry unit
+  # is registered. `list-unit-files` enumerates installed units even when none
+  # are running, which is what we want here.
+  #
+  # ``systemctl --user restart`` blocks until the unit reports active, which
+  # for the sync daemon means DuckDB open + cloud heartbeat round-trip
+  # (5-30s on slow networks). We background it with ``--no-block`` so
+  # install.sh doesn't stall on daemon startup — matches the macOS launchd
+  # fire-and-forget pattern. (#1215)
+  if [ "$_IS_WSL" = "0" ] && command -v systemctl >/dev/null 2>&1; then
+    if systemctl --user list-unit-files 2>/dev/null | grep -q '^clawmetry-sync\.service'; then
+      systemctl --user daemon-reload >/dev/null 2>&1 || true
+      if systemctl --user restart --no-block clawmetry-sync.service >/dev/null 2>&1; then
+        echo -e "  ${DIM}↺ clawmetry-sync restarting in background${NC}"
+        _RESTARTED=1
+      fi
+    fi
+  fi
+
+  if [ "$_RESTARTED" = "0" ]; then
+    if [ "$_IS_WSL" = "1" ]; then
+      echo -e "  ${DIM}WSL detected — systemd user services not available by default.${NC}"
+    else
+      echo -e "  ${DIM}Hint: no systemd user unit found for clawmetry.${NC}"
+    fi
+    echo -e "  ${DIM}If clawmetry was already running, restart it with:${NC}"
+    echo -e "  ${DIM}  pkill -f clawmetry && nohup clawmetry &${NC}"
+  fi
+fi
+
+# ── Post-install: kill stray pre-existing daemons ───────────────────────────
+# The launchctl/systemd blocks above only restart OS-managed jobs. If the
+# user originally started clawmetry by hand (``pip install clawmetry &&
+# clawmetry --port 8900``), that pid is still attached to the OLD venv we
+# just deleted — and now races the freshly-installed daemon for the DuckDB
+# write lock. ``pkill -f`` here ensures the OLD daemon exits so the NEW one
+# (which the launchctl/systemd block above will respawn, or which the user
+# will respawn with ``clawmetry``) takes over cleanly.
+#
+# Guarded by the pre-flight detect so we don't kill a daemon that wasn't
+# there when the installer started — that case would either (a) be the
+# launchctl/systemd job we just kickstarted, or (b) be unrelated.
+if [ "$CLAWMETRY_RESTART_AFTER" = "1" ]; then
+  echo -e "  → Killing stray pre-existing daemon(s)..."
+  pkill -f "clawmetry\.sync" >/dev/null 2>&1 || true
+  # No sleep here — the freshly-spawned daemon's DuckDB open already retries
+  # on lock contention (clawmetry/local_store.py), so install.sh doesn't
+  # need to babysit the kernel. Saves 1s of fixed dead time. (#1215)
+  echo -e "  ${DIM}  ↺ Stray daemon(s) signalled${NC}"
+fi
+
 echo ""
-echo -e "  ${GREEN}${BOLD}✓ ClawMetry $CLAWMETRY_VERSION installed${NC}"
+_ELAPSED=$(( $(date +%s) - _T0 ))
+echo -e "  ${GREEN}${BOLD}✓ ClawMetry $CLAWMETRY_VERSION installed${NC} ${DIM}(${_ELAPSED}s total)${NC}"
 echo ""
 echo -e "  $(printf '%.0s─' {1..50})"
 echo ""
@@ -412,14 +721,14 @@ SANDBOX_SCRIPT
 fi
 
 # ── Onboarding ───────────────────────────────────────────────────────────────
-# Runs: clawmetry setup (skipped when NemoClaw is detected — setup happens inside sandbox)
+# Runs: clawmetry onboard (skipped when NemoClaw is detected — onboard happens inside sandbox)
 
 if [ "${CLAWMETRY_SKIP_ONBOARD:-}" = "1" ] || [ "$NEMOCLAW_DETECTED" = "1" ]; then
   [ "$NEMOCLAW_DETECTED" = "1" ] || echo -e "  ${DIM}Skipping onboard (CLAWMETRY_SKIP_ONBOARD=1)${NC}"
 elif (exec </dev/tty) 2>/dev/null; then
-  "$CLAWMETRY_BIN" setup </dev/tty || true
+  "$CLAWMETRY_BIN" onboard </dev/tty || true
 else
-  "$CLAWMETRY_BIN" setup || true
+  "$CLAWMETRY_BIN" onboard || true
 fi
 
 # ── PATH reminder if needed ──────────────────────────────────────────────────

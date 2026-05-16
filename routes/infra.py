@@ -32,6 +32,7 @@ import time
 from datetime import datetime, timezone
 
 from flask import Blueprint, Response, jsonify, request
+from clawmetry.config import is_local_store_read_enabled
 
 bp_logs = Blueprint('logs', __name__)
 bp_memory = Blueprint('memory', __name__)
@@ -311,6 +312,52 @@ def api_flow_events():
     )
 
 
+@bp_logs.route("/api/flow/runs")
+def api_flow_runs():
+    """Historical flow-runs list — closes #611.
+
+    Each row is one session_id's worth of events, aggregated from the local
+    DuckDB ``events`` table:
+
+      session_id, agent_id, started_at, duration_seconds, channels_touched,
+      models_invoked, tools_called, total_cost, status (completed/failed),
+      models[], channel
+
+    Query params:
+      ``limit``  — max rows (default 30, hard cap 200)
+      ``since``  — ISO timestamp lower-bound on event ts
+      ``until``  — ISO timestamp upper-bound
+
+    Returns ``{runs: [...], _source: "local_store"|"empty"}``. Never raises
+    — on any store failure we return an empty list with the legacy tag so
+    the Flow tab degrades gracefully.
+    """
+    try:
+        limit_raw = int(request.args.get("limit", 30))
+    except (TypeError, ValueError):
+        limit_raw = 30
+    limit = max(1, min(200, limit_raw))
+    since = request.args.get("since") or None
+    until = request.args.get("until") or None
+    agent_id = request.args.get("agent_id") or None
+
+    runs: list = []
+    source = "empty"
+    try:
+        from clawmetry import local_store
+        store = local_store.get_store(read_only=True)
+        runs = store.query_flow_runs(
+            agent_id=agent_id, since=since, until=until, limit=limit,
+        ) or []
+        if runs:
+            source = "local_store"
+    except Exception:
+        runs = []
+        source = "empty"
+
+    return jsonify({"runs": runs, "count": len(runs), "_source": source})
+
+
 @bp_logs.route("/api/logs-stream")
 def api_logs_stream():
     """SSE endpoint - streams new log lines in real-time."""
@@ -361,12 +408,235 @@ def api_logs_stream():
 
 
 # ── Memory files ───────────────────────────────────────────────────────────
+#
+# Local-store fast path (DuckDB MOAT mandate): when
+# CLAWMETRY_LOCAL_STORE_READ=1 AND the local memory_blobs table has rows for
+# this agent, serve directly from DuckDB. Falls through to the legacy
+# filesystem path otherwise (so a fresh install with no local store, or a
+# user who hasn't enabled the gate, sees the same data as before — zero-
+# change default). The POST handler at /api/file intentionally stays on
+# disk; writes are a future ingest hook (sync.py owns memory ingest today).
+
+
+def _try_local_store_memory_files():
+    """Read memory file metadata directly from the local DuckDB. Returns
+    a list shaped identically to ``_get_memory_files()`` (``[{"path":
+    str, "size": int}, ...]``). Returns ``None`` to defer to the
+    filesystem fallback if:
+      - the local_store module isn't importable
+      - the memory_blobs table is empty
+      - any unexpected error happens (we'd rather degrade than 500)
+    """
+    # CRITICAL (regression #1228): the sync daemon (separate process)
+    # holds DuckDB's exclusive lock — even RO opens block on macOS, which
+    # is why the Memory tab spinner stuck on "Loading…". Route through
+    # the daemon's local_query proxy first; fall back to direct open in
+    # single-process boots.
+    rows = None
+    try:
+        from routes.local_query import local_store_via_daemon
+        rows = local_store_via_daemon("query_memory_blobs", limit=500)
+    except Exception:
+        rows = None
+    if rows is None:
+        try:
+            from clawmetry import local_store
+            store = local_store.get_store(read_only=True)
+            rows = store.query_memory_blobs(limit=500)
+        except Exception:
+            return None
+    if not rows:
+        return None
+    out = []
+    seen: set[str] = set()
+    for r in rows:
+        path = r.get("path") or ""
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        size = r.get("size_bytes")
+        if size is None:
+            blob = r.get("blob")
+            if isinstance(blob, str):
+                size = len(blob.encode("utf-8", errors="replace"))
+            elif isinstance(blob, (bytes, bytearray)):
+                size = len(blob)
+            else:
+                size = 0
+        out.append({"path": path, "size": int(size or 0)})
+    return out
+
+
+def _try_local_store_file(path: str):
+    """Read one memory file directly from the local DuckDB. Returns the
+    same response shape as the legacy filesystem-backed endpoint
+    (``{"path", "content", "size", "mtime"}``). Returns ``None`` to
+    defer to the filesystem fallback if:
+      - the local_store module isn't importable
+      - no memory_blobs row matches the requested path
+      - the blob payload isn't UTF-8 text (rare; punt to disk path)
+    """
+    # See #1228 — proxy through the daemon when present (cross-process
+    # DuckDB lock blocks even RO opens), fall back to direct read.
+    rows = None
+    try:
+        from routes.local_query import local_store_via_daemon
+        rows = local_store_via_daemon(
+            "query_memory_blobs", path_prefix=path, limit=50,
+        )
+    except Exception:
+        rows = None
+    if rows is None:
+        try:
+            from clawmetry import local_store
+            store = local_store.get_store(read_only=True)
+            # query_memory_blobs has no exact-path filter (path_prefix is the
+            # closest), so use prefix=path to narrow then exact-match below.
+            rows = store.query_memory_blobs(path_prefix=path, limit=50)
+        except Exception:
+            return None
+    for r in rows:
+        if (r.get("path") or "") != path:
+            continue
+        blob = r.get("blob")
+        if blob is None:
+            content = ""
+        elif isinstance(blob, str):
+            content = blob
+        else:
+            # Binary blob (non-utf8) — defer to filesystem path which can
+            # at least raise a sensible error to the user.
+            return None
+        size = r.get("size_bytes")
+        if size is None:
+            size = len(content.encode("utf-8", errors="replace"))
+        # ts is an ISO string; convert to epoch seconds for parity with
+        # os.path.getmtime() which returns float seconds.
+        mtime = 0
+        ts = r.get("ts")
+        if ts:
+            try:
+                from datetime import datetime as _dt
+                mtime = int(_dt.fromisoformat(
+                    ts.replace("Z", "+00:00")
+                ).timestamp())
+            except Exception:
+                pass
+        return {
+            "path": path,
+            "content": content[:500_000],
+            "size": int(size or 0),
+            "mtime": mtime,
+            "_source": "local_store",
+        }
+    return None
+
+
+def _try_local_store_memory_analytics(bloat_warn_kb: int, bloat_crit_kb: int):
+    """Compute memory analytics from the local DuckDB. Same response
+    shape as the filesystem-backed endpoint. Returns ``None`` to defer
+    when the local store has no memory_blobs rows."""
+    files = _try_local_store_memory_files()
+    if files is None:
+        return None
+    return _build_memory_analytics(files, bloat_warn_kb, bloat_crit_kb,
+                                   source="local_store")
+
+
+def _build_memory_analytics(files, bloat_warn_kb, bloat_crit_kb, *, source=None):
+    """Pure analytics builder over a ``[{path, size}, ...]`` list. Shared
+    between the local-store fast path and the filesystem fallback so the
+    response shape stays identical regardless of source."""
+    total_bytes = sum(f.get("size", 0) for f in files)
+    root_files = [f for f in files if "/" not in f["path"]]
+    daily_files = [f for f in files if f["path"].startswith("memory/")]
+    est_tokens = total_bytes // 4
+
+    analysis = []
+    recommendations = []
+    for f in files:
+        entry = {
+            "path": f["path"],
+            "sizeBytes": f["size"],
+            "sizeKB": round(f["size"] / 1024, 1),
+            "estTokens": f["size"] // 4,
+            "status": "ok",
+        }
+        kb = f["size"] / 1024
+        if kb >= bloat_crit_kb:
+            entry["status"] = "critical"
+            recommendations.append({
+                "file": f["path"],
+                "severity": "critical",
+                "message": f"{f['path']} is {kb:.1f}KB ({f['size'] // 4} est. tokens). "
+                f"Consider pruning to keep context window budget lean.",
+            })
+        elif kb >= bloat_warn_kb:
+            entry["status"] = "warning"
+            recommendations.append({
+                "file": f["path"],
+                "severity": "warning",
+                "message": f"{f['path']} is {kb:.1f}KB. Growing large, review for stale content.",
+            })
+        analysis.append(entry)
+
+    daily_growth = []
+    date_sizes = {}
+    for f in daily_files:
+        basename = f["path"].replace("memory/", "")
+        date_part = basename.replace(".md", "")[:10]
+        if len(date_part) == 10 and date_part[4] == "-":
+            date_sizes[date_part] = date_sizes.get(date_part, 0) + f["size"]
+    for d in sorted(date_sizes.keys())[-30:]:
+        daily_growth.append({"date": d, "bytes": date_sizes[d]})
+
+    context_budgets = {}
+    for name, limit in [
+        ("claude_200k", 200000),
+        ("gpt4_128k", 128000),
+        ("gemini_1m", 1000000),
+    ]:
+        pct = round((est_tokens / limit) * 100, 1) if limit > 0 else 0
+        context_budgets[name] = {
+            "limit": limit,
+            "memoryTokens": est_tokens,
+            "percentUsed": min(pct, 100),
+            "status": "critical" if pct > 25 else ("warning" if pct > 10 else "ok"),
+        }
+
+    top_files = sorted(analysis, key=lambda x: x["sizeBytes"], reverse=True)[:5]
+    has_bloat = any(r["severity"] == "critical" for r in recommendations)
+    has_warnings = any(r["severity"] == "warning" for r in recommendations)
+
+    payload = {
+        "totalBytes": total_bytes,
+        "totalKB": round(total_bytes / 1024, 1),
+        "estTokens": est_tokens,
+        "fileCount": len(files),
+        "rootFileCount": len(root_files),
+        "dailyFileCount": len(daily_files),
+        "files": analysis,
+        "topFiles": top_files,
+        "dailyGrowth": daily_growth,
+        "contextBudgets": context_budgets,
+        "recommendations": recommendations,
+        "hasBloat": has_bloat,
+        "hasWarnings": has_warnings,
+        "thresholds": {"warnKB": bloat_warn_kb, "critKB": bloat_crit_kb},
+    }
+    if source:
+        payload["_source"] = source
+    return payload
 
 
 @bp_memory.route("/api/memory-files")
 @bp_memory.route("/api/memory")
 def api_memory_files():
     import dashboard as _d
+    if is_local_store_read_enabled():
+        fast = _try_local_store_memory_files()
+        if fast is not None:
+            return jsonify({"files": fast, "_source": "local_store"})
     return jsonify(_d._get_memory_files())
 
 
@@ -375,6 +645,10 @@ def api_view_file():
     """Return the contents of a memory file."""
     import dashboard as _d
     path = request.args.get("path", "")
+    if is_local_store_read_enabled() and path:
+        fast = _try_local_store_file(path)
+        if fast is not None:
+            return jsonify(fast)
     full = os.path.normpath(os.path.join(_d.WORKSPACE, path))
     if not full.startswith(os.path.normpath(_d.WORKSPACE)):
         return jsonify({"error": "Access denied"}), 403
@@ -424,106 +698,18 @@ def api_write_file():
 def api_memory_analytics():
     """Memory usage analytics with bloat detection and recommendations."""
     import dashboard as _d
-    workspace = _d.WORKSPACE or os.getcwd()
-    memory_dir = _d.MEMORY_DIR or os.path.join(workspace, "memory")
 
     # Configurable thresholds (bytes)
     bloat_warn_kb = int(request.args.get("warn_kb", 8))
     bloat_crit_kb = int(request.args.get("crit_kb", 16))
 
+    if is_local_store_read_enabled():
+        fast = _try_local_store_memory_analytics(bloat_warn_kb, bloat_crit_kb)
+        if fast is not None:
+            return jsonify(fast)
+
     files = _d._get_memory_files()
-    total_bytes = sum(f.get("size", 0) for f in files)
-    root_files = [f for f in files if "/" not in f["path"]]
-    daily_files = [f for f in files if f["path"].startswith("memory/")]
-
-    # Estimate tokens (rough: 1 token ~ 4 chars ~ 4 bytes for English text)
-    est_tokens = total_bytes // 4
-
-    # Per-file analysis with bloat flags
-    analysis = []
-    recommendations = []
-    for f in files:
-        entry = {
-            "path": f["path"],
-            "sizeBytes": f["size"],
-            "sizeKB": round(f["size"] / 1024, 1),
-            "estTokens": f["size"] // 4,
-            "status": "ok",
-        }
-        kb = f["size"] / 1024
-        if kb >= bloat_crit_kb:
-            entry["status"] = "critical"
-            recommendations.append(
-                {
-                    "file": f["path"],
-                    "severity": "critical",
-                    "message": f"{f['path']} is {kb:.1f}KB ({f['size'] // 4} est. tokens). "
-                    f"Consider pruning to keep context window budget lean.",
-                }
-            )
-        elif kb >= bloat_warn_kb:
-            entry["status"] = "warning"
-            recommendations.append(
-                {
-                    "file": f["path"],
-                    "severity": "warning",
-                    "message": f"{f['path']} is {kb:.1f}KB. Growing large, review for stale content.",
-                }
-            )
-        analysis.append(entry)
-
-    # Daily memory dir growth (count files per date from filenames)
-    daily_growth = []
-    if os.path.isdir(memory_dir):
-        date_sizes = {}
-        for f in daily_files:
-            basename = f["path"].replace("memory/", "")
-            date_part = basename.replace(".md", "")[:10]  # YYYY-MM-DD
-            if len(date_part) == 10 and date_part[4] == "-":
-                date_sizes[date_part] = date_sizes.get(date_part, 0) + f["size"]
-        for d in sorted(date_sizes.keys())[-30:]:
-            daily_growth.append({"date": d, "bytes": date_sizes[d]})
-
-    # Context budget estimation
-    # Common context windows: 200K tokens (Claude), 128K (GPT-4), 1M (Gemini)
-    context_budgets = {}
-    for name, limit in [
-        ("claude_200k", 200000),
-        ("gpt4_128k", 128000),
-        ("gemini_1m", 1000000),
-    ]:
-        pct = round((est_tokens / limit) * 100, 1) if limit > 0 else 0
-        context_budgets[name] = {
-            "limit": limit,
-            "memoryTokens": est_tokens,
-            "percentUsed": min(pct, 100),
-            "status": "critical" if pct > 25 else ("warning" if pct > 10 else "ok"),
-        }
-
-    # Largest files
-    top_files = sorted(analysis, key=lambda x: x["sizeBytes"], reverse=True)[:5]
-
-    has_bloat = any(r["severity"] == "critical" for r in recommendations)
-    has_warnings = any(r["severity"] == "warning" for r in recommendations)
-
-    return jsonify(
-        {
-            "totalBytes": total_bytes,
-            "totalKB": round(total_bytes / 1024, 1),
-            "estTokens": est_tokens,
-            "fileCount": len(files),
-            "rootFileCount": len(root_files),
-            "dailyFileCount": len(daily_files),
-            "files": analysis,
-            "topFiles": top_files,
-            "dailyGrowth": daily_growth,
-            "contextBudgets": context_budgets,
-            "recommendations": recommendations,
-            "hasBloat": has_bloat,
-            "hasWarnings": has_warnings,
-            "thresholds": {"warnKB": bloat_warn_kb, "critKB": bloat_crit_kb},
-        }
-    )
+    return jsonify(_build_memory_analytics(files, bloat_warn_kb, bloat_crit_kb))
 
 
 # ── Security ───────────────────────────────────────────────────────────────
@@ -883,3 +1069,175 @@ def api_automation_analysis():
             'error': str(e),
             'lastAnalysis': datetime.now(timezone.utc).isoformat()
         })
+
+
+def _try_local_store_session_history_tokens():
+    """Tier-1 DuckDB fast path for /api/context-anatomy session-history bucket.
+
+    Replaces a 5-file × N-line JSONL scan (the single hottest blocking
+    read in this endpoint) with a single SQL aggregate over the events
+    table. Returns the most recent non-zero ``usage.input_tokens``
+    reading from the latest active session, mirroring the legacy
+    behaviour exactly. Returns ``None`` to defer to the JSONL scanner if:
+      * the daemon proxy isn't reachable AND direct open fails
+      * the events table has no message events with non-zero usage yet
+    """
+    result = None
+    try:
+        from routes.local_query import local_store_via_daemon
+        result = local_store_via_daemon("query_context_window_peek", scan_sessions=5)
+    except Exception:
+        result = None
+    if result is None:
+        # Single-process boots (tests, dev mode) never hit the daemon —
+        # open the local store directly.
+        try:
+            from clawmetry import local_store
+            store = local_store.get_store(read_only=True)
+            result = store.query_context_window_peek(scan_sessions=5)
+        except Exception:
+            return None
+    if not isinstance(result, dict):
+        return None
+    tok = result.get("input_tokens") or 0
+    try:
+        return int(tok)
+    except (TypeError, ValueError):
+        return None
+
+
+@bp_config.route("/api/context-anatomy")
+def api_context_anatomy():
+    """Estimate context window consumption broken down by source (#566).
+
+    Returns a list of buckets with token estimates derived from:
+      - Workspace file sizes (SOUL.md, AGENTS.md, TOOLS.md, …)
+      - memory/ directory total
+      - A fixed tool-definition estimate (~1,500 tok)
+      - Session history = last observed input_tokens minus known static buckets
+
+    Token counts are approximations (file_bytes / 3.5 chars-per-token).
+    """
+    import dashboard as _d
+
+    CHARS_PER_TOKEN = 3.5
+    CONTEXT_LIMIT = 200_000  # Claude 200K window
+
+    def _file_tokens(path):
+        try:
+            return max(1, int(os.path.getsize(path) / CHARS_PER_TOKEN))
+        except OSError:
+            return 0
+
+    workspace = _d.WORKSPACE or ""
+    sessions_dir = _d.SESSIONS_DIR or ""
+
+    buckets = []
+
+    # Static workspace files — each gets its own bucket if present
+    _SYSTEM_FILES = [
+        ("SOUL.md",      "#a855f7"),
+        ("AGENTS.md",    "#3b82f6"),
+        ("TOOLS.md",     "#06b6d4"),
+        ("HEARTBEAT.md", "#22c55e"),
+        ("IDENTITY.md",  "#ec4899"),
+        ("USER.md",      "#f59e0b"),
+    ]
+    for fname, color in _SYSTEM_FILES:
+        fpath = os.path.join(workspace, fname) if workspace else ""
+        if fpath and os.path.isfile(fpath):
+            buckets.append({
+                "label": fname,
+                "tokens": _file_tokens(fpath),
+                "color": color,
+                "category": "system",
+            })
+
+    # Memory files — summed into one bucket
+    memory_dir = os.path.join(workspace, "memory") if workspace else ""
+    if memory_dir and os.path.isdir(memory_dir):
+        try:
+            mem_tokens = sum(
+                _file_tokens(os.path.join(memory_dir, f))
+                for f in os.listdir(memory_dir)
+                if f.endswith(".md")
+            )
+        except OSError:
+            mem_tokens = 0
+        if mem_tokens > 0:
+            buckets.append({
+                "label": "Memory files",
+                "tokens": mem_tokens,
+                "color": "#059669",
+                "category": "memory",
+            })
+
+    # Tool definitions — fixed estimate (built-ins + common MCPs)
+    TOOL_EST = 1_500
+    buckets.append({
+        "label": "Tool defs (est.)",
+        "tokens": TOOL_EST,
+        "color": "#d97706",
+        "category": "tools",
+    })
+
+    # Session history: total input_tokens from last active session minus known static
+    session_history_tokens = 0
+    fast_tok = None
+    if is_local_store_read_enabled():
+        fast_tok = _try_local_store_session_history_tokens()
+    if fast_tok is not None and fast_tok > 0:
+        session_history_tokens = fast_tok
+    elif sessions_dir and os.path.isdir(sessions_dir):
+        # Legacy JSONL fallback — preserved verbatim so endpoint stays
+        # working when the local store hasn't been ingested yet.
+        try:
+            files = sorted(
+                [
+                    f for f in os.listdir(sessions_dir)
+                    if f.endswith(".jsonl")
+                    and ".deleted." not in f
+                    and ".reset." not in f
+                ],
+                key=lambda f: os.path.getmtime(os.path.join(sessions_dir, f)),
+                reverse=True,
+            )
+            for fname in files[:5]:
+                last_input = 0
+                try:
+                    with open(os.path.join(sessions_dir, fname), errors="replace") as fh:
+                        for line in fh:
+                            try:
+                                ev = json.loads(line.strip())
+                                u = (ev.get("message") or {}).get("usage") or {}
+                                inp = u.get("input_tokens", 0)
+                                if inp:
+                                    last_input = inp
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                if last_input > 0:
+                    session_history_tokens = last_input
+                    break
+        except Exception:
+            pass
+
+    if session_history_tokens > 0:
+        known_static = sum(b["tokens"] for b in buckets)
+        dynamic = max(0, session_history_tokens - known_static)
+        if dynamic > 0:
+            buckets.append({
+                "label": "Session history",
+                "tokens": dynamic,
+                "color": "#0891b2",
+                "category": "history",
+            })
+
+    total = sum(b["tokens"] for b in buckets)
+    return jsonify({
+        "buckets": buckets,
+        "total_estimated": total,
+        "context_limit": CONTEXT_LIMIT,
+        "pct_used": round(total / CONTEXT_LIMIT * 100, 1) if CONTEXT_LIMIT else 0,
+    })

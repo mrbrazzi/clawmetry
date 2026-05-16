@@ -1,3 +1,60 @@
+// ─────────────────────────────────────────────────────────────────────────
+// Response-shape tolerance helpers (epic #1032 Phase 2-5 forward-compat)
+//
+// As routes migrate to the local-DuckDB fast path (`_source: "local_store"`)
+// and the cloud's heartbeat-piggyback cache (`_source: "cache"`), JSON
+// payloads have grown wrapper envelopes:
+//   • legacy:    [ {...}, {...} ]
+//   • local store: { rules: [...], _source: "local_store" }
+//   • cloud cache: { rules_blob: "<b64-ciphertext>", _source: "cache", shape: "alert_rules", ... }
+//
+// `unwrapList(resp, key)` returns the plaintext list regardless of which
+// shape the server picked. On `_source: "cache"` the cipher blob can only
+// be read by a CLOUD_MODE browser that has the user's E2E key + the
+// cloud-injected `decryptBlob` helper; if either is missing we return an
+// empty list silently (no JS error, no crash). The cloud-side decryptor
+// is owned by clawmetry-cloud/dashboard.py — never move decryption out
+// of the browser.
+// ─────────────────────────────────────────────────────────────────────────
+function unwrapList(resp, key) {
+  if (Array.isArray(resp)) return resp;
+  if (!resp || typeof resp !== 'object') return [];
+  if (Array.isArray(resp[key])) return resp[key];
+  // Cache envelope holds ciphertext only — the browser-side decryptor
+  // owns the unwrap. We can't decrypt synchronously here, so callers that
+  // can wait should use `unwrapListAsync` instead. Returning [] keeps the
+  // tab rendering instead of throwing.
+  return [];
+}
+
+async function unwrapListAsync(resp, key, blobKey) {
+  if (Array.isArray(resp)) return resp;
+  if (!resp || typeof resp !== 'object') return [];
+  if (Array.isArray(resp[key])) return resp[key];
+  if (resp._source === 'cache' && resp[blobKey] && typeof window !== 'undefined') {
+    try {
+      // The cloud-injected decryptor (see clawmetry-cloud/dashboard.py
+      // cm-brain-decrypt script block) returns the decoded payload as
+      // a JSON object; the actual list is under `key`.
+      var keyB64 = null;
+      try {
+        var ls = window.localStorage || null;
+        if (ls && window.CLOUD_NODE_ID) {
+          keyB64 = ls.getItem('cm-enc-key-' + window.CLOUD_NODE_ID);
+        }
+      } catch (e) { /* localStorage blocked */ }
+      if (keyB64 && typeof window.decryptBlob === 'function') {
+        var dec = await window.decryptBlob(resp[blobKey], keyB64);
+        if (dec && Array.isArray(dec[key])) return dec[key];
+        if (Array.isArray(dec)) return dec;
+      }
+    } catch (e) {
+      try { console.warn('[unwrapListAsync] decrypt failed for', key, e); } catch (_) {}
+    }
+  }
+  return [];
+}
+
 // === Budget & Alert Functions ===
 function openBudgetModal() {
   document.getElementById('budget-modal').style.display = 'flex';
@@ -93,7 +150,9 @@ async function createAlertRule() {
 async function loadAlertRules() {
   try {
     var data = await fetch('/api/alerts/rules').then(function(r){return r.json();});
-    var rules = data.rules || [];
+    // Tolerate all three shapes: legacy array, {rules,_source:"local_store"},
+    // {rules_blob,_source:"cache"} via the shared unwrap helper.
+    var rules = await unwrapListAsync(data, 'rules', 'rules_blob');
     if(rules.length === 0) {
       document.getElementById('alert-rules-list').innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-muted);">No alert rules configured</div>';
       return;
@@ -112,7 +171,10 @@ async function loadAlertRules() {
     });
     document.getElementById('alert-rules-list').innerHTML = html;
   } catch(e) {
-    document.getElementById('alert-rules-list').textContent = 'Failed to load';
+    // Issue #1257: replace silent "Failed to load" text with an actionable
+    // Failed-to-load + Retry pattern. Mirror loadCrons / loadAutonomy / loadSystemHealth.
+    var el = document.getElementById('alert-rules-list');
+    if (el) el.innerHTML = '<div style="color:var(--text-error);padding:20px;font-size:13px;">Failed to load: ' + escHtml(String(e)) + ' &nbsp;<button onclick="loadAlertRules()" style="margin-left:8px;background:transparent;border:1px solid var(--border-primary);color:var(--text-secondary);border-radius:4px;padding:2px 10px;font-size:11px;cursor:pointer;">Retry</button></div>';
   }
 }
 
@@ -208,7 +270,9 @@ async function loadAlertHistory() {
     });
     document.getElementById('alert-history-list').innerHTML = html;
   } catch(e) {
-    document.getElementById('alert-history-list').textContent = 'Failed to load';
+    // Issue #1257: Failed-to-load + Retry button pattern (mirror #1314/#1316).
+    var el = document.getElementById('alert-history-list');
+    if (el) el.innerHTML = '<div style="color:var(--text-error);padding:20px;font-size:13px;">Failed to load: ' + escHtml(String(e)) + ' &nbsp;<button onclick="loadAlertHistory()" style="margin-left:8px;background:transparent;border:1px solid var(--border-primary);color:var(--text-secondary);border-radius:4px;padding:2px 10px;font-size:11px;cursor:pointer;">Retry</button></div>';
   }
 }
 
@@ -216,9 +280,16 @@ async function checkActiveAlerts() {
   try {
     var data = await fetch('/api/alerts/active').then(function(r){return r.json();});
     var alerts = data.alerts || [];
+    var count = alerts.length;
+    // Update bell icon badge and Alerts nav tab badge
+    var bellBadge = document.getElementById('alerts-bell-badge');
+    var tabBadge  = document.getElementById('nav-alerts-badge');
+    var countLabel = count > 99 ? '99+' : String(count);
+    if (bellBadge) { bellBadge.textContent = countLabel; bellBadge.style.display = count > 0 ? '' : 'none'; }
+    if (tabBadge)  { tabBadge.textContent  = countLabel; tabBadge.style.display  = count > 0 ? '' : 'none'; }
     var banner = document.getElementById('alert-banner');
-    if(alerts.length === 0) {
-      banner.style.display = 'none';
+    if(count === 0) {
+      if (banner) banner.style.display = 'none';
       return;
     }
     // Show most recent alert
@@ -242,8 +313,29 @@ async function ackAllAlerts() {
   } catch(e) {}
 }
 
+// PRD #1252 Phase 1 — visibility-gated setInterval. The 5 module-init
+// pollers below (alerts, anomalies×2, heartbeat, paused-banner) fire on
+// every page load REGARDLESS of which tab is visible to the user. With
+// the user away from the browser for hours, these still hit the daemon
+// every 15-300s for nothing.
+//
+// User feedback (verbatim, 2026-05-15): "the browser seem to make a ton
+// of requests in one go". This helper kills background polling when the
+// tab is hidden — a no-op when document.visibilityState === 'hidden',
+// resumes immediately on visibilitychange. Per-tab pollers (loadCrons
+// 30s when on Crons tab, etc.) keep their existing tab-name gates.
+//
+// Function declaration, NOT var, so the hoist makes it available to the
+// module-init `setInterval` callers below at parse time.
+function visibilitySetInterval(fn, ms) {
+  return setInterval(function() {
+    if (typeof document !== 'undefined' && document.hidden) return;
+    try { fn(); } catch (e) {}
+  }, ms);
+}
+
 // Check alerts every 30s
-setInterval(checkActiveAlerts, 30000);
+visibilitySetInterval(checkActiveAlerts, 30000);
 setTimeout(checkActiveAlerts, 3000);
 
 // === Anomaly Detection Banner ===
@@ -298,7 +390,7 @@ async function checkAnomalies() {
 }
 
 // Check anomalies every 5 minutes
-setInterval(checkAnomalies, 300000);
+visibilitySetInterval(checkAnomalies, 300000);
 setTimeout(checkAnomalies, 8000);
 
 // === Anomaly Detection Panel (GH #304) ===
@@ -402,7 +494,7 @@ async function ackAnomaly(id) {
 
 // Load anomaly panel on overview and refresh every 2 minutes
 setTimeout(loadAnomalyPanel, 4000);
-setInterval(loadAnomalyPanel, 120000);
+visibilitySetInterval(loadAnomalyPanel, 120000);
 
 // === Heartbeat Gap Alerting ===
 async function checkHeartbeatStatus() {
@@ -427,7 +519,7 @@ async function checkHeartbeatStatus() {
     }
   } catch(e) {}
 }
-setInterval(checkHeartbeatStatus, 30000);
+visibilitySetInterval(checkHeartbeatStatus, 30000);
 setTimeout(checkHeartbeatStatus, 5000);
 
 function dismissPausedBanner() {
@@ -456,7 +548,7 @@ async function refreshPausedBanner() {
     banner.style.display = 'flex';
   } catch(e) {}
 }
-setInterval(refreshPausedBanner, 15000);
+visibilitySetInterval(refreshPausedBanner, 15000);
 setTimeout(refreshPausedBanner, 1500);
 
 // === Telegram Config Functions ===
@@ -503,7 +595,49 @@ async function testTelegram() {
   }
 }
 
+// Issue #1252 Phase 3 — defer SSE openings until tab dwell > 2 s.
+//
+// Before: every switchTab into 'brain' or 'logs' opened the SSE handshake
+// immediately. Users flicking through tabs to look around paid for handshakes
+// they never saw, and dangling EventSource connections piled up against the
+// browser's 6-conn-per-origin budget.
+//
+// After: dwellOpenSSE(tabName, openFn) waits 2 s before opening; if the user
+// switches AWAY from the tab in that window (cancelAllPendingSSEDwell fires
+// at the top of switchTab), the open never happens.
+//
+// Boot-time SSE opens (line ~12414) are intentionally NOT routed through
+// here — Phase 1+2 cover the "don't fetch what user can't see" case for
+// page load; Phase 3 only addresses tab-switch flicker.
+var _pendingSSEDwell = {};
+var SSE_DWELL_MS = 2000;
+
+function dwellOpenSSE(tabName, openFn, dwellMs) {
+  if (typeof dwellMs !== 'number') dwellMs = SSE_DWELL_MS;
+  if (_pendingSSEDwell[tabName]) {
+    clearTimeout(_pendingSSEDwell[tabName]);
+    _pendingSSEDwell[tabName] = null;
+  }
+  // visibilitychange handler manages backgrounded-tab SSE re-open separately.
+  if (document.hidden) return;
+  _pendingSSEDwell[tabName] = setTimeout(function() {
+    _pendingSSEDwell[tabName] = null;
+    try { openFn(); } catch (e) {}
+  }, dwellMs);
+}
+
+function cancelAllPendingSSEDwell() {
+  Object.keys(_pendingSSEDwell).forEach(function(k) {
+    if (_pendingSSEDwell[k]) {
+      clearTimeout(_pendingSSEDwell[k]);
+      _pendingSSEDwell[k] = null;
+    }
+  });
+}
+
 function switchTab(name) {
+  // Phase 3: kill any pending SSE-open dwell from the tab we're leaving.
+  cancelAllPendingSSEDwell();
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
   var page = document.getElementById('page-' + name);
@@ -514,7 +648,7 @@ function switchTab(name) {
   // Stop cron auto-refresh when leaving crons tab
   if (name !== 'crons' && _cronAutoRefreshTimer) { clearInterval(_cronAutoRefreshTimer); _cronAutoRefreshTimer = null; }
   if (name === 'overview') loadAll();
-  if (name === 'overview') { if (typeof _velocityPollTimer !== 'undefined' && _velocityPollTimer) clearInterval(_velocityPollTimer); if (typeof loadTokenVelocity === 'function') _velocityPollTimer = setInterval(loadTokenVelocity, 30000); }
+  if (name === 'overview') { if (typeof _velocityPollTimer !== 'undefined' && _velocityPollTimer) clearInterval(_velocityPollTimer); if (typeof loadTokenVelocity === 'function') _velocityPollTimer = visibilitySetInterval(loadTokenVelocity, 30000); }
   if (name === 'usage') loadUsage();
   if (name === 'skills') loadSkills();
   if (name === 'crons') loadCrons();
@@ -533,11 +667,19 @@ function switchTab(name) {
   if (name === 'approvals') { if (typeof loadApprovalsTab === 'function') loadApprovalsTab(); }
   if (name === 'alerts') { if (typeof loadAlertsPage === 'function') loadAlertsPage(); }
   if (name === 'actions') loadQAHistory();
-  if (name === 'logs') { if (!logStream || logStream.readyState === EventSource.CLOSED) startLogStream(); loadLogs(); }
+  if (name === 'logs') {
+    // Phase 3 (#1252): defer the SSE handshake until the user actually
+    // dwells on the Logs tab for ≥2 s. Initial loadLogs() still fires
+    // immediately so the page paints content from cache.
+    if (!logStream || logStream.readyState === EventSource.CLOSED) {
+      dwellOpenSSE('logs', startLogStream);
+    }
+    loadLogs();
+  }
   if (name === 'models') loadModelAttribution();
   if (name === 'nemoclaw') { loadNemoClaw(); _startNcApprovalsAutoRefresh(); }
   if (name !== 'nemoclaw') _stopNcApprovalsAutoRefresh();
-  if (name === 'subagents') { loadSubagents(); if (!_subagentsTimer) _subagentsTimer = setInterval(loadSubagents, 5000); }
+  if (name === 'subagents') { loadSubagents(); if (!_subagentsTimer) _subagentsTimer = visibilitySetInterval(loadSubagents, 5000); }
   if (name !== 'subagents' && _subagentsTimer) { clearInterval(_subagentsTimer); _subagentsTimer = null; }
 }
 
@@ -705,7 +847,15 @@ async function loadAutonomy() {
   } catch(e) {
     console.warn('autonomy load failed', e);
     if (labelEl) labelEl.textContent = '—';
-    if (gapEl) gapEl.textContent = 'Couldn\u2019t load right now.';
+    // Issue #1257 part 2 — replace silent failure with explicit
+    // Failed-to-load + Retry. Mirrors Brain pattern (PR #1239).
+    if (gapEl) {
+      gapEl.innerHTML = '<span style="color:var(--text-error);">Failed to load: '
+        + escHtml(String(e && e.message || e)) + '</span> '
+        + '<button onclick="loadAutonomy()" title="Server slow \u2014 usually clears within 30 s" '
+        + 'style="margin-left:6px;background:transparent;border:1px solid var(--border-primary);'
+        + 'color:var(--text-secondary);border-radius:4px;padding:1px 8px;font-size:11px;cursor:pointer;">Retry</button>';
+    }
   }
 }
 
@@ -873,7 +1023,10 @@ async function loadSelfConfig() {
     var filesReq = fetch('/api/memory-files').then(function(r){return r.json();}).catch(function(){return [];});
     var trackedReq = fetch('/api/selfconfig').then(function(r){return r.json();}).catch(function(){return {files:[]};});
     var results = await Promise.all([filesReq, trackedReq]);
-    var realFiles = results[0] || [];
+    // /api/memory-files used to return a bare array; the local-store fast
+    // path wraps in {files:[...], _source:"local_store"}. Accept both.
+    var rawFiles = results[0];
+    var realFiles = Array.isArray(rawFiles) ? rawFiles : (rawFiles && rawFiles.files) || [];
     var tracked = (results[1] && results[1].files) || [];
 
     _selfconfigTrackedMeta = {};
@@ -1142,7 +1295,12 @@ async function _selfconfigRenderReader(filename, ts) {
       } else if (!d.content || !d.content.trim()) {
         bodyEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:0;">This file is empty.</div>';
       } else {
-        bodyEl.innerHTML = '<div class="mem-prose">' + _renderMarkdown(d.content) + '</div>';
+        // Show raw markdown source, not rendered HTML — these files ARE the
+        // agent's source-of-truth and editing them has agent-behaviour
+        // consequences, so rendering bullets/headers obscures the actual
+        // bytes the agent reads. Same monospace style as the Edit textarea
+        // so Preview ↔ Edit looks consistent.
+        bodyEl.innerHTML = '<pre style="margin:0;font-family:\'JetBrains Mono\',\'SF Mono\',monospace;font-size:13px;line-height:1.55;white-space:pre-wrap;word-break:break-word;color:var(--text-primary);">' + escHtml(d.content) + '</pre>';
       }
     }
     _selfconfigUpdateStatusBar(filename, ts, d);
@@ -1320,6 +1478,15 @@ async function loadSkills() {
   var summaryEl = document.getElementById('skills-summary-row');
   var listEl = document.getElementById('skills-list');
   if (!summaryEl || !listEl) return;
+  // Cloud iframes don't have access to the local skills filesystem — the
+  // cloud server returns 410 Gone for /api/skills, which the browser logs
+  // as a console error every time the user opens the Skills tab. Render
+  // an inline empty-state instead so the network call never fires.
+  if (window.CLOUD_MODE) {
+    listEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;">Skills inspector is local-only. Open the dashboard on the host running OpenClaw to view installed skills.</div>';
+    summaryEl.innerHTML = '';
+    return;
+  }
   listEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;">Loading...</div>';
   try {
     var data = await fetch('/api/skills').then(function(r) { return r.json(); });
@@ -1594,17 +1761,54 @@ function formatTime(ms) {
   return new Date(ms).toLocaleString('en-GB', {hour:'2-digit',minute:'2-digit',day:'numeric',month:'short'});
 }
 
+// Inflight dedup: 5 long-lived SSE EventSources (brain, flow-brain,
+// flow-events, health, logs) eat 5/6 slots in the browser's HTTP/1.1
+// per-origin connection budget. Pollers firing every 5–10s with no dedup
+// then stack 10+ identical fetches into the last slot and starve every new
+// request into "(pending)" forever — the surface symptom is "Failed to
+// load: timeout" on Brain. Collapsing duplicate URLs keeps inflight to ~1
+// per endpoint regardless of how often the cadence fires.
+var _inflightJsonFetches = {};
 async function fetchJsonWithTimeout(url, timeoutMs) {
+  if (_inflightJsonFetches[url]) return _inflightJsonFetches[url];
   var ctrl = new AbortController();
   var to = setTimeout(function() { ctrl.abort('timeout'); }, timeoutMs);
-  try {
-    var r = await fetch(url, {signal: ctrl.signal});
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return await r.json();
-  } finally {
-    clearTimeout(to);
-  }
+  var p = (async function() {
+    try {
+      var r = await fetch(url, {signal: ctrl.signal});
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return await r.json();
+    } finally {
+      clearTimeout(to);
+      delete _inflightJsonFetches[url];
+    }
+  })();
+  _inflightJsonFetches[url] = p;
+  return p;
 }
+
+// Same root cause as above — when the browser tab is hidden the 5 SSE are
+// useless yet still hold connection slots. Close them on hidden; the tab-
+// change handlers re-open the one needed when the user returns (each guards
+// on readyState===CLOSED, so this is idempotent).
+(function _installSSEVisibilityGuard() {
+  if (typeof document === 'undefined' || !document.addEventListener) return;
+  function _closeAllSSE() {
+    ['_brainSSE', '_flowBrainSse', '_flowSse', 'healthStream', 'logStream'].forEach(function(key) {
+      try {
+        var es = window[key];
+        if (es && typeof es.close === 'function') {
+          es.close();
+          window[key] = null;
+        }
+      } catch(e) {}
+    });
+  }
+  document.addEventListener('visibilitychange', function() {
+    if (document.hidden) _closeAllSSE();
+  });
+  window.addEventListener('pagehide', _closeAllSSE);
+})();
 
 async function resolvePrimaryModelFallback() {
   try {
@@ -1654,17 +1858,42 @@ function setFlowTextAll(idSuffix, text, maxLen) {
   });
 }
 
+// Issue #556: Anthropic OAuth migration banner. Render when /api/overview
+// reports client_health.using_oauth=true. Dismissal is sticky in localStorage
+// so we don't nag users who acknowledged the message.
+function dismissOauthBanner() {
+  try { localStorage.setItem('cm_oauth_banner_dismissed', '1'); } catch(e) {}
+  var b = document.getElementById('oauth-banner');
+  if (b) b.style.display = 'none';
+}
+function renderOauthBanner(overview) {
+  var b = document.getElementById('oauth-banner');
+  if (!b) return;
+  var ch = overview && overview.client_health;
+  var using = !!(ch && ch.using_oauth);
+  var dismissed = false;
+  try { dismissed = localStorage.getItem('cm_oauth_banner_dismissed') === '1'; } catch(e) {}
+  if (using && !dismissed) {
+    b.style.display = 'flex';
+  } else {
+    b.style.display = 'none';
+  }
+}
+
 async function loadAll() {
   try {
     // Render overview quickly; do not block on heavy usage aggregation.
     var overview = await fetchJsonWithTimeout('/api/overview', 3000);
+    try { renderOauthBanner(overview); } catch(e) {}
 
     // Start only critical secondary panels immediately. Expensive/non-critical
     // cards are staggered below so the initial widget load does not stampede
     // the backend and queue behind transcript analytics.
     loadActivityStream().catch(function(e){console.warn('activity stream failed',e)});
     loadHealth().catch(function(e){console.warn('health failed',e)});
-    loadMCTasks().catch(function(e){console.warn('mctasks failed',e)});
+    // Mission Control task summary was removed when the external MC service
+    // was retired (commit 62e1fe7). The /api/mc-tasks 404 was firing on every
+    // page load + every 30s — issue #1127. Frontend code now deleted below.
     if (typeof loadReliabilityCard === 'function') setTimeout(function(){ loadReliabilityCard().catch(function(e){console.warn('reliability card failed',e)}); }, 1200);
     if (typeof loadTokenVelocity === 'function') setTimeout(function(){ loadTokenVelocity().catch(function(e){console.warn('velocity check failed',e)}); }, 1600);
     if (typeof loadDiagnostics === 'function') loadDiagnostics().catch(function(e){console.warn('diagnostics failed',e)});
@@ -2000,7 +2229,7 @@ async function loadActiveTasks() {
 function startActiveTasksRefresh() {
   loadActiveTasks();
   if (_activeTasksTimer) clearInterval(_activeTasksTimer);
-  _activeTasksTimer = setInterval(loadActiveTasks, 30000);
+  _activeTasksTimer = visibilitySetInterval(loadActiveTasks, 30000);
 }
 
 async function loadToolActivity() {
@@ -2129,15 +2358,129 @@ function formatBrainTime(isoStr) {
     var d = new Date(isoStr);
     var now = new Date();
     var sameDay = d.getFullYear()===now.getFullYear() && d.getMonth()===now.getMonth() && d.getDate()===now.getDate();
+    var sameYear = d.getFullYear()===now.getFullYear();
     var time = d.toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
-    var prefix = sameDay ? 'Today' : d.toLocaleDateString('en-GB', {day:'numeric',month:'short'});
+    var prefix;
+    if (sameDay) {
+      prefix = 'Today';
+    } else if (sameYear) {
+      // Same year — "9 May" is unambiguous.
+      prefix = d.toLocaleDateString('en-GB', {day:'numeric',month:'short'});
+    } else {
+      // Different year — must include year, otherwise "9 May" is ambiguous
+      // (e.g. cross-year SSE replay shows up as "9 May" with no year hint).
+      prefix = d.toLocaleDateString('en-GB', {day:'numeric',month:'short',year:'numeric'});
+    }
     return '<span style="opacity:0.45;font-size:10px;margin-right:3px;">' + prefix + '</span>' + time;
   } catch(e) { return isoStr || ''; }
+}
+
+// Plain-text variant of formatBrainTime — returns "Today 14:23:45" with no
+// HTML tags so callers can safely pass the result through escHtml() or
+// concatenate it into a plain-text context without worrying about double-escaping.
+function _formatBrainTimePlain(isoStr) {
+  try {
+    var d = new Date(isoStr);
+    var now = new Date();
+    var sameDay = d.getFullYear()===now.getFullYear() && d.getMonth()===now.getMonth() && d.getDate()===now.getDate();
+    var sameYear = d.getFullYear()===now.getFullYear();
+    var time = d.toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    var prefix;
+    if (sameDay) {
+      prefix = 'Today';
+    } else if (sameYear) {
+      prefix = d.toLocaleDateString('en-GB', {day:'numeric',month:'short'});
+    } else {
+      prefix = d.toLocaleDateString('en-GB', {day:'numeric',month:'short',year:'numeric'});
+    }
+    return prefix + ' ' + time;
+  } catch(e) { return isoStr || ''; }
+}
+
+// ── Provenance pill (PR feat/brain-tab-hide-plumbing) ──────────────────
+// User messages from channel adapters arrive prefixed with a JSON block
+// like:
+//
+//     Sender (untrusted metadata):
+//     ```json
+//     {"chat_id":"telegram:...","sender":"Vivek Chand","timestamp":...}
+//     ```
+//     <real message body>
+//
+// Showing the raw JSON 3+ times per message buries the actual conversation.
+// This helper detects the prefix, parses the JSON, and renders a small
+// channel pill (📱 Telegram · Vivek Chand · 22:15  ⓘ) followed by the
+// message body. The ⓘ button toggles the original JSON inline so
+// debuggability is preserved.
+function _provenancePillHtml(meta, bodyHtml) {
+  var chatId = String(meta.chat_id || '').toLowerCase();
+  var icon = '💬';
+  var providerLabel = '';
+  // chat_id format: "<provider>:<id>"  (e.g. "telegram:8517")
+  var prov = chatId.indexOf(':') > 0 ? chatId.split(':')[0] : '';
+  if (prov && _channelIcons && _channelIcons[prov]) {
+    icon = _channelIcons[prov];
+    providerLabel = (typeof _channelDisplayName === 'function')
+      ? _channelDisplayName(prov)
+      : (prov.charAt(0).toUpperCase() + prov.slice(1));
+  }
+  var sender = meta.sender ? String(meta.sender) : '';
+  var ts = meta.timestamp;
+  var tStr = '';
+  if (ts) {
+    try {
+      var d = (typeof ts === 'number') ? new Date(ts * (ts > 1e12 ? 1 : 1000)) : new Date(ts);
+      if (!isNaN(d.getTime())) {
+        tStr = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+      }
+    } catch(e) {}
+  }
+  var pillId = 'prov-' + Math.random().toString(36).slice(2, 9);
+  var parts = [icon];
+  if (providerLabel) parts.push(escHtml(providerLabel));
+  if (sender) parts.push(escHtml(sender));
+  if (tStr) parts.push(escHtml(tStr));
+  var pill =
+    '<span class="brain-provenance-pill" style="display:inline-flex;align-items:center;gap:6px;background:var(--bg-tertiary,#1a1a2e);border:1px solid var(--border,#333);color:var(--text-muted);padding:2px 8px;border-radius:10px;font-size:10px;font-weight:500;margin-bottom:4px;font-family:ui-sans-serif,system-ui,sans-serif;">' +
+    parts.join(' · ') +
+    ' <button type="button" onclick="event.stopPropagation();var el=document.getElementById(\'' + pillId + '\');if(el){el.style.display=el.style.display===\'none\'?\'block\':\'none\';}" style="background:none;border:none;color:var(--text-muted);cursor:pointer;padding:0 2px;font-size:11px;line-height:1;" title="Show raw provenance JSON">ⓘ</button>' +
+    '</span>';
+  var rawJson = '<pre id="' + pillId + '" style="display:none;background:var(--bg-tertiary,#1a1a2e);border:1px solid var(--border-primary,#333);border-radius:6px;padding:6px 10px;margin:4px 0;font-size:10px;color:var(--text-muted);overflow-x:auto;white-space:pre-wrap;word-break:break-all;max-height:160px;">' + escHtml(JSON.stringify(meta, null, 2)) + '</pre>';
+  return '<div class="brain-provenance-row">' + pill + rawJson + '</div>' + (bodyHtml || '');
+}
+
+// Detects the "Sender (untrusted metadata)" / "Conversation info ..." JSON
+// prefix that channel adapters prepend to user messages. Returns
+// { meta:{...}, body:"<remaining text>" } or null.
+function _parseProvenancePrefix(s) {
+  if (!s || typeof s !== 'string') return null;
+  // Match: optional "<label> (untrusted metadata):" header, then a ```json
+  // block, then the rest is the real body. Header is optional because some
+  // payloads ship just the json fence at the top.
+  var m = s.match(/^(?:[^\n]*\(untrusted metadata\)[^\n]*\n)?\s*```json\s*([\s\S]*?)```\s*([\s\S]*)$/);
+  if (!m) return null;
+  try {
+    var meta = JSON.parse(m[1]);
+    if (!meta || typeof meta !== 'object') return null;
+    // Require at least one provenance-y key so we don't eat unrelated json.
+    if (meta.chat_id == null && meta.sender == null && meta.message_id == null) {
+      return null;
+    }
+    return { meta: meta, body: (m[2] || '').trim() };
+  } catch(e) { return null; }
 }
 
 function renderBrainDetail(detail) {
   if (!detail) return '';
   var s = detail.trim();
+  // Provenance prefix → channel pill + body
+  var prov = _parseProvenancePrefix(s);
+  if (prov) {
+    var bodyHtml = prov.body
+      ? '<span style="white-space:pre-wrap;word-break:break-word;">' + escHtml(prov.body) + '</span>'
+      : '<span style="color:var(--text-muted);font-style:italic;font-size:11px;">(no message body)</span>';
+    return _provenancePillHtml(prov.meta, bodyHtml);
+  }
   // Try JSON rendering
   var jsonMatch = s.match(/^```json\s*([\s\S]*?)```$/) || s.match(/^(\{[\s\S]*\}|\[[\s\S]*\])$/);
   if (jsonMatch) {
@@ -2163,16 +2506,193 @@ var _brainTypeFilter = 'all';
 var _brainChannelFilter = 'all';
 var _brainAllEvents = [];
 
+// Provider → emoji + display name. Mirrors routes/brain.py `_CHANNEL_ICON`
+// and clawmetry/sync.py `_CHANNEL_DIRS` (the canonical 21-adapter list).
+// Keep these three in sync when a new adapter ships.
 var _channelIcons = {
-  'telegram': '📱', 'whatsapp': '💬', 'discord': '🎮', 'slack': '📢',
+  'telegram': '📱', 'whatsapp': '💬', 'discord': '🎮', 'slack': '💼',
   'signal': '📡', 'irc': '💻', 'imessage': '🍎', 'webchat': '🌐',
-  'googlechat': '📧', 'cli': '🖥️', 'cron': '⏰'
+  'googlechat': '🔵', 'matrix': '🔢', 'msteams': '🏢', 'mattermost': '⚡',
+  'line': '💚', 'nostr': '🟣', 'twitch': '💜', 'bluebubbles': '💙',
+  'feishu': '🟠', 'zalo': '🩵', 'tlon': '🟤', 'synologychat': '🟦',
+  'nextcloudtalk': '☁️',
+  'cli': '🖥️', 'tui': '⌨️', 'cron': '⏰'
 };
 var _channelColors = {
   'telegram': '#2f9ef4', 'whatsapp': '#25d366', 'discord': '#5865F2', 'slack': '#4A154B',
   'signal': '#3a76f0', 'irc': '#6B7280', 'imessage': '#34C759', 'webchat': '#0EA5E9',
-  'googlechat': '#1A73E8', 'cli': '#94a3b8', 'cron': '#6B7280'
+  'googlechat': '#1A73E8', 'matrix': '#0DBD8B', 'msteams': '#4B53BC', 'mattermost': '#0072C6',
+  'line': '#06C755', 'nostr': '#9333ea', 'twitch': '#9146FF', 'bluebubbles': '#3478F6',
+  'feishu': '#00D6B9', 'zalo': '#0068FF', 'tlon': '#A78BFA', 'synologychat': '#1A73E8',
+  'nextcloudtalk': '#0082C9',
+  'cli': '#94a3b8', 'tui': '#94a3b8', 'cron': '#6B7280'
 };
+// Display-name overrides for channels whose snake/lower-case key isn't a
+// great human label. (`telegram` → `Telegram` is fine via title-case;
+// `googlechat` → `Google Chat` is not.)
+var _channelDisplayNames = {
+  'googlechat': 'Google Chat',
+  'msteams':    'MS Teams',
+  'bluebubbles':'BlueBubbles',
+  'imessage':   'iMessage',
+  'webchat':    'WebChat',
+  'irc':        'IRC',
+  'cli':        'CLI',
+  'tui':        'TUI',
+  'synologychat': 'Synology Chat',
+  'nextcloudtalk': 'Nextcloud Talk'
+};
+
+function _channelDisplayName(provider) {
+  if (!provider) return '';
+  var key = String(provider).toLowerCase();
+  if (_channelDisplayNames[key]) return _channelDisplayNames[key];
+  return key.charAt(0).toUpperCase() + key.slice(1);
+}
+
+// ── Channel-event extraction (Brain row renderer helper) ───────────────
+// Coordinates with the Telegram-ingest agent (PR aca53ec8): the
+// `events`-table row carries `event_type=channel.in|channel.out` and the
+// raw provider payload under `data`. Brain endpoint also enriches some
+// rows with top-level `channel`/`channelSubject`/`chatType` fields. This
+// helper accepts BOTH shapes plus a graceful fallback for the legacy
+// JSONL parser path so we don't regress when ingest hasn't migrated yet.
+//
+// Returned shape (all fields optional, all strings):
+//   { provider, providerLabel, providerIcon, providerColor,
+//     sender, chatId, direction /* 'in' | 'out' */ }
+// Returns null when the event clearly isn't a channel turn.
+function _extractChannelInfo(ev) {
+  if (!ev || typeof ev !== 'object') return null;
+  var data = (ev.data && typeof ev.data === 'object') ? ev.data : {};
+
+  // ── provider ─────────────────────────────────────────────────────────
+  var provider = ev.provider || ev.channel || data.provider || '';
+  if (!provider) {
+    // event_type "channel.in"/"channel.out" doesn't carry provider on its
+    // own — we keep going only if some other field hints at a channel.
+    var src = String(ev.source || ev.src || '');
+    var srcMatch = src.match(/^(?:agent:[^:]+:)?([a-z]+)(?::|$)/);
+    if (srcMatch) {
+      var maybe = srcMatch[1];
+      if (_channelIcons[maybe] && maybe !== 'main' && maybe !== 'cli') {
+        provider = maybe;
+      }
+    }
+  }
+  // event_type can be the discriminator on its own
+  var evType = String(ev.type || ev.event_type || '').toUpperCase();
+  var isChannelType = evType === 'CHANNEL.IN' || evType === 'CHANNEL.OUT' ||
+                       evType === 'CHANNEL_IN' || evType === 'CHANNEL_OUT';
+  if (!provider && !isChannelType) return null;
+  provider = String(provider || '').toLowerCase();
+  // Treat plain CLI/cron sources as non-channel (the Brain renderer has
+  // its own 🖥️/⏰ chips for those).
+  if (provider === 'cli' || provider === 'cron' || provider === 'main') {
+    return null;
+  }
+
+  // ── direction ────────────────────────────────────────────────────────
+  var direction = ev.direction || data.direction || '';
+  if (!direction) {
+    if (evType === 'CHANNEL.OUT' || evType === 'CHANNEL_OUT') direction = 'out';
+    else if (evType === 'CHANNEL.IN' || evType === 'CHANNEL_IN') direction = 'in';
+    else if (data.role === 'assistant' || data.from_bot === true) direction = 'out';
+    else direction = 'in';
+  }
+  direction = String(direction).toLowerCase();
+  if (direction !== 'in' && direction !== 'out') direction = 'in';
+
+  // ── sender ───────────────────────────────────────────────────────────
+  var sender = ev.sender || ev.sender_name || ev.senderName || data.sender_name || '';
+  if (!sender) {
+    var senderBlock = data.from || data.sender || data.user;
+    if (senderBlock && typeof senderBlock === 'object') {
+      sender = senderBlock.username || senderBlock.first_name ||
+               senderBlock.name || senderBlock.id || '';
+    }
+  }
+  sender = sender ? String(sender) : '';
+
+  // ── chat id ──────────────────────────────────────────────────────────
+  var chatId = ev.chat_id || ev.chatId || data.chat_id || data.channel_id || '';
+  if (!chatId && data.chat && typeof data.chat === 'object') {
+    chatId = data.chat.id || '';
+  }
+  chatId = chatId ? String(chatId) : '';
+
+  // ── body-missing detection (issue #1201) ─────────────────────────────
+  // The gateway.log Telegram parser (clawmetry/sync.py
+  // ``parse_telegram_outbound_line``) ingests outbound ACKs with
+  // ``body=None`` because OpenClaw stores Telegram chats in memory and
+  // the log only carries the API ACK, not the message text. Without this
+  // flag the renderer prints an empty detail row that looks like the bot
+  // replied with nothing. We surface the breadcrumb (``raw_blob.body_capture
+  // == "ack_only"``) AND a generic empty-body check so other adapters
+  // with the same shape get the same affordance for free.
+  var hasBodyText = !!(
+    ev.detail || ev.body || data.text || data.body || data.message
+  );
+  var ackOnly = false;
+  var raw = data.raw_blob;
+  if (raw && typeof raw === 'object' && raw.body_capture === 'ack_only') {
+    ackOnly = true;
+  }
+  var bodyMissing = direction === 'out' && (ackOnly || !hasBodyText);
+
+  return {
+    provider:      provider,
+    providerLabel: _channelDisplayName(provider),
+    providerIcon:  _channelIcons[provider] || '📨',
+    providerColor: _channelColors[provider] || '#667',
+    sender:        sender,
+    chatId:        chatId,
+    direction:     direction,
+    bodyMissing:   bodyMissing,
+    ackOnly:       ackOnly
+  };
+}
+
+// Render the meta row for a channel event (used by renderBrainStream when
+// _extractChannelInfo returns non-null). Replaces the generic AGENT/USER
+// type tag with a channel pill + sender name + direction arrow.
+function renderChannelEventMeta(ev, info, opts) {
+  opts = opts || {};
+  var html = '';
+  var arrow = info.direction === 'out' ? '↗' : '↘';
+  var arrowColor = info.direction === 'out' ? '#10b981' : '#60a5fa';
+  var arrowTitle = info.direction === 'out' ? 'Outbound (agent reply)' : 'Inbound (from user)';
+  // Channel pill — emoji + provider name in provider colour.
+  html += '<span class="brain-channel-pill" style="display:inline-flex;align-items:center;gap:4px;background:' +
+           info.providerColor + '22;color:' + info.providerColor +
+           ';padding:1px 8px;border-radius:10px;font-size:10px;font-weight:600;flex-shrink:0;white-space:nowrap;" title="' +
+           escHtml(info.provider + (info.chatId ? ' chat=' + info.chatId : '')) + '">' +
+           info.providerIcon + ' ' + escHtml(info.providerLabel) + '</span>';
+  // Direction arrow.
+  html += '<span class="brain-channel-direction" style="color:' + arrowColor +
+           ';font-size:11px;font-weight:700;flex-shrink:0;" title="' +
+           escHtml(arrowTitle) + '">' + arrow + '</span>';
+  // Sender name (italic). Falls back to a neutral placeholder so we never
+  // collapse to nothing — keeps the row scannable even when the upstream
+  // adapter omitted the sender block.
+  var senderText = info.sender || (info.direction === 'out' ? 'agent' : 'user');
+  html += '<span class="brain-channel-sender" style="font-style:italic;color:var(--text-secondary);font-size:11px;flex-shrink:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:160px;" title="' +
+           escHtml(senderText) + '">' + escHtml(senderText) + '</span>';
+  // Body-missing affordance (issue #1201). Outbound channel events from
+  // the gateway.log parser carry no body text — surface a "sent · (no
+  // body captured)" pill instead of leaving the detail row empty, which
+  // looked like the bot replied with nothing. Tooltip explains why.
+  if (info.bodyMissing) {
+    var ackTitle = info.ackOnly
+      ? 'Body not captured — OpenClaw stores Telegram chats in memory; only the API ACK is logged.'
+      : 'Body not captured — adapter logged the send but not the message text.';
+    html += '<span class="brain-channel-sent" style="display:inline-flex;align-items:center;gap:4px;color:#10b981;font-size:10px;font-weight:600;flex-shrink:0;white-space:nowrap;" title="' +
+             escHtml(ackTitle) + '">⤴ sent</span>';
+    html += '<span class="brain-channel-nobody" style="color:var(--text-muted);font-size:10px;font-style:italic;flex-shrink:0;white-space:nowrap;" title="' +
+             escHtml(ackTitle) + '">(no body captured)</span>';
+  }
+  return html;
+}
 
 var _brainTypeIcons = {
   'EXEC': '⚙️', 'SHELL': '⚙️', 'READ': '📖', 'WRITE': '✏️',
@@ -2333,6 +2853,99 @@ function setBrainChannelFilter(ch, btn) {
   renderBrainStream(_brainAllEvents);
 }
 
+// Collapse runs of body-less outbound channel events from the same chat
+// (issue: P1 follow-up to #1205). After #1205 every gateway.log Telegram
+// outbound ACK renders as a "⤴ sent · (no body captured)" row — once the
+// Brain feed hydrates with dozens of these from one chat the feed turns
+// into visual noise. Threshold of 3+ to collapse: 1 or 2 stays as-is so
+// short bursts read naturally; 3+ becomes one summary row with a count
+// and time range, click-to-expand. Pure presentation — the underlying
+// events array is untouched.
+//
+// Grouping rules:
+//   - same provider + chat_id (different chats never merge)
+//   - direction === "out" (inbound silence is intentional per #1205)
+//   - bodyMissing === true (body-bearing rows render normally + break run)
+//   - any non-matching event in between (inbound, body-bearing, non-channel)
+//     breaks the run
+//
+// Input: array sorted newest-first (renderBrainStream sorts before this).
+// Output: array of same/fewer length where collapsed entries carry
+// __collapsedRun (the original event objects) + __collapsedCount.
+function _collapseBodylessOutbound(events) {
+  if (!events || events.length === 0) return events || [];
+  var collapsed = [];
+  var i = 0;
+  while (i < events.length) {
+    var ev = events[i];
+    var info = _extractChannelInfo(ev);
+    if (info && info.bodyMissing && info.direction === 'out') {
+      // Walk forward gathering same-chat body-less outbound events. Any
+      // mismatch (different chat, inbound, body-bearing, non-channel)
+      // breaks the run — strict adjacency is the whole point.
+      var run = [ev];
+      var j = i + 1;
+      while (j < events.length) {
+        var ne = events[j];
+        var ninfo = _extractChannelInfo(ne);
+        if (ninfo && ninfo.bodyMissing && ninfo.direction === 'out' &&
+            ninfo.provider === info.provider && ninfo.chatId === info.chatId) {
+          run.push(ne);
+          j++;
+        } else {
+          break;
+        }
+      }
+      if (run.length >= 3) {
+        // Synthesize a wrapper that preserves the head event's identity
+        // (so source/time/etc. on the row reflect a real event) but
+        // carries the run for the renderer to summarise + expand.
+        var wrapper = {};
+        for (var k in ev) { if (Object.prototype.hasOwnProperty.call(ev, k)) wrapper[k] = ev[k]; }
+        wrapper.__collapsedRun = run;
+        wrapper.__collapsedCount = run.length;
+        collapsed.push(wrapper);
+        i = j;
+      } else {
+        // Under threshold — render each row individually. Don't skip ahead
+        // (we still want the next iteration to check those events fresh).
+        collapsed.push(ev);
+        i++;
+      }
+    } else {
+      collapsed.push(ev);
+      i++;
+    }
+  }
+  return collapsed;
+}
+
+function _toggleBrainCollapsedRun(btn, key) {
+  var host = btn.closest('.brain-event');
+  if (!host) return;
+  var inner = host.querySelector('.brain-collapsed-run');
+  if (!inner) return;
+  var open = inner.style.display !== 'none';
+  inner.style.display = open ? 'none' : '';
+  btn.textContent = open ? '▸ expand' : '▾ collapse';
+  // Don't bubble up into _toggleBrainEvent (which toggles the turn detail).
+  if (event && event.stopPropagation) event.stopPropagation();
+}
+
+// Plumbing event types: internal queue housekeeping that's noise to anyone
+// debugging an actual conversation. Hidden by default; toggle in the Brain
+// header reveals them. Match is case-insensitive on type AND detail to
+// catch QUEUE-OPERATION / queue_operation / "queue-operation" alike.
+function _isPlumbingEvent(ev) {
+  if (!ev) return false;
+  var t = String(ev.type || '').toLowerCase().replace(/[_-]/g, '');
+  if (t === 'queueoperation') return true;
+  // Belt-and-suspenders: some ingests stuff "queue-operation" into role/detail
+  var role = String(ev.role || '').toLowerCase().replace(/[_-]/g, '');
+  if (role === 'queueoperation') return true;
+  return false;
+}
+
 function renderBrainStream(events) {
   var el = document.getElementById('brain-stream');
   if (!el) return;
@@ -2343,11 +2956,29 @@ function renderBrainStream(events) {
   if (_brainChannelFilter !== 'all') {
     filtered = filtered.filter(function(ev) { return (ev.channel || '') === _brainChannelFilter; });
   }
+  // Plumbing toggle: hide QUEUE-OPERATION rows unless user opted in.
+  // Updates the "Show plumbing (N hidden)" label as a side-effect so the
+  // count stays in sync with whatever the current filter set surfaces.
+  var plumbingCount = filtered.filter(_isPlumbingEvent).length;
+  var countEl = document.getElementById('brain-plumbing-count');
+  if (countEl) {
+    countEl.textContent = plumbingCount > 0
+      ? (window._brainShowPlumbing ? '(' + plumbingCount + ' shown)' : '(' + plumbingCount + ' hidden)')
+      : '';
+  }
+  if (!window._brainShowPlumbing) {
+    filtered = filtered.filter(function(ev) { return !_isPlumbingEvent(ev); });
+  }
   filtered = filtered.slice().sort(function(a,b){
     var ta = a.time ? new Date(a.time).getTime() : 0;
     var tb = b.time ? new Date(b.time).getTime() : 0;
     return tb - ta;
   });
+  // Collapse 3+ consecutive body-less outbound rows from the same chat
+  // into a single summary row (P1 follow-up to #1205). Pure presentation
+  // — the underlying _brainAllEvents store is unchanged so re-renders
+  // (filter changes, auto-refresh) recompute from the source of truth.
+  filtered = _collapseBodylessOutbound(filtered);
   if (!filtered || filtered.length === 0) {
     el.innerHTML = '<div style="color:var(--text-muted);padding:20px">No activity yet</div>';
     return;
@@ -2387,6 +3018,21 @@ function renderBrainStream(events) {
     }
     if (skillName) {
       skillBadge = '<span class="brain-skill" style="color:#f59e0b;font-size:10px;flex-shrink:0;white-space:nowrap;" title="Skill: ' + escHtml(skillName) + '">🎯 ' + escHtml(skillName.length > 16 ? skillName.slice(0, 14) + '\u2026' : skillName) + '</span>';
+    }
+    // Task type badge (issue #571)
+    var taskBadge = '';
+    var _tt = ev.taskType || '';
+    if (_tt) {
+      var _ttMap = {
+        creative:  ['🎨', '#f97316', 'Creative'],
+        factual:   ['🔍', '#3b82f6', 'Factual'],
+        reasoning: ['🧢', '#8b5cf6', 'Reasoning'],
+        mixed:     ['🔀', '#6b7280', 'Mixed']
+      };
+      var _ttCfg = _ttMap[_tt];
+      if (_ttCfg) {
+        taskBadge = '<span class="brain-task-type" style="color:' + _ttCfg[1] + ';font-size:10px;flex-shrink:0;white-space:nowrap;" title="Task type: ' + _ttCfg[2] + '">' + _ttCfg[0] + ' ' + _ttCfg[2] + '</span>';
+      }
     }
     // Build turn timeline for USER events (Phase 4: Agent Runtime Timeline)
     var turnTimeline = '';
@@ -2472,13 +3118,81 @@ function renderBrainStream(events) {
     }
     var _evKey = _brainEvKey(ev);
     var _evExpCls = _brainExpandedKeys[_evKey] ? ' expanded' : '';
-    html += '<div class="brain-event' + _evExpCls + '" data-evkey="' + escHtml(_evKey) + '" onclick="_toggleBrainEvent(this, this.dataset.evkey)">';
+    // Channel-event branch (Telegram, Signal, Slack, …): replace the
+    // generic AGENT/USER tag with a provider pill + sender name + direction
+    // arrow. Triggered when ev exposes channel/provider/sender or carries a
+    // channel.in/channel.out event_type. Coordinates with the Telegram
+    // ingest agent (PR aca53ec8) on field names. Falls back gracefully when
+    // those fields are missing — the legacy renderer still owns CLI/cron/
+    // tool/think rows.
+    var chInfo = _extractChannelInfo(ev);
+    // Collapsed-run branch (P1 follow-up to #1205): when the collapse
+    // pass merged 3+ same-chat body-less outbound rows, render ONE
+    // summary row with count + time-range + expand affordance. Click
+    // expand → reveals the underlying rows inline (the same renderer
+    // re-runs over each event in the run, so each row keeps its own
+    // "⤴ sent · (no body captured)" treatment).
+    if (chInfo && ev.__collapsedRun && ev.__collapsedCount >= 3) {
+      var run = ev.__collapsedRun;
+      // Times are sorted newest-first from the upstream sort, so the
+      // last event in the run is the oldest. Format "oldest → newest".
+      // Use the plain-text variant so rangeLabel is safe to pass through
+      // escHtml() — avoids the double-escape bug fixed in PR #1215.
+      var newestT = run[0] && run[0].time ? _formatBrainTimePlain(run[0].time) : '';
+      var oldestT = run[run.length - 1] && run[run.length - 1].time ? _formatBrainTimePlain(run[run.length - 1].time) : '';
+      var rangeLabel = oldestT && newestT && oldestT !== newestT
+        ? oldestT + ' → ' + newestT
+        : (newestT || oldestT || '');
+      html += '<div class="brain-event brain-collapsed' + _evExpCls + '" data-evkey="' + escHtml(_evKey) + '">';
+      html += '<div class="brain-meta">';
+      html += '<span class="brain-time">' + formatBrainTime(ev.time) + '</span>';
+      html += renderChannelEventMeta(ev, chInfo);
+      // Count badge — monospace so eye latches onto the number.
+      html += '<span class="brain-collapsed-count" style="display:inline-flex;align-items:center;gap:4px;background:rgba(16,185,129,0.12);color:#10b981;padding:1px 7px;border-radius:10px;font-size:10px;font-weight:700;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;flex-shrink:0;white-space:nowrap;" title="' +
+        escHtml(ev.__collapsedCount + ' consecutive outbound ACKs from this chat — bodies not captured (collapsed for readability)') +
+        '">↪ ' + ev.__collapsedCount + ' outbound</span>';
+      if (rangeLabel) {
+        html += '<span class="brain-collapsed-range" style="color:var(--text-muted);font-size:10px;flex-shrink:0;white-space:nowrap;">' + escHtml(rangeLabel) + '</span>';
+      }
+      html += '<span class="brain-collapsed-note" style="color:var(--text-muted);font-size:10px;font-style:italic;flex-shrink:0;white-space:nowrap;">(bodies not captured)</span>';
+      // Expand affordance — small text button, monospace arrow.
+      html += '<button type="button" class="brain-collapsed-toggle" onclick="_toggleBrainCollapsedRun(this, this.closest(\'.brain-event\').dataset.evkey)" style="margin-left:auto;padding:1px 8px;border-radius:10px;border:1px solid var(--border,#444);background:transparent;color:var(--text-secondary);font-size:10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;cursor:pointer;flex-shrink:0;">▸ expand</button>';
+      html += '</div>';
+      // Expanded rows live in this hidden container — each one re-runs
+      // the same channel-event meta render so the user sees the rows
+      // they would have seen without collapse.
+      html += '<div class="brain-collapsed-run" style="display:none;margin-top:6px;padding:6px 0 2px 16px;border-left:2px solid rgba(16,185,129,0.3);">';
+      run.forEach(function(rev) {
+        var rinfo = _extractChannelInfo(rev);
+        if (!rinfo) return;
+        html += '<div class="brain-collapsed-row" style="display:flex;gap:6px;align-items:center;padding:2px 0;font-size:11px;">';
+        html += '<span class="brain-time" style="color:var(--text-faint);min-width:90px;flex-shrink:0;">' + formatBrainTime(rev.time) + '</span>';
+        html += renderChannelEventMeta(rev, rinfo);
+        html += '</div>';
+      });
+      html += '</div>';
+      html += '</div>';
+      return;  // collapsed row replaces the whole event div — no detail/turnTimeline
+    }
+    // Row-level visual classes: plumbing rows are de-emphasized when shown,
+    // and outbound channel rows with no body captured collapse to a thin
+    // grey one-liner ("📱 Telegram → agent (relayed)") instead of looking
+    // like the bot replied with nothing.
+    var rowCls = '';
+    if (_isPlumbingEvent(ev)) rowCls += ' brain-plumbing';
+    if (chInfo && chInfo.bodyMissing) rowCls += ' brain-relay-only';
+    html += '<div class="brain-event' + _evExpCls + rowCls + '" data-evkey="' + escHtml(_evKey) + '" onclick="_toggleBrainEvent(this, this.dataset.evkey)">';
     html += '<div class="brain-meta">';
     html += '<span class="brain-time">' + formatBrainTime(ev.time) + '</span>';
-    html += '<span class="brain-type" style="background:rgba(100,100,100,0.15);color:' + color + ';padding:1px 6px;border-radius:3px;font-size:10px;font-weight:700;min-width:70px;text-align:center;display:inline-block;white-space:nowrap;">' + icon + ' ' + escHtml(evType) + '</span>';
-    html += '<span class="brain-source" style="color:' + color + ';flex-shrink:0;" title="' + escHtml(fullSrc) + '">' + roleIcon + ' ' + escHtml(shortSrc) + '</span>';
-    html += chBadge;
+    if (chInfo) {
+      html += renderChannelEventMeta(ev, chInfo);
+    } else {
+      html += '<span class="brain-type" style="background:rgba(100,100,100,0.15);color:' + color + ';padding:1px 6px;border-radius:3px;font-size:10px;font-weight:700;min-width:70px;text-align:center;display:inline-block;white-space:nowrap;">' + icon + ' ' + escHtml(evType) + '</span>';
+      html += '<span class="brain-source" style="color:' + color + ';flex-shrink:0;" title="' + escHtml(fullSrc) + '">' + roleIcon + ' ' + escHtml(shortSrc) + '</span>';
+      html += chBadge;
+    }
     html += skillBadge;
+    html += taskBadge;
     html += '</div>';
     html += '<span class="brain-detail">' + renderBrainDetail(ev.detail || '') + '</span>';
     html += turnTimeline;
@@ -2575,10 +3289,30 @@ function renderBrainChart(events) {
   canvas.height = 80;
   ctx.clearRect(0, 0, W, 80);
 
-  // 60 min / 30s = 120 buckets, stacked by source color
+  // Adaptive window: pick the shortest window that contains the events so the
+  // chart actually renders bars instead of an empty 60-min background. The
+  // previous hard-coded 60-min window meant any event older than an hour
+  // (~typical for /api/brain-history?limit=300) was dropped silently.
   var now = Date.now();
-  var bucketMs = 30000;
-  var numBuckets = 120;
+  var WINDOWS = [
+    { ms: 3600000,   bucketMs: 30000   },  // 1h  / 30s  = 120 buckets
+    { ms: 21600000,  bucketMs: 180000  },  // 6h  / 3m   = 120 buckets
+    { ms: 86400000,  bucketMs: 720000  }   // 24h / 12m  = 120 buckets
+  ];
+  var oldestAge = 0;
+  for (var ei = 0; ei < events.length; ei++) {
+    try {
+      var ageE = now - new Date(events[ei].time).getTime();
+      if (ageE > oldestAge && ageE < 86400000 * 2) oldestAge = ageE;
+    } catch(e) {}
+  }
+  var win = WINDOWS[0];
+  for (var wi = 0; wi < WINDOWS.length; wi++) {
+    if (oldestAge <= WINDOWS[wi].ms) { win = WINDOWS[wi]; break; }
+    win = WINDOWS[wi];
+  }
+  var bucketMs = win.bucketMs;
+  var numBuckets = Math.floor(win.ms / bucketMs);
   var buckets = {};
   events.forEach(function(ev) {
     try {
@@ -2717,16 +3451,23 @@ function _buildSourcesList(events) {
 async function loadContextInspector() {
   try {
     // Fetch overview for model + token info
-    var ov = await fetch('/api/overview').then(function(r){return r.json();}).catch(function(){return {};});
+    var ov = await fetchJsonWithTimeout('/api/overview', 5000).catch(function(){return {};});
     // Fetch brain history for compaction events + turn count
-    var brain = await fetch('/api/brain-history?limit=300').then(function(r){return r.json();}).catch(function(){return {events:[]};});
-    // Fetch skills for header token count
-    var skills = await fetch('/api/skills').then(function(r){return r.json();}).catch(function(){return {skills:[],summary:{}};});
+    var brain = await fetchJsonWithTimeout('/api/brain-history?limit=300', 8000).catch(function(){return {events:[]};});
+    // Fetch skills for header token count. /api/skills is cloud-disabled
+    // (410 Gone) — skip the network call in cloud mode and use empty totals.
+    var skills = window.CLOUD_MODE
+      ? {skills:[],summary:{}}
+      : await fetch('/api/skills').then(function(r){return r.json();}).catch(function(){return {skills:[],summary:{}};});
 
     var contextWindow = ov.contextWindow || 200000;
     var mainTokens = ov.mainTokens || 0;
     var model = ov.model || 'unknown';
-    var events = brain.events || [];
+    // brain may be either {events:[...]} (legacy/local_store) or
+    // {_source:"cache", events_blob:"..."} (cache hit on cloud). Use the
+    // async unwrapper so the cloud-injected decryptBlob can decode the
+    // ciphertext when CLOUD_MODE+enc-key are both available.
+    var events = await unwrapListAsync(brain, 'events', 'events_blob');
 
     // Context window usage bar
     var pct = contextWindow > 0 ? Math.min(100, Math.round(mainTokens / contextWindow * 100)) : 0;
@@ -3025,7 +3766,23 @@ window.selfevolveRun = async function () {
 };
 
 async function loadBrainPage(silent) {
-  if (window.CLOUD_MODE) return;
+  // Cloud iframe doesn't proxy /api/brain-history (live event stream is
+  // local-only). Without this branch, `loadBrainPage` returned silently and
+  // left the inline `Loading...` placeholder in `#brain-stream` forever
+  // (P0 follow-up to #1235). Replace the spinner with an explicit
+  // empty-state so cloud users understand the surface is local-only and
+  // the spinner stops misrepresenting the load state.
+  if (window.CLOUD_MODE) {
+    var cloudEl = document.getElementById('brain-stream');
+    if (cloudEl && /Loading/i.test(cloudEl.innerText || '')) {
+      cloudEl.innerHTML = '<div style="color:var(--text-muted);padding:20px;font-size:13px;">' +
+  '<div style="font-size:15px;font-weight:600;margin-bottom:6px;">🔒 Brain activity stays local — by design.</div>' +
+  '<div style="margin-bottom:8px;">Your prompts, tool calls, and reasoning never leave your machine. We only see aggregated counts.</div>' +
+  '<a href="#local-first" style="color:var(--text-link, #60a5fa);text-decoration:none;">Why local-first →</a>' + 
+  '</div>';
+    }
+    return;
+  }
   if (!silent) { advisorProbe(); selfevolveProbe(); }
   try {
     var data = await fetchJsonWithTimeout('/api/brain-history?limit=300', 20000);
@@ -3050,19 +3807,167 @@ async function loadBrainPage(silent) {
     var wasAtTop = !streamEl || streamEl.scrollTop < 40;
     renderBrainStream(events);
   } catch(e) {
-    if (!silent) {
-      var el = document.getElementById('brain-stream');
-      if (el) el.innerHTML = '<div style="color:var(--text-error);padding:20px">Failed to load: ' + escHtml(String(e)) + '</div>';
+    // Always replace the spinner on error -- previously this only fired
+    // when `silent=false`, so a silent retry that errored left the prior
+    // `Loading...` placeholder in place forever (P0 follow-up to #1235).
+    var el = document.getElementById('brain-stream');
+    if (el) {
+      var stillLoading = /Loading/i.test(el.innerText || '');
+      if (!silent || stillLoading) {
+        el.innerHTML = '<div style="color:var(--text-error);padding:20px;font-size:13px;">Failed to load: ' + escHtml(String(e)) + ' &nbsp;<button onclick="loadBrainPage()" style="margin-left:8px;background:transparent;border:1px solid var(--border-primary);color:var(--text-secondary);border-radius:4px;padding:2px 10px;font-size:11px;cursor:pointer;">Retry</button></div>';
+      }
     }
   }
-  // After initial load, start SSE for live updates instead of polling
+  // After initial load, start SSE for live updates instead of polling.
+  // Phase 3 (#1252): defer the handshake until the user dwells on the
+  // Brain tab for ≥2 s — switching away cancels the pending open.
   if (!_brainSSE && !_brainSSEConnected) {
-    _startBrainSSE();
+    dwellOpenSSE('brain', _startBrainSSE);
   }
   // Only poll as fallback if SSE is not connected
   if (_brainRefreshTimer) clearTimeout(_brainRefreshTimer);
   if (!_brainSSEConnected && document.getElementById('page-brain') && document.getElementById('page-brain').classList.contains('active')) {
     _brainRefreshTimer = setTimeout(function() { loadBrainPage(true); }, 5000);
+  }
+  // Loop-signals badge (#1364) — fire-and-forget; never blocks the Brain tab.
+  loadLoopSignals();
+}
+
+
+// ── LoopDetector signals badge (#1364) ─────────────────────────────────────
+// Backed by /api/loop-signals → DuckDB ``loop_signals`` table populated by
+// clawmetry/proxy.py's LoopDetector. Hidden when the count is 0; clicking
+// expands a flat table (Time | Session | Pattern | Repeat).
+var _loopSignalsExpanded = false;
+
+async function loadLoopSignals() {
+  if (window.CLOUD_MODE) return;
+  var badge = document.getElementById('brain-loops-badge');
+  var countEl = document.getElementById('brain-loops-badge-count');
+  var tableEl = document.getElementById('brain-loops-table');
+  if (!badge || !countEl || !tableEl) return;
+  try {
+    var data = await fetchJsonWithTimeout('/api/loop-signals?limit=20', 5000);
+    var rows = (data && data.signals) || [];
+    if (!rows.length) {
+      badge.style.display = 'none';
+      tableEl.innerHTML = '';
+      return;
+    }
+    badge.style.display = '';
+    countEl.textContent = String(rows.length);
+    // Render table — keep it dead simple: Time | Session | Pattern | Repeat.
+    var head = '<div style="display:grid;grid-template-columns:130px 160px 1fr 70px;gap:10px;padding:4px 0;border-bottom:1px solid var(--border-secondary);font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:1px;">'
+      + '<div>Last seen</div><div>Session</div><div>Pattern</div><div style="text-align:right;">Repeats</div></div>';
+    var body = rows.map(function(r) {
+      var ts = r.last_seen || r.first_seen || '';
+      try { ts = new Date(ts).toLocaleString(); } catch (e) {}
+      var sid = String(r.session_id || '').slice(0, 16);
+      var sig = String(r.signature || '');
+      if (sig.length > 60) sig = sig.slice(0, 57) + '...';
+      var rc = r.repeat_count != null ? r.repeat_count : '-';
+      return '<div style="display:grid;grid-template-columns:130px 160px 1fr 70px;gap:10px;padding:5px 0;border-bottom:1px solid var(--border-secondary);">'
+        + '<div style="color:var(--text-muted);">' + escHtml(ts) + '</div>'
+        + '<div style="color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + escHtml(String(r.session_id || '')) + '">' + escHtml(sid) + '</div>'
+        + '<div style="color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + escHtml(String(r.signature || '')) + '">' + escHtml(sig) + '</div>'
+        + '<div style="text-align:right;color:#ef4444;font-weight:700;">' + escHtml(String(rc)) + '</div>'
+        + '</div>';
+    }).join('');
+    tableEl.innerHTML = head + body;
+  } catch (e) {
+    // Fail closed: hide the badge so we don't show a stale or wrong count.
+    badge.style.display = 'none';
+  }
+}
+
+function toggleLoopSignalsList() {
+  var panel = document.getElementById('brain-loops-panel');
+  if (!panel) return;
+  _loopSignalsExpanded = !_loopSignalsExpanded;
+  panel.style.display = _loopSignalsExpanded ? '' : 'none';
+}
+
+
+// ── OTel Spans panel (MOAT issue #1364) ────────────────────────────────────
+// Lightweight read-side surface for spans we already store in DuckDB via
+// the /v1/traces OTLP receiver. Flat table — no tree, no charts. Toggle is
+// hidden until the user clicks the "Spans" button on the Brain tab; first
+// click triggers the fetch. Subsequent clicks just toggle visibility.
+var _spansPanelLoaded = false;
+function toggleSpansPanel() {
+  var panel = document.getElementById('spans-panel');
+  if (!panel) return;
+  var visible = panel.style.display !== 'none';
+  panel.style.display = visible ? 'none' : 'block';
+  if (!visible && !_spansPanelLoaded) {
+    loadSpansPanel();
+  }
+}
+
+function _spansFmtTime(unixSec) {
+  if (!unixSec) return '—';
+  try {
+    var d = new Date(Number(unixSec) * 1000);
+    if (isNaN(d.getTime())) return '—';
+    return d.toLocaleTimeString();
+  } catch (e) { return '—'; }
+}
+
+function _spansFmtDur(ms) {
+  if (ms == null) return '—';
+  var n = Number(ms);
+  if (!isFinite(n)) return '—';
+  if (n < 1) return '<1ms';
+  if (n < 1000) return n.toFixed(0) + 'ms';
+  return (n / 1000).toFixed(2) + 's';
+}
+
+function _spansEsc(s) {
+  if (s == null) return '';
+  return String(s).replace(/[&<>"']/g, function(c) {
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+
+async function loadSpansPanel() {
+  var wrap = document.getElementById('spans-table-wrap');
+  var countEl = document.getElementById('spans-count');
+  if (!wrap) return;
+  wrap.innerHTML = '<div style="color:var(--text-muted);padding:20px;font-size:12px;">Loading spans...</div>';
+  try {
+    var resp = await fetch('/api/spans?limit=100');
+    var data = await resp.json();
+    _spansPanelLoaded = true;
+    var spans = (data && data.spans) || [];
+    if (countEl) countEl.textContent = String(spans.length);
+    if (!spans.length) {
+      var hint = (data && data._source === 'unavailable')
+        ? 'Local store unavailable — start the sync daemon or restart with CLAWMETRY_LOCAL_STORE_READ=1.'
+        : 'No OTel spans yet. Wire an OTLP exporter to <code>/v1/traces</code> on this dashboard\'s port to start capturing.';
+      wrap.innerHTML = '<div style="color:var(--text-muted);padding:20px;font-size:12px;text-align:center;line-height:1.6;">' + hint + '</div>';
+      return;
+    }
+    var rowsHtml = spans.map(function(s) {
+      var sess = s.session_id || '';
+      var sessShort = sess ? (sess.length > 12 ? sess.slice(0, 12) + '…' : sess) : '—';
+      return '<tr style="border-bottom:1px solid var(--border);">'
+        + '<td style="padding:6px 8px;color:var(--text-tertiary);font-family:monospace;white-space:nowrap;">' + _spansEsc(_spansFmtTime(s.start_time)) + '</td>'
+        + '<td style="padding:6px 8px;color:var(--text-primary);">' + _spansEsc(s.name || '—') + '</td>'
+        + '<td style="padding:6px 8px;color:var(--text-secondary);text-align:right;font-family:monospace;white-space:nowrap;">' + _spansEsc(_spansFmtDur(s.duration_ms)) + '</td>'
+        + '<td style="padding:6px 8px;color:var(--text-secondary);font-family:monospace;font-size:11px;" title="' + _spansEsc(sess) + '">' + _spansEsc(sessShort) + '</td>'
+        + '<td style="padding:6px 8px;color:var(--text-tertiary);font-size:11px;">' + _spansEsc(s.kind || '—') + '</td>'
+        + '</tr>';
+    }).join('');
+    wrap.innerHTML = '<table style="width:100%;border-collapse:collapse;font-size:12px;">'
+      + '<thead><tr style="text-align:left;color:var(--text-muted);font-size:10px;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid var(--border);">'
+      +   '<th style="padding:4px 8px;font-weight:600;">Time</th>'
+      +   '<th style="padding:4px 8px;font-weight:600;">Name</th>'
+      +   '<th style="padding:4px 8px;font-weight:600;text-align:right;">Duration</th>'
+      +   '<th style="padding:4px 8px;font-weight:600;">Session</th>'
+      +   '<th style="padding:4px 8px;font-weight:600;">Kind</th>'
+      + '</tr></thead><tbody>' + rowsHtml + '</tbody></table>';
+  } catch (e) {
+    wrap.innerHTML = '<div style="color:var(--text-error);padding:20px;font-size:12px;">Failed to load spans: ' + _spansEsc(String(e)) + '</div>';
   }
 }
 
@@ -3160,7 +4065,10 @@ async function loadNemoClaw() {
 
     if (!data.installed) {
       if (tab) tab.style.display = 'none';
-      page.innerHTML = '<div style="padding:40px 20px;text-align:center;color:var(--text-muted);font-size:14px;">NemoClaw not installed on this host.<br><span style="font-size:12px;">Install via <code style="background:var(--bg-secondary);padding:2px 6px;border-radius:3px;">pip install nemoclaw</code></span></div>';
+      // Issue #1127: previously said "pip install nemoclaw" but the package
+      // is not yet publicly released (only a 0.0.0a1 placeholder exists on
+      // PyPI). Replace with an honest "Coming soon" empty state.
+      page.innerHTML = '<div style="padding:40px 20px;text-align:center;color:var(--text-muted);font-size:14px;">NemoClaw governance is not yet available on this host.<br><span style="font-size:12px;">Coming soon &mdash; NVIDIA NeMo Guardrails integration is in private preview.</span></div>';
       return;
     }
 
@@ -3279,7 +4187,7 @@ var _ncApprovalsTimer = null;
 function _startNcApprovalsAutoRefresh() {
   if (_ncApprovalsTimer) return;
   loadNemoClawApprovals();
-  _ncApprovalsTimer = setInterval(loadNemoClawApprovals, 15000);
+  _ncApprovalsTimer = visibilitySetInterval(loadNemoClawApprovals, 15000);
 }
 function _stopNcApprovalsAutoRefresh() {
   if (_ncApprovalsTimer) { clearInterval(_ncApprovalsTimer); _ncApprovalsTimer = null; }
@@ -4027,30 +4935,61 @@ function toggleCronAutoRefresh() {
   var cb = document.getElementById('cron-auto-refresh');
   if (!cb) return;
   if (cb.checked) {
-    if (!_cronAutoRefreshTimer) _cronAutoRefreshTimer = setInterval(loadCrons, 30000);
+    if (!_cronAutoRefreshTimer) _cronAutoRefreshTimer = visibilitySetInterval(loadCrons, 30000);
   } else {
     if (_cronAutoRefreshTimer) { clearInterval(_cronAutoRefreshTimer); _cronAutoRefreshTimer = null; }
   }
 }
 
 async function loadCrons() {
-  var data = await fetch('/api/crons').then(r => r.json());
-  _cronJobs = data.jobs || [];
-  // Show/hide cron action buttons based on gateway support
-  document.querySelectorAll('.cron-action-btn').forEach(function(btn) {
-    btn.style.display = _cronActionsAvailable ? '' : 'none';
-  });
-  renderCrons();
-  // Load cron health summary panel
-  loadCronHealth();
-  // Load multi-node cron status from fleet nodes
-  loadCronsMultiNode();
-  // Load cron health monitor (GH #302)
-  loadCronHealth();
-  // Start auto-refresh if checkbox is checked and timer not running
-  var cb = document.getElementById('cron-auto-refresh');
-  if (cb && cb.checked && !_cronAutoRefreshTimer) {
-    _cronAutoRefreshTimer = setInterval(loadCrons, 30000);
+  // Issue #1257 — wrap in try/catch with explicit Failed-to-load + Retry,
+  // mirroring the Brain pattern from PR #1239 (app.js:3614). Previously
+  // this function had NO error handling — a flaky /api/crons call would
+  // crash the function, leave the spinner forever, and silently break
+  // the auto-refresh timer rebind below.
+  try {
+    var data = await (typeof fetchJsonWithTimeout === 'function'
+      ? fetchJsonWithTimeout('/api/crons', 8000)
+      : fetch('/api/crons').then(r => r.json()));
+    _cronJobs = data.jobs || [];
+    // Cron actions (create / pause / fix / kill-all) hit the local OpenClaw
+    // gateway, which is always reachable from the OSS dashboard but is
+    // cloud-disabled from the iframe. Default to true for the OSS-dashboard
+    // case so the "+ New Job" button is actually visible — the empty-state
+    // copy says to click it. Cloud-iframe stays false so we don't dangle
+    // controls that 410 when used.
+    _cronActionsAvailable = !window.CLOUD_MODE;
+    // Show/hide cron action buttons based on gateway availability
+    document.querySelectorAll('.cron-action-btn').forEach(function(btn) {
+      btn.style.display = _cronActionsAvailable ? '' : 'none';
+    });
+    renderCrons();
+    // Load cron health summary panel
+    loadCronHealth();
+    // Load multi-node cron status from fleet nodes
+    loadCronsMultiNode();
+    // Load cron health monitor (GH #302)
+    loadCronHealth();
+    // Start auto-refresh if checkbox is checked and timer not running
+    var cb = document.getElementById('cron-auto-refresh');
+    if (cb && cb.checked && !_cronAutoRefreshTimer) {
+      _cronAutoRefreshTimer = visibilitySetInterval(loadCrons, 30000);
+    }
+  } catch (e) {
+    // Find the cron list container and replace its spinner with the
+    // Failed-to-load + Retry pattern. Container ID is `cron-jobs-list`
+    // (matches `renderCrons()` in this file).
+    var listEl = document.getElementById('cron-jobs-list')
+              || document.getElementById('cron-jobs')
+              || document.getElementById('crons-list');
+    var msg = '<div style="padding:16px;color:var(--text-error);font-size:13px;">'
+            + 'Failed to load crons: ' + escHtml(String(e && e.message || e))
+            + ' <button onclick="loadCrons()" title="Server slow — usually clears within 30 s" '
+            + 'style="margin-left:8px;background:transparent;border:1px solid var(--border-primary);'
+            + 'color:var(--text-secondary);border-radius:4px;padding:2px 10px;font-size:11px;cursor:pointer;">Retry</button>'
+            + '</div>';
+    if (listEl) listEl.innerHTML = msg;
+    console.warn('loadCrons failed', e);
   }
 }
 
@@ -4198,9 +5137,17 @@ function renderCrons() {
 
   var jobs = _cronView === 'paused' ? paused : active;
   if (jobs.length === 0) {
-    var msg = _cronView === 'paused'
-      ? 'No paused jobs. Disable any active job to see it here.'
-      : 'No active cron jobs yet. Click "+ New Job" to create one.';
+    var msg;
+    if (_cronView === 'paused') {
+      msg = 'No paused jobs. Disable any active job to see it here.';
+    } else if (window.CLOUD_MODE) {
+      // In cloud iframe mode the "+ New Job" button is hidden because
+      // cron-create hits a cloud-disabled endpoint; pointing the user
+      // at an invisible button (clawmetry-cloud#793) is a UX dead-end.
+      msg = 'No active cron jobs yet. Create one from the OSS dashboard on the host running OpenClaw.';
+    } else {
+      msg = 'No active cron jobs yet. Click "+ New Job" to create one.';
+    }
     listEl.innerHTML = '<div style="color:var(--text-muted);padding:24px;text-align:center;font-size:13px;">' + msg + '</div>';
     return;
   }
@@ -4454,16 +5401,149 @@ function toggleCronExpand(jobId) {
   renderCrons();
 }
 
+// Renders the per-job run timeline (issue #605): sparkline + stat row + table.
+// Pulled out of loadCronRuns so the markup is reviewable as a single unit and
+// can be unit-tested by passing a synthetic runs array via window.
+function _renderCronRunTimeline(jobId, runs, jobJobs) {
+  if (!runs || !runs.length) return '';
+  // Sparkline: last min(30, runs.length) runs (most-recent FIRST in `runs`).
+  var spark = runs.slice(0, 30).slice().reverse(); // oldest -> newest left-to-right
+  var maxDur = 1;
+  spark.forEach(function(r) {
+    var d = r.duration_ms || 0;
+    if (d > maxDur) maxDur = d;
+  });
+  var W = 240, H = 36, pad = 2;
+  var step = spark.length > 1 ? (W - 2*pad) / (spark.length - 1) : 0;
+  var svg = '<svg width="' + W + '" height="' + H + '" style="display:block;background:var(--bg-secondary,#111);border-radius:4px;" aria-label="Last ' + spark.length + ' runs">';
+  // Polyline for duration trend.
+  var pts = spark.map(function(r, i) {
+    var d = r.duration_ms || 0;
+    var x = pad + i * step;
+    var y = H - pad - (d / maxDur) * (H - 2*pad);
+    return x.toFixed(1) + ',' + y.toFixed(1);
+  }).join(' ');
+  svg += '<polyline fill="none" stroke="var(--text-muted,#888)" stroke-width="1" points="' + pts + '" />';
+  // Status dots
+  spark.forEach(function(r, i) {
+    var d = r.duration_ms || 0;
+    var x = pad + i * step;
+    var y = H - pad - (d / maxDur) * (H - 2*pad);
+    var color = (r.status === 'ok' || r.status === 'success' || r.status === 'completed') ? '#4ade80'
+              : (r.status === 'error' || r.status === 'failed' || r.status === 'failure') ? '#f87171'
+              : '#fbbf24';
+    var tip = new Date(r.ts).toLocaleString() + ' - ' + (r.status||'?') + ' - ' + (d/1000).toFixed(2) + 's';
+    svg += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="2.5" fill="' + color + '"><title>' + escHtml(tip) + '</title></circle>';
+  });
+  svg += '</svg>';
+
+  // Stats: success rate, MTBF (mean time between failures), avg tokens/run.
+  var total = runs.length;
+  var okN = 0, errN = 0;
+  var tokSum = 0, tokN = 0;
+  var failTs = [];
+  runs.forEach(function(r) {
+    if (r.status === 'ok' || r.status === 'success' || r.status === 'completed') okN++;
+    else if (r.status === 'error' || r.status === 'failed' || r.status === 'failure') {
+      errN++;
+      if (r.ts) failTs.push(r.ts);
+    }
+    var u = r.usage || {};
+    var t = u.total_tokens || u.totalTokens || ((u.input_tokens||0)+(u.output_tokens||0)) || 0;
+    if (t > 0) { tokSum += t; tokN++; }
+  });
+  var successPct = total ? Math.round(okN / total * 100) : 0;
+  var mtbfStr = '-';
+  if (failTs.length >= 2) {
+    failTs.sort(function(a,b){return a-b;});
+    var gaps = [];
+    for (var i=1; i<failTs.length; i++) gaps.push(failTs[i]-failTs[i-1]);
+    var meanGapMs = gaps.reduce(function(a,b){return a+b;},0) / gaps.length;
+    var meanGapH = meanGapMs / 3600000;
+    if (meanGapH >= 24) mtbfStr = (meanGapH/24).toFixed(1) + 'd';
+    else if (meanGapH >= 1) mtbfStr = meanGapH.toFixed(1) + 'h';
+    else mtbfStr = Math.max(1, Math.round(meanGapMs/60000)) + 'm';
+  } else if (failTs.length <= 1) {
+    mtbfStr = errN === 0 ? 'no failures' : 'n/a';
+  }
+  var avgTok = tokN ? Math.round(tokSum / tokN) : 0;
+  var statRow = '<div style="display:flex;gap:14px;flex-wrap:wrap;color:var(--text-muted);font-size:11px;margin:8px 0;">'
+    + '<span><strong style="color:var(--text-primary);">' + successPct + '%</strong> success last ' + total + '</span>'
+    + '<span>MTBF <strong style="color:var(--text-primary);">' + escHtml(mtbfStr) + '</strong></span>'
+    + (avgTok ? '<span>~<strong style="color:var(--text-primary);">' + avgTok.toLocaleString() + '</strong> tokens/run</span>' : '')
+    + '</div>';
+
+  // Next-run-at line.
+  var nextLine = '';
+  var nextMs = null;
+  for (var k=0; k<runs.length; k++) {
+    if (runs[k].next_run_at) { nextMs = runs[k].next_run_at; break; }
+  }
+  if (!nextMs && jobJobs && jobJobs.state && jobJobs.state.nextRunAtMs) {
+    nextMs = jobJobs.state.nextRunAtMs;
+  }
+  if (nextMs) {
+    nextLine = '<div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;">Next run: <span style="color:var(--text-primary);">' + escHtml(new Date(nextMs).toLocaleString()) + '</span></div>';
+  }
+
+  // Recent-runs table (compact, scrollable).
+  var rows = '';
+  runs.slice(0, 30).forEach(function(r) {
+    var when = r.ts ? new Date(r.ts).toLocaleString() : '-';
+    var dur = r.duration_ms ? (r.duration_ms/1000).toFixed(2) + 's' : '-';
+    var isOk  = (r.status === 'ok' || r.status === 'success' || r.status === 'completed');
+    var isErr = (r.status === 'error' || r.status === 'failed' || r.status === 'failure');
+    var pillBg    = isOk ? '#166534' : isErr ? '#7f1d1d' : '#78350f';
+    var pillColor = isOk ? '#4ade80' : isErr ? '#f87171' : '#fbbf24';
+    var pillLabel = isOk ? (r.delivered_at ? 'OK ✓' : 'OK') : isErr ? 'FAIL' : escHtml(r.status || '?');
+    var tipParts  = [r.status || '?'];
+    if (r.delivered_at) tipParts.push('Delivered ' + new Date(r.delivered_at).toLocaleString());
+    if (r.error) tipParts.push('Error: ' + String(r.error).substring(0, 300));
+    var pill = '<span title="' + escHtml(tipParts.join(' · ')) + '" style="display:inline-block;padding:2px 8px;border-radius:999px;background:' + pillBg + ';color:' + pillColor + ';font-size:10px;font-weight:700;white-space:nowrap;">' + pillLabel + '</span>';
+    rows += '<tr>'
+      + '<td style="padding:3px 8px;">' + pill + '</td>'
+      + '<td style="padding:3px 8px;white-space:nowrap;">' + escHtml(when) + '</td>'
+      + '<td style="padding:3px 8px;">' + escHtml(dur) + '</td>'
+      + '</tr>';
+  });
+  var table = '<div style="max-height:240px;overflow:auto;border:1px solid var(--border-secondary);border-radius:4px;margin-top:6px;">'
+    + '<table style="width:100%;font-size:11px;border-collapse:collapse;">'
+    + '<thead style="position:sticky;top:0;background:var(--bg-secondary);"><tr style="text-align:left;color:var(--text-muted);">'
+    + '<th style="padding:4px 8px;font-weight:600;">Status</th>'
+    + '<th style="padding:4px 8px;font-weight:600;">When</th>'
+    + '<th style="padding:4px 8px;font-weight:600;">Duration</th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+
+  return '<div class="cron-run-timeline" data-job-id="' + escHtml(jobId) + '">'
+    + svg + statRow + nextLine + table + '</div>';
+}
+
 async function loadCronRuns(jobId) {
   try {
+    // Issue #605: per-job timeline endpoint reads ~/.openclaw/cron/runs/<id>.jsonl
+    // and returns 200 + empty list if the file is missing. We race it against
+    // the legacy gateway-derived /api/cron/<id>/runs endpoint so the existing
+    // calendar heatmap + status pills still render even when the JSONL feed
+    // is empty (no OpenClaw cron writer yet).
+    var timelinePromise = fetch('/api/crons/' + encodeURIComponent(jobId) + '/runs?limit=30')
+      .then(function(r) { return r.ok ? r.json() : {runs:[]}; })
+      .catch(function() { return {runs:[]}; });
     var resp = await fetch('/api/cron/' + encodeURIComponent(jobId) + '/runs');
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     var data = await resp.json();
+    var timelineData = await timelinePromise;
+    var timelineRuns = (timelineData && timelineData.runs) || [];
     var el = document.getElementById('cron-runs-' + jobId);
     if (!el) return;
     var runs = (data && data.runs) || [];
-    if (runs.length === 0) {
-      el.innerHTML = '<div style="color:var(--text-muted);">No run history yet — your agent has not reported any runs for this job.</div>';
+    var jobObj = (_cronJobs || []).find(function(j) { return j.id === jobId; });
+    var timelineHtml = _renderCronRunTimeline(jobId, timelineRuns, jobObj);
+    if (runs.length === 0 && timelineRuns.length === 0) {
+      el.innerHTML = (timelineHtml || '') + '<div style="color:var(--text-muted);">No run history yet — your agent has not reported any runs for this job.</div>';
+      return;
+    }
+    if (runs.length === 0 && timelineRuns.length > 0) {
+      el.innerHTML = timelineHtml;
       return;
     }
     // Build calendar heatmap (last 30 days)
@@ -4502,7 +5582,7 @@ async function loadCronRuns(jobId) {
         h += '<div style="color:var(--text-error);font-size:11px;padding:2px 0 4px 8px;border-left:2px solid var(--text-error);margin-left:4px;">' + escHtml(r.error).substring(0,200) + '</div>';
       }
     });
-    el.innerHTML = h;
+    el.innerHTML = timelineRuns.length > 0 ? timelineHtml : h;
   } catch(e) {
     var el = document.getElementById('cron-runs-' + jobId);
     if (el) el.innerHTML = '<div style="color:var(--text-error);">Could not load run history (' + escHtml(String(e.message||e)) + '). The endpoint may be unreachable or your gateway is offline.</div>';
@@ -4907,7 +5987,10 @@ async function _loadMemoryAllFiles() {
     return;
   }
   loadMemoryAnalytics();
-  var data = await fetch('/api/memory-files').then(r => r.json());
+  var rawData = await fetch('/api/memory-files').then(r => r.json());
+  // /api/memory-files used to return a bare array; the local-store fast
+  // path wraps in {files:[...], _source:"local_store"}. Accept both.
+  var data = Array.isArray(rawData) ? rawData : (rawData && rawData.files) || [];
   var el = document.getElementById('memory-list');
   // Add hover CSS once
   if (!document.getElementById('mem-ide-css')) {
@@ -4982,99 +6065,15 @@ async function _loadMemoryAllFiles() {
   });
 }
 
-// ===== Mission Control Summary Bar =====
-var _mcData = null;
-var _mcExpanded = null;
-var _mcRefreshTimer = null;
-
-async function loadMCTasks() {
-  try {
-    var r = await fetch('/api/mc-tasks');
-    var data = await r.json();
-    var wrapper = document.getElementById('mc-bar-wrapper');
-    if (!data.available) { wrapper.style.display='none'; return; }
-    wrapper.style.display='';
-    var tasks = data.tasks || [];
-    var cols = [
-      {key:'inbox', label:'Inbox', color:'#3b82f6', bg:'#3b82f620', icon:'📥', tasks:[]},
-      {key:'in_progress', label:'In Progress', color:'#16a34a', bg:'#16a34a20', icon:'🔄', tasks:[]},
-      {key:'review', label:'Review', color:'#d97706', bg:'#d9770620', icon:'👀', tasks:[]},
-      {key:'blocked', label:'Blocked', color:'#dc2626', bg:'#dc262620', icon:'🚫', tasks:[]},
-      {key:'done', label:'Done', color:'#6b7280', bg:'#6b728020', icon:'✅', tasks:[]}
-    ];
-    tasks.forEach(function(t) {
-      var col = t.column || 'inbox';
-      var c = cols.find(function(x){return x.key===col;});
-      if (c) c.tasks.push(t);
-    });
-    _mcData = cols;
-    var bar = document.getElementById('mc-summary-bar');
-    var html = '<span style="font-size:12px;font-weight:700;color:var(--text-tertiary);margin-right:4px;">🎯 MC</span>';
-    cols.forEach(function(c, i) {
-      if (i > 0) html += '<span style="color:var(--text-faint);font-size:12px;margin:0 2px;">│</span>';
-      var active = _mcExpanded === c.key ? 'outline:2px solid '+c.color+';outline-offset:-2px;' : '';
-      html += '<span data-col-key="'+c.key+'" onclick="toggleMCColumn(this.dataset.colKey)" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;padding:4px 10px;border-radius:16px;background:'+c.bg+';'+active+'transition:all 0.15s;">';
-      html += '<span style="font-size:12px;">'+c.icon+'</span>';
-      html += '<span style="font-size:11px;color:var(--text-secondary);">'+c.label+'</span>';
-      html += '<span style="font-size:12px;font-weight:700;color:'+c.color+';min-width:16px;text-align:center;">'+c.tasks.length+'</span>';
-      html += '</span>';
-    });
-    var total = tasks.length;
-    html += '<span style="margin-left:auto;font-size:10px;color:var(--text-muted);">'+total+' tasks</span>';
-    bar.innerHTML = html;
-    if (_mcExpanded) renderMCExpanded(_mcExpanded);
-  } catch(e) {
-    var w = document.getElementById('mc-bar-wrapper');
-    if (w) w.style.display='none';
-  }
-}
-
-function toggleMCColumn(key) {
-  if (_mcExpanded === key) { _mcExpanded = null; document.getElementById('mc-expanded-section').style.display='none'; }
-  else { _mcExpanded = key; renderMCExpanded(key); }
-  // Re-render bar to update active pill
-  if (_mcData) {
-    var bar = document.getElementById('mc-summary-bar');
-    var cols = _mcData;
-    var html = '<span style="font-size:12px;font-weight:700;color:var(--text-tertiary);margin-right:4px;">🎯 MC</span>';
-    cols.forEach(function(c, i) {
-      if (i > 0) html += '<span style="color:var(--text-faint);font-size:12px;margin:0 2px;">│</span>';
-      var active = _mcExpanded === c.key ? 'outline:2px solid '+c.color+';outline-offset:-2px;' : '';
-      html += '<span data-col-key="'+c.key+'" onclick="toggleMCColumn(this.dataset.colKey)" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;padding:4px 10px;border-radius:16px;background:'+c.bg+';'+active+'transition:all 0.15s;">';
-      html += '<span style="font-size:12px;">'+c.icon+'</span>';
-      html += '<span style="font-size:11px;color:var(--text-secondary);">'+c.label+'</span>';
-      html += '<span style="font-size:12px;font-weight:700;color:'+c.color+';min-width:16px;text-align:center;">'+c.tasks.length+'</span>';
-      html += '</span>';
-    });
-    var total = cols.reduce(function(s,c){return s+c.tasks.length;},0);
-    html += '<span style="margin-left:auto;font-size:10px;color:var(--text-muted);">'+total+' tasks</span>';
-    bar.innerHTML = html;
-  }
-}
-
-function renderMCExpanded(key) {
-  var sec = document.getElementById('mc-expanded-section');
-  if (!_mcData) { sec.style.display='none'; return; }
-  var col = _mcData.find(function(c){return c.key===key;});
-  if (!col || col.tasks.length === 0) { sec.style.display='block'; sec.innerHTML='<div style="font-size:12px;color:var(--text-muted);padding:4px;">No tasks in '+col.label+'</div>'; return; }
-  sec.style.display='block';
-  var html = '<div style="font-size:11px;font-weight:700;color:'+col.color+';margin-bottom:8px;">'+col.icon+' '+col.label+' ('+col.tasks.length+')</div>';
-  html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:6px;">';
-  col.tasks.forEach(function(t) {
-    var title = t.title || '--';
-    var badge = t.companyId ? '<span style="font-size:9px;background:var(--bg-secondary);padding:1px 5px;border-radius:3px;color:var(--text-muted);margin-left:6px;">'+t.companyId+'</span>' : '';
-    html += '<div style="font-size:12px;color:var(--text-secondary);padding:4px 8px;background:var(--bg-secondary);border-radius:6px;border-left:3px solid '+col.color+';white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="'+(t.title||'').replace(/"/g,'&quot;')+'">'+title+badge+'</div>';
-  });
-  html += '</div>';
-  sec.innerHTML = html;
-}
-
-// MC auto-refresh every 30s
-if (!_mcRefreshTimer) {
-  _mcRefreshTimer = setInterval(function() {
-    if (document.querySelector('.nav-tab.active')?.textContent?.trim() === 'Overview') loadMCTasks();
-  }, 30000);
-}
+// ===== Mission Control Summary Bar — REMOVED =====
+// The Mission Control summary used to proxy a dedicated MC service via
+// /api/mc-tasks. That backend route was deleted in commit 62e1fe7 when the
+// external MC service was retired, but the polling code (initial fetch +
+// 30s setInterval) was left behind and was firing ~11 404s per audit walk
+// (issue #1127). The whole feature is dead — no `mc-bar-wrapper` /
+// `mc-summary-bar` / `mc-expanded-section` elements exist in the templates
+// either — so the polling loop, helpers and module-level state have all
+// been removed. If MC ever returns, restore from git history.
 
 // ===== Health Checks =====
 async function loadHealth() {
@@ -5111,6 +6110,72 @@ function startHealthStream() {
     } catch(ex) {}
   };
   healthStream.onerror = function() { setTimeout(startHealthStream, 30000); };
+}
+
+// Gateway-health 24h sparkline (#852 followup, MOAT/DuckDB-first).
+// Pulls daemon-captured `gateway.metric` events from /api/gateway-health/history
+// and renders them as a 240x36 inline SVG inside #sh-gateway-spark. Empty
+// data (fresh install: no daemon yet, or <30s elapsed) renders as a quiet
+// "no history yet" hint so the card never looks broken.
+async function _loadGatewayHealthSparkline() {
+  var el = document.getElementById('sh-gateway-spark');
+  if (!el) return;
+  var rows;
+  try {
+    rows = await fetchJsonWithTimeout('/api/gateway-health/history?hours=24', 6000);
+  } catch (_e) {
+    rows = [];
+  }
+  if (!Array.isArray(rows) || rows.length === 0) {
+    el.innerHTML = '<div style="font-size:10px;color:var(--text-muted);font-style:italic;opacity:0.7;">Sparkline available after daemon captures 24h of samples.</div>';
+    return;
+  }
+  // Only keep rows with a numeric rss_mb — daemon may have written
+  // gateway.metric rows where vitals weren't readable (status=warning,
+  // rss_mb=null). Those break the y-axis; skip them.
+  var pts = rows.filter(function(r) {
+    return r && typeof r.rss_mb === 'number';
+  });
+  if (pts.length === 0) {
+    el.innerHTML = '<div style="font-size:10px;color:var(--text-muted);font-style:italic;opacity:0.7;">Sparkline available after daemon captures 24h of samples.</div>';
+    return;
+  }
+  var W = 240, H = 36, pad = 2;
+  var maxRss = 0, minRss = pts[0].rss_mb;
+  pts.forEach(function(p) {
+    if (p.rss_mb > maxRss) maxRss = p.rss_mb;
+    if (p.rss_mb < minRss) minRss = p.rss_mb;
+  });
+  // Avoid a flat-line that visually collapses to the bottom — give the
+  // y-range a 10MB floor so small fluctuations are still visible.
+  var range = Math.max(10, maxRss - minRss);
+  var step = pts.length > 1 ? (W - 2*pad) / (pts.length - 1) : 0;
+  var coords = pts.map(function(p, i) {
+    var x = pad + i * step;
+    var y = H - pad - ((p.rss_mb - minRss) / range) * (H - 2*pad);
+    return x.toFixed(1) + ',' + y.toFixed(1);
+  });
+  var svg = '<svg width="' + W + '" height="' + H + '" style="display:block;background:var(--bg-primary,#0a0a0a);border-radius:4px;border:1px solid var(--border-secondary);" aria-label="Gateway RSS over last 24h">';
+  // Filled area under the curve for a "memory pressure" feel.
+  var areaPts = coords.slice();
+  areaPts.push((pad + (pts.length-1) * step).toFixed(1) + ',' + (H - pad).toFixed(1));
+  areaPts.push(pad.toFixed(1) + ',' + (H - pad).toFixed(1));
+  svg += '<polygon fill="rgba(34,197,94,0.18)" points="' + areaPts.join(' ') + '" />';
+  // Trend line.
+  svg += '<polyline fill="none" stroke="#22c55e" stroke-width="1.2" points="' + coords.join(' ') + '" />';
+  // Latest-point dot.
+  var last = pts[pts.length - 1];
+  var lastX = pad + (pts.length-1) * step;
+  var lastY = H - pad - ((last.rss_mb - minRss) / range) * (H - 2*pad);
+  svg += '<circle cx="' + lastX.toFixed(1) + '" cy="' + lastY.toFixed(1) + '" r="2" fill="#22c55e"><title>' + last.rss_mb + ' MB @ ' + (last.ts || '') + '</title></circle>';
+  svg += '</svg>';
+  // Min/max caption.
+  var caption = '<div style="font-size:10px;color:var(--text-muted);margin-top:3px;display:flex;justify-content:space-between;">'
+    + '<span>min ' + minRss.toFixed(0) + ' MB</span>'
+    + '<span style="color:var(--text-secondary);">' + pts.length + ' samples · 24h</span>'
+    + '<span>max ' + maxRss.toFixed(0) + ' MB</span>'
+    + '</div>';
+  el.innerHTML = svg + caption;
 }
 
 // ===== System Health Panel =====
@@ -5277,6 +6342,205 @@ async function loadSystemHealth() {
       }
     } catch(e) {}
 
+    // Channel ingest (#1310 follow-up) — per-provider message counts so
+    // operators see whether the gateway WS tap is actually writing
+    // Telegram/Signal/Slack/etc. messages to DuckDB. Closes the user-felt
+    // loop on PR #1313 (the env-var fix): if Telegram appears here with a
+    // recent mins_ago, the tap is hot. If "never" / very stale, daemon
+    // didn't pick up the env var and Brain feed will look empty too.
+    try {
+      var ingest = (d && Array.isArray(d.channel_ingest)) ? d.channel_ingest : [];
+      var ciWrap = document.getElementById('sh-channel-ingest-wrap');
+      var ciEl = document.getElementById('sh-channel-ingest');
+      if (ciEl && ciWrap) {
+        if (ingest.length === 0) {
+          ciWrap.style.display = 'none';
+        } else {
+          ciWrap.style.display = '';
+          var emoji = function(p) {
+            return p === 'telegram' ? '✈️'
+                 : p === 'signal'   ? '📡'
+                 : p === 'slack'    ? '💬'
+                 : p === 'discord'  ? '🎮'
+                 : p === 'whatsapp' ? '🟢'
+                 : p === 'imessage' ? '🍎'
+                 : p === 'webchat'  ? '🌐'
+                 : p === 'irc'      ? '#'
+                 : '📨';
+          };
+          var fmtMins = function(m) {
+            if (m == null) return 'never';
+            if (m < 1) return 'just now';
+            if (m < 60) return m + 'm ago';
+            if (m < 1440) return Math.floor(m/60) + 'h ago';
+            return Math.floor(m/1440) + 'd ago';
+          };
+          var cihtml = '';
+          ingest.forEach(function(row) {
+            var mins = row.mins_ago;
+            // Hot < 10m → green, warm < 60m → amber, stale → muted.
+            var dotColor = (mins != null && mins < 10) ? '#16a34a'
+                         : (mins != null && mins < 60) ? '#d97706'
+                         : '#6b7280';
+            var border = (mins != null && mins < 10) ? 'rgba(22,163,74,0.3)' : 'var(--border-secondary)';
+            cihtml += '<div title="total ' + row.total + ' (' + (row.msg_in||0) + ' in / ' + (row.msg_out||0) + ' out)" '
+              + 'style="display:flex;align-items:center;gap:7px;padding:7px 12px;background:var(--bg-secondary);border-radius:8px;border:1px solid ' + border + ';font-size:12px;margin-bottom:4px;">'
+              + '<span style="width:9px;height:9px;border-radius:50%;background:' + dotColor + ';flex-shrink:0;display:inline-block;"></span>'
+              + emoji(row.provider) + ' <span style="font-weight:600;color:var(--text-primary);">' + escHtml(row.provider) + '</span>'
+              + '<span style="color:var(--text-muted);font-size:11px;margin-left:auto;">' + fmtMins(mins) + ' &middot; ' + row.total + ' total</span>'
+              + '</div>';
+          });
+          ciEl.innerHTML = cihtml;
+        }
+      }
+    } catch(e) { /* channel-ingest panel optional */ }
+
+    // Handler latency (#1283) — top-N slowest /api/* endpoints, 5-min rolling p50/p95.
+    // Surfaces /api/sessions-class regressions in seconds, not weeks.
+    try {
+      var latData = await fetchJsonWithTimeout('/api/handler-latency?top=10', 3000);
+      var latWrap = document.getElementById('sh-latency-wrap');
+      var latEl = document.getElementById('sh-latency');
+      var endpoints = (latData && Array.isArray(latData.endpoints)) ? latData.endpoints : [];
+      if (latEl && latWrap) {
+        if (endpoints.length === 0) {
+          latWrap.style.display = 'none';
+        } else {
+          latWrap.style.display = '';
+          var slowThr = latData.slow_threshold_ms || 500;
+          var lhtml = '';
+          endpoints.forEach(function(ep) {
+            var p95 = ep.p95_ms || 0;
+            var p50 = ep.p50_ms || 0;
+            var bad = ep.is_slow || p95 > slowThr;
+            var bg = bad ? 'var(--bg-error,rgba(220,38,38,0.08))' : 'var(--bg-secondary)';
+            var border = bad ? 'rgba(220,38,38,0.3)' : 'var(--border-secondary)';
+            var p95Color = bad ? 'var(--text-error,#dc2626)' : 'var(--text-primary)';
+            var p95Str = p95 >= 1000 ? (p95/1000).toFixed(2) + 's' : Math.round(p95) + 'ms';
+            var p50Str = p50 >= 1000 ? (p50/1000).toFixed(2) + 's' : Math.round(p50) + 'ms';
+            // Issue #1290 — humanised label for non-technical operators;
+            // raw endpoint identifier preserved in the tooltip for engineers
+            // who need it (grep, log correlation).
+            var label = ep.label || ep.endpoint;
+            lhtml += '<div title="' + escHtml(ep.endpoint) + '" style="display:flex;align-items:center;gap:8px;padding:6px 12px;background:' + bg + ';border-radius:6px;border:1px solid ' + border + ';font-size:12px;margin-bottom:4px;">'
+              + '<span style="color:var(--text-primary);font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escHtml(label) + '</span>'
+              + '<span style="color:var(--text-muted);font-size:10px;">n=' + ep.count + '</span>'
+              + '<span style="color:var(--text-muted);font-size:11px;">p50 ' + p50Str + '</span>'
+              + '<span style="color:' + p95Color + ';font-weight:600;font-size:11px;">p95 ' + p95Str + '</span>'
+              + '</div>';
+          });
+          latEl.innerHTML = lhtml;
+        }
+      }
+    } catch(e) { /* latency panel optional */ }
+
+    // Daemon health (PRD #1133 layer 4) — surface sync.log error rate so
+    // the silent-NameError class of bug stops slipping past users.
+    var dmWrap = document.getElementById('sh-daemon-wrap');
+    var dmEl = document.getElementById('sh-daemon');
+    if (d.daemon && dmEl) {
+      var dm = d.daemon;
+      var dmStatus = dm.status || 'healthy';
+      var dmDot = dmStatus === 'healthy' ? '🟢' : (dmStatus === 'degraded' ? '🟡' : '🔴');
+      var dmColor = dmStatus === 'healthy' ? 'var(--text-success,#22c55e)'
+                  : dmStatus === 'degraded' ? '#f59e0b'
+                  : 'var(--text-error,#dc2626)';
+      var dmLabel = dmStatus === 'healthy' ? 'Healthy'
+                  : dmStatus === 'degraded' ? 'Degraded'
+                  : 'BROKEN';
+      var e5 = dm.errors_last_5min || 0;
+      var e1h = dm.errors_last_1h || 0;
+      var msg = dm.last_error_message || '';
+      // Truncate to 200 chars at the UI layer (parser already capped at 500).
+      var msgShort = msg.length > 200 ? msg.slice(0, 200) + '…' : msg;
+      var html = '<div style="padding:8px 14px;background:var(--bg-secondary);border-radius:8px;border:1px solid var(--border-secondary);font-size:13px;">';
+      html += '<div style="display:flex;align-items:center;gap:8px;">';
+      html += dmDot + ' <span style="font-weight:600;color:' + dmColor + ';">' + dmLabel + '</span>';
+      html += '<span style="color:var(--text-muted);font-size:11px;margin-left:auto;">';
+      html += 'Last 5m: <span style="color:' + (e5 > 0 ? dmColor : 'var(--text-muted)') + ';font-weight:600;">' + e5 + '</span>';
+      html += ' &nbsp;·&nbsp; Last 1h: <span style="color:' + (e1h > 0 ? dmColor : 'var(--text-muted)') + ';font-weight:600;">' + e1h + '</span>';
+      html += '</span></div>';
+      if (msgShort) {
+        html += '<div style="margin-top:8px;padding:6px 8px;background:var(--bg-primary);border:1px solid var(--border-secondary);border-radius:6px;font-family:\'JetBrains Mono\',monospace;font-size:11px;color:var(--text-secondary);word-break:break-word;">';
+        html += escHtml(msgShort);
+        if (dm.last_error_ts) {
+          html += '<div style="margin-top:4px;color:var(--text-muted);font-size:10px;">at ' + escHtml(dm.last_error_ts) + '</div>';
+        }
+        html += '</div>';
+      }
+      if (dm.log_path) {
+        html += '<div style="margin-top:6px;font-size:10px;color:var(--text-muted);font-family:\'JetBrains Mono\',monospace;">📄 ' + escHtml(dm.log_path) + '</div>';
+      }
+      html += '</div>';
+      dmEl.innerHTML = html;
+      // Always show the card — daemon is core infrastructure, even "healthy" is reassuring.
+      if (dmWrap) dmWrap.style.display = '';
+    } else if (dmWrap) { dmWrap.style.display = 'none'; }
+
+    // Gateway health (#852) — surface OpenClaw gateway process vitals
+    // (RSS / CPU / uptime). The ~600MB → ~945MB memory-bloat-OOM pattern
+    // was invisible from the dashboard until this card landed.
+    var gwWrap = document.getElementById('sh-gateway-wrap');
+    var gwEl = document.getElementById('sh-gateway');
+    if (d.gateway && gwEl) {
+      var gw = d.gateway;
+      var gwStatus = gw.status || 'not_running';
+      var gwDot, gwLabel, gwColor;
+      if (gwStatus === 'critical') {
+        gwDot = '🔴'; gwLabel = 'Critical'; gwColor = 'var(--text-error,#dc2626)';
+      } else if (gwStatus === 'warning') {
+        gwDot = '🟡'; gwLabel = 'Warning'; gwColor = '#f59e0b';
+      } else if (gwStatus === 'healthy') {
+        gwDot = '🟢'; gwLabel = 'Healthy'; gwColor = 'var(--text-success,#22c55e)';
+      } else {
+        gwDot = '⚫'; gwLabel = 'Not running'; gwColor = 'var(--text-muted)';
+      }
+      var rss = (typeof gw.rss_mb === 'number') ? gw.rss_mb : null;
+      var thr = gw.memory_threshold_mb || 900;
+      var memPct = (rss !== null) ? Math.min(100, Math.round((rss / thr) * 100)) : 0;
+      var memBarColor = (gwStatus === 'critical') ? 'var(--text-error,#dc2626)'
+                      : (gwStatus === 'warning') ? '#f59e0b'
+                      : 'var(--text-success,#22c55e)';
+      // Pretty uptime: "1d 3h", "47m", "12s"
+      function _fmtUp(s) {
+        if (s === null || s === undefined) return '—';
+        s = Math.max(0, Math.floor(s));
+        if (s < 60) return s + 's';
+        if (s < 3600) return Math.floor(s/60) + 'm';
+        if (s < 86400) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+        return Math.floor(s/86400) + 'd ' + Math.floor((s%86400)/3600) + 'h';
+      }
+      var gwHtml = '<div style="padding:8px 14px;background:var(--bg-secondary);border-radius:8px;border:1px solid var(--border-secondary);font-size:13px;">';
+      gwHtml += '<div style="display:flex;align-items:center;gap:8px;">';
+      gwHtml += gwDot + ' <span style="font-weight:600;color:' + gwColor + ';">' + gwLabel + '</span>';
+      if (gw.pid) {
+        gwHtml += '<span style="color:var(--text-muted);font-size:11px;font-family:\'JetBrains Mono\',monospace;">PID ' + gw.pid + '</span>';
+      }
+      gwHtml += '<span style="color:var(--text-muted);font-size:11px;margin-left:auto;">Uptime: <span style="color:var(--text-secondary);font-weight:600;">' + _fmtUp(gw.uptime_seconds) + '</span></span>';
+      gwHtml += '</div>';
+      if (rss !== null) {
+        gwHtml += '<div style="margin-top:8px;">';
+        gwHtml += '<div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted);margin-bottom:4px;">';
+        gwHtml += '<span>Memory</span>';
+        gwHtml += '<span style="color:' + gwColor + ';font-weight:600;">' + rss + ' MB</span><span> / ' + thr + ' MB</span>';
+        gwHtml += '</div>';
+        gwHtml += '<div style="height:6px;background:var(--bg-primary);border-radius:3px;overflow:hidden;border:1px solid var(--border-secondary);">';
+        gwHtml += '<div style="height:100%;width:' + memPct + '%;background:' + memBarColor + ';transition:width 0.3s ease;"></div>';
+        gwHtml += '</div></div>';
+      }
+      if (typeof gw.cpu_pct === 'number') {
+        gwHtml += '<div style="margin-top:6px;font-size:11px;color:var(--text-muted);">CPU: <span style="color:var(--text-secondary);font-weight:600;">' + gw.cpu_pct + '%</span></div>';
+      }
+      // 24h RSS sparkline (#852 followup) — placeholder div; populated
+      // asynchronously by _loadGatewayHealthSparkline() below.
+      gwHtml += '<div id="sh-gateway-spark" style="margin-top:8px;min-height:36px;"></div>';
+      gwHtml += '</div>';
+      gwEl.innerHTML = gwHtml;
+      if (gwWrap) gwWrap.style.display = '';
+      // Kick off the sparkline fetch; never blocks the rest of the card.
+      try { _loadGatewayHealthSparkline(); } catch (_e) {}
+    } else if (gwWrap) { gwWrap.style.display = 'none'; }
+
     // Sandbox Status (conditional)
     var sbWrap = document.getElementById('sh-sandbox-wrap');
     var sbEl = document.getElementById('sh-sandbox');
@@ -5324,8 +6588,16 @@ async function loadSystemHealth() {
 
     return true;
   } catch(e) {
+    // Issue #1257 part 3 — replace static "Unable to load right now"
+    // with Failed-to-load + Retry. Mirrors Brain pattern (PR #1239).
     console.error('System health load failed', e);
-    var msg = '<div style="padding:8px 10px;background:var(--bg-secondary);border:1px solid var(--border-secondary);border-radius:8px;font-size:12px;color:var(--text-muted);">Unable to load right now</div>';
+    var errMsg = escHtml(String(e && e.message || e));
+    var msg = '<div style="padding:8px 10px;background:var(--bg-error,rgba(220,38,38,0.08));border:1px solid rgba(220,38,38,0.3);border-radius:8px;font-size:12px;color:var(--text-error,#dc2626);">'
+      + 'Failed to load: ' + errMsg
+      + ' <button onclick="loadSystemHealth()" title="Server slow \u2014 usually clears within 30 s" '
+      + 'style="margin-left:8px;background:transparent;border:1px solid var(--border-primary);'
+      + 'color:var(--text-secondary);border-radius:4px;padding:1px 8px;font-size:11px;cursor:pointer;">Retry</button>'
+      + '</div>';
     document.getElementById('sh-services').innerHTML = msg;
     document.getElementById('sh-disks').innerHTML = msg;
     document.getElementById('sh-crons').innerHTML = msg;
@@ -5381,12 +6653,20 @@ async function _loadReliabilityWidget() {
 function startSystemHealthRefresh() {
   loadSystemHealth();
   if (window._sysHealthTimer) clearInterval(window._sysHealthTimer);
-  window._sysHealthTimer = setInterval(loadSystemHealth, 30000);
+  window._sysHealthTimer = visibilitySetInterval(loadSystemHealth, 30000);
 }
 
 async function loadDiagnostics() {
   var el = document.getElementById('sh-diagnostics');
   if (!el) return false;
+  // Diagnostics inspect local processes and on-disk OpenClaw config — neither
+  // exists in the cloud iframe. The cloud server returns 410 / 404 for both
+  // URLs, which the browser logs as console errors on every System Health
+  // refresh. Skip the call entirely and render a static "local-only" note.
+  if (window.CLOUD_MODE) {
+    el.innerHTML = '<div style="color:var(--text-muted);">Diagnostics are local-only — open the dashboard on the host to inspect detected config.</div>';
+    return true;
+  }
   try {
     var d = await fetchJsonWithTimeout('/api/diagnostics', 6000).catch(function() {
       return fetchJsonWithTimeout('/api/config-diagnostics', 6000);
@@ -5608,6 +6888,8 @@ async function loadUsage() {
     tableHtml += '<tr><td>This Month</td><td>' + fmtTokens(data.month) + '</td><td>' + fmtCost(data.monthCost) + '</td></tr>';
     tableHtml += '</tbody>';
     document.getElementById('usage-cost-table').innerHTML = tableHtml;
+    // Issue #68 — per-session cost breakdown table.
+    renderTopSessionsByCost(data.sessions || []);
     // OTLP-specific sections
     var otelExtra = document.getElementById('otel-extra-sections');
     if (data.source === 'otlp') {
@@ -5652,8 +6934,121 @@ async function loadUsage() {
     loadCostComparison();
     // Load activity heatmap
     loadHeatmap();
+    // Load prompt cache analytics (GH #979)
+    loadCacheAnalytics();
   } catch(e) {
     document.getElementById('usage-chart').innerHTML = '<span style="color:#555">No usage data available</span>';
+  }
+}
+
+// Issue #68 — render "Top sessions by cost" table on the Usage tab.
+// Rows come straight from /api/usage's new ``sessions`` array, already
+// sorted desc by total_cost_usd server-side.
+function renderTopSessionsByCost(rows) {
+  var el = document.getElementById('usage-top-sessions-table');
+  if (!el) return;
+  function fmtCost(c) { return c >= 0.01 ? '$' + c.toFixed(2) : c > 0 ? '<$0.01' : '$0.00'; }
+  function fmtTokens(n) { return n >= 1000000 ? (n/1000000).toFixed(1) + 'M' : n >= 1000 ? (n/1000).toFixed(0) + 'K' : String(n); }
+  function fmtDate(iso) {
+    if (!iso) return '—';
+    var d = String(iso).slice(0, 10);
+    return d || '—';
+  }
+  if (!rows || rows.length === 0) {
+    el.innerHTML = '<tbody><tr><td colspan="6" style="color:#666;">No session cost data yet</td></tr></tbody>';
+    return;
+  }
+  var html = '<thead><tr>'
+    + '<th>Session</th>'
+    + '<th>Agent</th>'
+    + '<th>Model</th>'
+    + '<th style="text-align:right;">Tokens</th>'
+    + '<th style="text-align:right;">Cost</th>'
+    + '<th style="text-align:right;">Msgs</th>'
+    + '<th>Started</th>'
+    + '</tr></thead><tbody>';
+  rows.forEach(function(r) {
+    var sid = String(r.session_id || '');
+    var sidShort = sid.length > 16 ? sid.slice(-16) : sid;
+    html += '<tr>'
+      + '<td><code style="font-size:11px;color:var(--text-muted);">' + escHtml(sidShort) + '</code></td>'
+      + '<td>' + escHtml(r.agent_id || '—') + '</td>'
+      + '<td>' + (r.model ? '<span class="badge model">' + escHtml(r.model) + '</span>' : '—') + '</td>'
+      + '<td style="text-align:right;">' + fmtTokens(r.total_tokens || 0) + '</td>'
+      + '<td style="text-align:right;font-weight:600;">' + fmtCost(r.total_cost_usd || 0) + '</td>'
+      + '<td style="text-align:right;">' + (r.message_count || 0) + '</td>'
+      + '<td style="color:var(--text-muted);font-size:12px;">' + escHtml(fmtDate(r.started_at)) + '</td>'
+      + '</tr>';
+  });
+  html += '</tbody>';
+  el.innerHTML = html;
+}
+
+async function loadCacheAnalytics() {
+  try {
+    var d = await fetch('/api/usage/cache-trends?days=14').then(function(r) { return r.json(); });
+    var tot = d.totals || {};
+    var hasCache = (tot.cache_read_tokens || 0) + (tot.cache_write_tokens || 0) > 0;
+    var title = document.getElementById('cache-perf-title');
+    var card = document.getElementById('cache-perf-card');
+    if (!title || !card) return;
+    if (!hasCache) return;
+    title.style.display = '';
+    card.style.display = '';
+
+    var hit = tot.cache_hit_ratio_pct || 0;
+    var hitColor = hit >= 60 ? '#22c55e' : hit >= 30 ? '#f59e0b' : '#ef4444';
+    var savings = tot.est_savings_usd || 0;
+    var crToks = tot.cache_read_tokens || 0;
+    var cwToks = tot.cache_write_tokens || 0;
+
+    function fmtToks(n) { return n >= 1e6 ? (n/1e6).toFixed(1)+'M' : n >= 1e3 ? (n/1e3).toFixed(0)+'K' : String(n||0); }
+    function fmtCost(c) { return c >= 0.01 ? '$'+c.toFixed(2) : c > 0 ? '<$0.01' : '$0.00'; }
+
+    var html = '<div style="display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start;">'
+      + '<div style="min-width:120px;text-align:center;">'
+      + '<div style="font-size:32px;font-weight:700;color:'+hitColor+';">'+hit.toFixed(1)+'%</div>'
+      + '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">cache hit rate</div>'
+      + '<div style="font-size:11px;color:var(--text-muted);margin-top:4px;">'+fmtToks(crToks)+' read · '+fmtToks(cwToks)+' write</div>'
+      + '</div>'
+      + '<div style="flex:1;min-width:180px;">';
+
+    if (savings > 0) {
+      html += '<div style="font-size:13px;margin-bottom:8px;">💰 Est. savings: <strong style="color:#22c55e;">'+fmtCost(savings)+'</strong> vs. uncached</div>';
+    }
+
+    var models = (d.by_model || []).filter(function(m) { return (m.cache_read_tokens||0)+(m.cache_write_tokens||0) > 0; });
+    if (models.length > 0) {
+      html += '<table style="width:100%;border-collapse:collapse;font-size:12px;">'
+        + '<thead><tr>'
+        + '<th style="text-align:left;color:var(--text-muted);padding:2px 8px 4px 0;font-weight:500;">Model</th>'
+        + '<th style="text-align:right;color:var(--text-muted);padding:2px 0 4px 8px;font-weight:500;">Hit %</th>'
+        + '<th style="text-align:right;color:var(--text-muted);padding:2px 0 4px 8px;font-weight:500;">Saved</th>'
+        + '</tr></thead><tbody>';
+      models.forEach(function(m) {
+        var mhit = m.cache_hit_ratio_pct || 0;
+        var mc = mhit >= 60 ? '#22c55e' : mhit >= 30 ? '#f59e0b' : '#ef4444';
+        html += '<tr>'
+          + '<td style="padding:2px 8px 2px 0;color:var(--text-secondary);">'+escHtml(m.model||'—')+'</td>'
+          + '<td style="text-align:right;padding:2px 0 2px 8px;color:'+mc+';font-weight:600;">'+mhit.toFixed(1)+'%</td>'
+          + '<td style="text-align:right;padding:2px 0 2px 8px;color:var(--text-muted);">'+fmtCost(m.est_savings_usd||0)+'</td>'
+          + '</tr>';
+      });
+      html += '</tbody></table>';
+    }
+
+    html += '</div></div>';
+
+    var recs = d.recommendations || [];
+    if (recs.length > 0) {
+      html += '<div style="margin-top:12px;padding:8px 12px;background:var(--bg-secondary);border-radius:6px;border-left:3px solid '+hitColor+';font-size:12px;color:var(--text-secondary);">'
+        + recs.map(function(r) { return escHtml(r); }).join('<br>')
+        + '</div>';
+    }
+
+    document.getElementById('cache-perf-content').innerHTML = html;
+  } catch(e) {
+    // Cache panel is optional — skip silently on error
   }
 }
 
@@ -6204,7 +7599,35 @@ function _buildReplayEvent(m, idx) {
     extra.from_hook = m.from_hook;
     extra.summary_truncated = m.summary_truncated;
   }
-  return { role: role, type: type, content: m.content || '', timestamp: m.timestamp, tokens: m.tokens || null, originalIndex: idx, extra: extra };
+  // Issue #564: decoding params (temperature / top_p / max_tokens / …) come
+  // through verbatim from the backend on assistant turns so the renderer can
+  // show a "⚙ T=0.7 · top_p=1 · max=4096" pill inline with the message.
+  return {
+    role: role,
+    type: type,
+    content: m.content || '',
+    timestamp: m.timestamp,
+    tokens: m.tokens || null,
+    params: m.params || null,
+    originalIndex: idx,
+    extra: extra
+  };
+}
+
+// Format the decoding-params dict into a compact inline pill. Returns ''
+// when nothing useful is set so callers can cheaply skip rendering.
+function _fmtDecodingParams(p) {
+  if (!p || typeof p !== 'object') return '';
+  var parts = [];
+  if (typeof p.temperature === 'number') parts.push('T=' + p.temperature);
+  if (typeof p.top_p === 'number') parts.push('top_p=' + p.top_p);
+  if (typeof p.top_k === 'number') parts.push('top_k=' + p.top_k);
+  if (typeof p.max_tokens === 'number') parts.push('max=' + p.max_tokens);
+  if (Array.isArray(p.stop_sequences) && p.stop_sequences.length) {
+    parts.push('stop=' + p.stop_sequences.length);
+  }
+  if (!parts.length) return '';
+  return '⚙ ' + parts.join(' · ');
 }
 
 function _renderReplayEvent(ev, highlighted) {
@@ -6228,6 +7651,13 @@ function _renderReplayEvent(ev, highlighted) {
     html += '<div style="white-space:pre-wrap;word-break:break-word;">' + escHtml(content) + '</div>';
   }
   if (ev.tokens) html += '<div style="font-size:11px;color:var(--text-muted);margin-top:4px;">&#128200; ' + ev.tokens + ' tokens</div>';
+  // Issue #564: decoding-config pill — small inline summary of the sampling
+  // params that produced this assistant turn (only present when the backend
+  // could extract at least one known key).
+  var decoded = _fmtDecodingParams(ev.params);
+  if (decoded) {
+    html += '<div class="chat-decoding" title="Sampling parameters" style="font-size:11px;color:var(--text-muted);margin-top:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">' + escHtml(decoded) + '</div>';
+  }
   if (ev.timestamp) html += '<div class="chat-ts">' + new Date(ev.timestamp).toLocaleString() + '</div>';
   html += '</div>';
   return html;
@@ -6709,7 +8139,7 @@ async function loadRateLimits() {
 
     // Auto-refresh every 30s while tab is active
     if (_rateLimitTimer) clearInterval(_rateLimitTimer);
-    _rateLimitTimer = setInterval(function() {
+    _rateLimitTimer = visibilitySetInterval(function() {
       var limitsPage = document.getElementById('page-limits');
       if (limitsPage && limitsPage.classList.contains('active')) loadRateLimits();
       else { clearInterval(_rateLimitTimer); _rateLimitTimer = null; }
@@ -6786,14 +8216,14 @@ var _overviewRefreshRunning = false;
 function startOverviewRefresh() {
   // Don't fire loadAll() immediately -- bootDashboard already called it
   if (window._overviewTimer) clearInterval(window._overviewTimer);
-  window._overviewTimer = setInterval(async function() {
+  window._overviewTimer = visibilitySetInterval(async function() {
     if (_overviewRefreshRunning) return;
     _overviewRefreshRunning = true;
     try { await loadAll(); } finally { _overviewRefreshRunning = false; }
   }, 10000);
   loadMainActivity();
   if (window._mainActivityTimer) clearInterval(window._mainActivityTimer);
-  window._mainActivityTimer = setInterval(loadMainActivity, 5000);
+  window._mainActivityTimer = visibilitySetInterval(loadMainActivity, 5000);
 }
 
 // Overview right-panel Brain stream: reuses /api/brain-history (same source as
@@ -6806,7 +8236,10 @@ async function loadMainActivity() {
     var el = document.getElementById('main-activity-list');
     var dot = document.getElementById('main-activity-dot');
     var label = document.getElementById('main-activity-label');
-    var events = (data && data.events) ? data.events.slice() : [];
+    // Tolerate {events:[...]} (legacy/local_store) AND
+    // {_source:"cache",events_blob:"..."} (cloud cache hit). Cache-only
+    // browsers without the decryptor silently see an empty panel.
+    var events = (await unwrapListAsync(data, 'events', 'events_blob')).slice();
     // /api/brain-history pins CONTEXT events to the top of the array (Brain
     // tab feature) — for the compact Overview panel we want pure timestamp
     // desc so the most recent conversation sits at the top.
@@ -7132,17 +8565,157 @@ function _startFlowSse() {
   _flowSse.onerror = function() { setTimeout(_startFlowSse, 5000); };
 }
 
+// ── Flow sub-tabs (Live | Runs) — issue #611 ────────────────────────────
+function switchFlowSubtab(name) {
+  var live = document.getElementById('flow-live-pane');
+  var runs = document.getElementById('flow-runs-pane');
+  if (!live || !runs) return;
+  if (name === 'runs') {
+    live.style.display = 'none';
+    runs.style.display = 'block';
+    loadFlowRuns();
+  } else {
+    live.style.display = '';
+    runs.style.display = 'none';
+  }
+  var tabs = document.querySelectorAll('#flow-subtabs .flow-subtab');
+  for (var i = 0; i < tabs.length; i++) {
+    var active = tabs[i].getAttribute('data-sub') === name;
+    tabs[i].classList.toggle('active', active);
+    tabs[i].style.borderBottom = active
+      ? '2px solid var(--accent-primary,#3b82f6)'
+      : '2px solid transparent';
+    tabs[i].style.color = active
+      ? 'var(--text-primary)'
+      : 'var(--text-muted)';
+  }
+}
+
+function _fmtRunDuration(secs) {
+  var s = Number(secs) || 0;
+  if (s < 1) return '<1s';
+  if (s < 60) return s.toFixed(0) + 's';
+  if (s < 3600) return (s / 60).toFixed(1) + 'm';
+  return (s / 3600).toFixed(1) + 'h';
+}
+
+function _fmtRunCost(c) {
+  var n = Number(c) || 0;
+  if (n === 0) return '$0';
+  if (n < 0.01) return '<$0.01';
+  return '$' + n.toFixed(2);
+}
+
+function _fmtRunStarted(iso) {
+  if (!iso) return '—';
+  try {
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    return d.toLocaleString();
+  } catch (e) { return iso; }
+}
+
+function loadFlowRuns() {
+  var sel = document.getElementById('flow-runs-limit');
+  var tbody = document.getElementById('flow-runs-tbody');
+  var countEl = document.getElementById('flow-runs-count');
+  if (!tbody) return;
+  var lim = sel ? parseInt(sel.value, 10) || 30 : 30;
+  tbody.innerHTML = '<tr><td colspan="8" style="padding:24px;text-align:center;color:var(--text-muted);font-size:12px;">Loading flow runs&hellip;</td></tr>';
+  fetch('/api/flow/runs?limit=' + lim)
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      var runs = (d && d.runs) || [];
+      if (countEl) countEl.textContent = runs.length + ' run' + (runs.length === 1 ? '' : 's');
+      if (!runs.length) {
+        tbody.innerHTML = '<tr><td colspan="8" style="padding:24px;text-align:center;color:var(--text-muted);font-size:12px;">No historical flow runs yet — the live Flow view will populate this once a session completes.</td></tr>';
+        return;
+      }
+      var rows = runs.map(function(r) {
+        var sid = String(r.session_id || '');
+        var sidShort = sid.length > 12 ? sid.slice(0, 8) + '…' : sid;
+        var models = (r.models || []).join(', ') || (r.models_invoked || 0);
+        var status = r.status || 'completed';
+        var statusColor = status === 'failed' ? '#ef4444' : '#22c55e';
+        var ch = r.channel || '—';
+        return ''
+          + '<tr style="border-top:1px solid var(--border-secondary,#2a2a4a);cursor:pointer;" '
+          +     'onclick="showFlowRunDetail(' + JSON.stringify(sid).replace(/"/g, '&quot;') + ')" '
+          +     'onmouseover="this.style.background=\'var(--bg-tertiary,#0d0d1f)\'" '
+          +     'onmouseout="this.style.background=\'\'">'
+          + '<td style="padding:8px 14px;font-family:monospace;color:var(--text-primary);">' + sidShort + '</td>'
+          + '<td style="padding:8px 14px;color:var(--text-muted);">' + _fmtRunStarted(r.started_at) + '</td>'
+          + '<td style="padding:8px 14px;text-align:right;color:var(--text-muted);">' + _fmtRunDuration(r.duration_seconds) + '</td>'
+          + '<td style="padding:8px 14px;color:var(--text-muted);">' + ch + '</td>'
+          + '<td style="padding:8px 14px;text-align:right;color:var(--text-primary);" title="' + models + '">' + (r.models_invoked || 0) + '</td>'
+          + '<td style="padding:8px 14px;text-align:right;color:var(--text-primary);">' + (r.tools_called || 0) + '</td>'
+          + '<td style="padding:8px 14px;text-align:right;color:var(--text-primary);">' + _fmtRunCost(r.total_cost) + '</td>'
+          + '<td style="padding:8px 14px;"><span style="color:' + statusColor + ';font-weight:600;">' + status + '</span></td>'
+          + '</tr>';
+      }).join('');
+      tbody.innerHTML = rows;
+    })
+    .catch(function() {
+      tbody.innerHTML = '<tr><td colspan="8" style="padding:24px;text-align:center;color:#ef4444;font-size:12px;">Failed to load flow runs.</td></tr>';
+    });
+}
+
+function showFlowRunDetail(sid) {
+  var box = document.getElementById('flow-runs-detail');
+  var title = document.getElementById('flow-runs-detail-title');
+  var body = document.getElementById('flow-runs-detail-body');
+  if (!box || !body) return;
+  if (title) title.textContent = 'Run · ' + sid;
+  body.innerHTML = '<div style="color:var(--text-muted);">Loading transcript&hellip;</div>';
+  box.style.display = 'block';
+  // Re-fetch /api/flow/runs to find this row (cheap; ≤200 rows). Then
+  // render a compact summary. The live Flow diagram is intentionally not
+  // re-driven here — the live view stays the source of truth for the
+  // animated SVG. Clicking a row gives users the stats panel for that run.
+  fetch('/api/flow/runs?limit=200')
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      var run = ((d && d.runs) || []).find(function(x) { return String(x.session_id) === String(sid); });
+      if (!run) { body.innerHTML = '<div style="color:#ef4444;">Run not found.</div>'; return; }
+      var models = (run.models || []).map(function(m) {
+        return '<span style="display:inline-block;background:var(--bg-tertiary,#0d0d1f);border:1px solid var(--border-secondary,#2a2a4a);border-radius:6px;padding:2px 8px;margin:2px 4px 2px 0;font-family:monospace;font-size:11px;">' + m + '</span>';
+      }).join('') || '<span style="color:var(--text-muted);">(none)</span>';
+      var statusColor = run.status === 'failed' ? '#ef4444' : '#22c55e';
+      body.innerHTML = ''
+        + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;">'
+        + '<div><div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Session</div><div style="font-family:monospace;color:var(--text-primary);word-break:break-all;">' + sid + '</div></div>'
+        + '<div><div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Started</div><div style="color:var(--text-primary);">' + _fmtRunStarted(run.started_at) + '</div></div>'
+        + '<div><div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Duration</div><div style="color:var(--text-primary);">' + _fmtRunDuration(run.duration_seconds) + '</div></div>'
+        + '<div><div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Channel</div><div style="color:var(--text-primary);">' + (run.channel || '—') + '</div></div>'
+        + '<div><div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Tool calls</div><div style="color:var(--text-primary);">' + (run.tools_called || 0) + '</div></div>'
+        + '<div><div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Total cost</div><div style="color:var(--text-primary);">' + _fmtRunCost(run.total_cost) + '</div></div>'
+        + '<div><div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Events</div><div style="color:var(--text-primary);">' + (run.event_count || 0) + '</div></div>'
+        + '<div><div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">Status</div><div style="color:' + statusColor + ';font-weight:600;">' + run.status + '</div></div>'
+        + '</div>'
+        + '<div style="margin-top:14px;"><div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Models invoked</div><div>' + models + '</div></div>'
+        + '<div style="margin-top:14px;"><a href="/api/transcript/' + encodeURIComponent(sid) + '" target="_blank" style="font-size:12px;color:var(--accent-primary,#3b82f6);text-decoration:none;">View full transcript &rarr;</a></div>';
+    })
+    .catch(function() {
+      body.innerHTML = '<div style="color:#ef4444;">Failed to load run detail.</div>';
+    });
+}
+
+function hideFlowRunDetail() {
+  var box = document.getElementById('flow-runs-detail');
+  if (box) box.style.display = 'none';
+}
+
 function initFlow() {
   if (flowInitDone) return;
   flowInitDone = true;
-  
+
   // Performance: Reduce update frequency on mobile
   var updateInterval = window.innerWidth < 768 ? 3000 : 2000;
 
   // Hide unconfigured channels in the flow SVG
   hideUnconfiguredChannels(document);
-  
-  fetch('/api/overview').then(function(r){return r.json();}).then(async function(d) {
+
+  fetchJsonWithTimeout('/api/overview', 5000).then(async function(d) {
     if (!d.model || d.model === 'unknown') {
       var fm = await resolvePrimaryModelFallback();
       if (fm && fm !== 'unknown') d.model = fm;
@@ -7150,7 +8723,7 @@ function initFlow() {
     if (d.model) applyBrainModelToAll(d.model);
     var tok = document.getElementById('flow-tokens');
     if (tok) tok.textContent = (d.mainTokens / 1000).toFixed(0) + 'K';
-    
+
     // Add visual hierarchy hints
     setTimeout(function() {
       enhanceArchitectureClarity();
@@ -7162,11 +8735,116 @@ function initFlow() {
 
   // Connect to the typed flow-events SSE (tails gateway.log + session JSONL)
   _startFlowSse();
+  // Active Tools + Live Tool Call Stream — DuckDB-backed (issue #1127).
+  // The flow-events SSE only fires when gateway.log emits the right keywords,
+  // which leaves "Active Tools: —" and "Waiting for activity…" stuck on most
+  // installs. /api/brain-history + /api/brain-stream read from the same
+  // DuckDB store that drives the rest of the Brain tab, so we backfill
+  // recent tool events and subscribe to the live stream from there.
+  _backfillFlowFromBrain();
+  _startFlowBrainStream();
 
-  setInterval(updateFlowStats, updateInterval);
+  // Lazy-load Phase 2 follow-up: this used to be a raw `setInterval(...)`
+  // unassigned to any timer var, so initFlow() leaked one new interval per
+  // visit. Capture the handle on `window._flowStatsTimer` so subsequent
+  // tab navigations can clear it (mirroring the per-tab timer pattern at
+  // app.js:606 etc.) and use visibilitySetInterval so the poll pauses when
+  // the browser tab is hidden — completes Phase 2 coverage.
+  if (window._flowStatsTimer) { try { clearInterval(window._flowStatsTimer); } catch(e){} }
+  window._flowStatsTimer = visibilitySetInterval(updateFlowStats, updateInterval);
+}
+
+// Map brain-history event types → Flow's active-tool buckets (exec/browser/
+// search/memory/cron/tts). Brain events are tool-typed by routes/brain.py
+// (EXEC/READ/WRITE/BROWSER/SEARCH/SPAWN/MSG/TOOL).
+function _brainTypeToFlowTool(t) {
+  if (!t) return null;
+  t = String(t).toUpperCase();
+  if (t === 'EXEC' || t === 'SHELL' || t === 'READ' || t === 'WRITE') return 'exec';
+  if (t === 'BROWSER') return 'browser';
+  if (t === 'SEARCH') return 'search';
+  if (t === 'SPAWN') return 'cron';
+  if (t === 'MSG') return 'tts';
+  if (t === 'TOOL') return 'exec';
+  return null;
+}
+
+// Pretty label for the live feed — keeps the same surface as flow-events.
+function _flowFeedLabelForTool(toolName) {
+  var toolNames = {exec:'running a command',browser:'browsing the web',search:'searching the web',cron:'scheduling',tts:'generating speech',memory:'accessing memory'};
+  return toolNames[toolName] || 'using ' + toolName;
+}
+
+function _backfillFlowFromBrain() {
+  // One-shot historical backfill from /api/brain-history (DuckDB-backed).
+  // Populates Active Tools with the most recent tool calls so the panel is
+  // never empty after a page reload, even if /api/flow-events has been quiet.
+  fetch('/api/brain-history?limit=40').then(function(r){return r.json();}).then(function(d) {
+    var events = (d && d.events) || [];
+    var now = Date.now();
+    var seen = 0;
+    // events are most-recent-first; scan up to 8 tool-typed events.
+    for (var i = 0; i < events.length && seen < 8; i++) {
+      var ev = events[i];
+      var tool = _brainTypeToFlowTool(ev && ev.type);
+      if (!tool) continue;
+      // Only mark "active" if recent (≤ 5 min) — older events are surfaced
+      // in the feed but should NOT spuriously light up the Active Tools row.
+      try {
+        var age = now - new Date(ev.time).getTime();
+        if (age >= 0 && age < 5 * 60 * 1000) {
+          flowStats.activeTools[tool] = true;
+          // Expire after the same 5s window the SSE handler uses.
+          setTimeout(function(t) {
+            return function() { delete flowStats.activeTools[t]; };
+          }(tool), 5000);
+        }
+      } catch(e) {}
+      seen++;
+    }
+    if (seen > 0) updateFlowStats();
+  }).catch(function(){});
+}
+
+var _flowBrainSse = null;
+function _startFlowBrainStream() {
+  if (window.CLOUD_MODE) return;
+  if (_flowBrainSse && _flowBrainSse.readyState !== EventSource.CLOSED) return;
+  try {
+    var url = '/api/brain-stream';
+    var tok =
+      localStorage.getItem('clawmetry-token') ||
+      localStorage.getItem('gw_token') ||
+      localStorage.getItem('cm-token');
+    if (tok) url += '?token=' + encodeURIComponent(tok);
+    var es = new EventSource(url);
+    _flowBrainSse = es;
+    es.onmessage = function(e) {
+      try {
+        var ev = JSON.parse(e.data);
+        if (!ev || !ev.type) return;
+        var tool = _brainTypeToFlowTool(ev.type);
+        if (!tool) return;
+        // Drive Active Tools + the existing tool-call animation off the same
+        // DuckDB-backed event. triggerToolCall already handles the 5s expiry.
+        triggerToolCall(tool);
+        var label = '⚡ ' + tool + ': ' + _flowFeedLabelForTool(tool);
+        addFlowFeedItem(label, '#f0c040', 'tool');
+        flowStats.events++;
+      } catch(e2) {}
+    };
+    es.onerror = function() {
+      try { es.close(); } catch(e3) {}
+      _flowBrainSse = null;
+      setTimeout(_startFlowBrainStream, 5000);
+    };
+  } catch(e) {}
 }
 
 function _populateFlowSkills() {
+  // /api/skills is cloud-disabled (410 Gone). Skip the fetch in cloud mode
+  // — the Flow tab still renders, just without per-skill mini-badges.
+  if (window.CLOUD_MODE) return;
   fetch('/api/skills').then(function(r){return r.json();}).then(function(d) {
     var skills = (d.skills || []).filter(function(s) { return s.status !== 'dead'; }).slice(0, 6);
     var container = document.getElementById('flow-skills-list');
@@ -7241,7 +8919,7 @@ function updateFlowStats() {
   var el3 = document.getElementById('flow-active-tools');
   if (el3) el3.textContent = names.length > 0 ? names.join(', ') : '\u2014';
   if (flowStats.events % 15 === 0) {
-    fetch('/api/overview').then(function(r){return r.json();}).then(function(d) {
+    fetchJsonWithTimeout('/api/overview', 5000).then(function(d) {
       var tok = document.getElementById('flow-tokens');
       if (tok) tok.textContent = (d.mainTokens / 1000).toFixed(0) + 'K';
     }).catch(function(){});
@@ -7649,6 +9327,14 @@ function processFlowEvent(line) {
     addFlowFeedItem('⚡ Session activated', '#f0c040', 'system');
     return;
   }
+  if (msg.includes('session state') && (msg.includes('new=completed') || msg.includes('new=error') || msg.includes('new=cancelled') || msg.includes('new=aborted'))) {
+    try {
+      var termObj = JSON.parse(line);
+      var termSid = termObj.session_key || termObj.session || termObj.sessionId || termObj.id || '';
+      _clearStuckBanner(termSid);
+    } catch(e) {}
+    return;
+  }
   if (msg.includes('lane enqueue') && msg.includes('main')) {
     if (now - (flowThrottles['lane']||0) < 2000) return;
     flowThrottles['lane'] = now;
@@ -7676,7 +9362,12 @@ function processFlowEvent(line) {
     flowThrottles['stuck'] = now;
     addFlowFeedItem('⚠️ Session stuck detected', '#e04040');
     _diagPush({kind:'session.stuck', value:1, ts:now});
-    _showStuckBanner();
+    try {
+      var stuckObj = JSON.parse(line);
+      var stuckSid = stuckObj.session_key || stuckObj.session || stuckObj.sessionId || stuckObj.id || '';
+      var stuckAge = stuckObj.age_ms ? Math.round(stuckObj.age_ms / 1000) : (stuckObj.age_s || 0);
+      _showStuckBanner(stuckSid, stuckAge);
+    } catch(e) { _showStuckBanner('', 0); }
     return;
   }
   if (msg.includes('tool end') || msg.includes('tool_end')) {
@@ -7694,15 +9385,113 @@ function _diagPush(event) {
   if (_diagBuffer.length > 200) _diagBuffer = _diagBuffer.slice(-200);
 }
 
-function _showStuckBanner() {
-  var existing = document.getElementById('stuck-session-banner');
-  if (existing) return;
-  var banner = document.createElement('div');
-  banner.id = 'stuck-session-banner';
-  banner.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);z-index:9999;background:#e04040;color:#fff;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;box-shadow:0 4px 16px rgba(0,0,0,0.4);display:flex;gap:12px;align-items:center;';
-  banner.innerHTML = '<span>⚠️ Session stuck detected — agent may be looping</span><button onclick="document.getElementById(\'stuck-session-banner\').remove()" style="background:rgba(255,255,255,0.2);border:none;color:#fff;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:12px;">Dismiss</button>';
-  document.body.appendChild(banner);
-  setTimeout(function() { var b = document.getElementById('stuck-session-banner'); if (b) b.remove(); }, 30000);
+var _stuckCount = 0;
+var _stuckSessions = {};
+
+function _updateStuckBadge() {
+  var badge = document.getElementById('nav-stuck-badge');
+  if (!badge) return;
+  if (_stuckCount > 0) { badge.textContent = _stuckCount; badge.style.display = 'inline'; }
+  else { badge.style.display = 'none'; }
+}
+
+// ── Stuck-session banner dismissal persistence (issue #1127) ───────────
+// Dismiss used to only hide the banner in-memory, so the next stuck event
+// (or page reload, since stuck events replay from /api/flow-events) made
+// the banner pop right back. We now persist a per-session dismissal stamp
+// in localStorage with a 24h TTL, and prune entries older than the TTL on
+// every read so the store can't grow unbounded.
+var _STUCK_DISMISS_KEY = 'stuck-session-dismissed';
+var _STUCK_DISMISS_TTL_MS = 24 * 60 * 60 * 1000;
+
+function _readStuckDismissals() {
+  try {
+    var raw = localStorage.getItem(_STUCK_DISMISS_KEY);
+    if (!raw) return {};
+    var obj = JSON.parse(raw);
+    return (obj && typeof obj === 'object') ? obj : {};
+  } catch(e) { return {}; }
+}
+
+function _writeStuckDismissals(obj) {
+  try { localStorage.setItem(_STUCK_DISMISS_KEY, JSON.stringify(obj || {})); }
+  catch(e) {}
+}
+
+function _pruneStuckDismissals(now) {
+  var obj = _readStuckDismissals();
+  var changed = false;
+  Object.keys(obj).forEach(function(k) {
+    var t = Number(obj[k]) || 0;
+    if (!t || (now - t) > _STUCK_DISMISS_TTL_MS) {
+      delete obj[k];
+      changed = true;
+    }
+  });
+  if (changed) _writeStuckDismissals(obj);
+  return obj;
+}
+
+function _isStuckDismissed(sessionId) {
+  if (!sessionId) return false;
+  var now = Date.now();
+  var obj = _pruneStuckDismissals(now);
+  var t = Number(obj[sessionId]) || 0;
+  return t > 0 && (now - t) < _STUCK_DISMISS_TTL_MS;
+}
+
+function _markStuckDismissed(sessionId) {
+  if (!sessionId) return;
+  var obj = _pruneStuckDismissals(Date.now());
+  obj[sessionId] = Date.now();
+  _writeStuckDismissals(obj);
+}
+
+function _showStuckBanner(sessionId, ageSec) {
+  // Issue #1127 — skip the banner entirely if the user already dismissed
+  // this session in the last 24h.
+  if (sessionId && _isStuckDismissed(sessionId)) return;
+  _stuckCount++;
+  if (sessionId) _stuckSessions[sessionId] = true;
+  _updateStuckBadge();
+  var banner = document.getElementById('stuck-session-banner');
+  if (!banner) return;
+  // Stash the session id on the banner so the Dismiss handler can write
+  // a localStorage entry keyed by it (the banner template's inline
+  // onclick doesn't have direct access to the originating event).
+  if (sessionId) banner.setAttribute('data-stuck-session-id', sessionId);
+  else banner.removeAttribute('data-stuck-session-id');
+  var label = sessionId ? sessionId.substring(0, 20) : 'unknown session';
+  var ageStr = ageSec > 0 ? ' (' + ageSec + 's)' : '';
+  var msg = document.getElementById('stuck-session-banner-msg');
+  if (msg) msg.textContent = '⚠️ Session stuck' + ageStr + ': ' + label + ' — agent may be looping';
+  var link = document.getElementById('stuck-session-banner-link');
+  if (link && sessionId) link.href = '#';
+  banner.style.display = 'flex';
+}
+
+// Called from the banner's Dismiss button (banners.html). Persists the
+// dismissal for 24h so a reload won't resurface the same warning.
+function dismissStuckBanner() {
+  var banner = document.getElementById('stuck-session-banner');
+  var sid = banner ? banner.getAttribute('data-stuck-session-id') : '';
+  if (sid) _markStuckDismissed(sid);
+  _clearStuckBanner();
+}
+
+function _clearStuckBanner(sessionId) {
+  if (sessionId && _stuckSessions[sessionId]) {
+    delete _stuckSessions[sessionId];
+    _stuckCount = Math.max(0, _stuckCount - 1);
+  } else if (!sessionId) {
+    _stuckCount = 0;
+    _stuckSessions = {};
+  }
+  _updateStuckBadge();
+  if (_stuckCount === 0) {
+    var banner = document.getElementById('stuck-session-banner');
+    if (banner) banner.style.display = 'none';
+  }
 }
 
 // === Overview Split-Screen: Clone flow SVG into overview pane ===
@@ -7938,7 +9727,7 @@ async function loadOverviewTasks() {
 function startOverviewTasksRefresh() {
   loadOverviewTasks();
   if (_ovTasksTimer) clearInterval(_ovTasksTimer);
-  _ovTasksTimer = setInterval(loadOverviewTasks, 10000);
+  _ovTasksTimer = visibilitySetInterval(loadOverviewTasks, 10000);
 }
 
 // === Task Detail Modal ===
@@ -8096,7 +9885,7 @@ function openCompModal(nodeId) {
     document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:40px;"><div class="pulse"></div> Loading TUI messages...</div>';
     document.getElementById('comp-modal-overlay').classList.add('open');
     loadTuiMessages(false);
-    window._tuiRefreshTimer = setInterval(function() { loadTuiMessages(true); }, 10000);
+    window._tuiRefreshTimer = visibilitySetInterval(function() { loadTuiMessages(true); }, 10000);
     return;
   }
 
@@ -8106,7 +9895,7 @@ function openCompModal(nodeId) {
     document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:40px;"><div class="pulse"></div> Loading messages...</div>';
     document.getElementById('comp-modal-overlay').classList.add('open');
     loadTelegramMessages(false);
-    _tgRefreshTimer = setInterval(function() { loadTelegramMessages(true); }, 10000);
+    _tgRefreshTimer = visibilitySetInterval(function() { loadTelegramMessages(true); }, 10000);
     return;
   }
 
@@ -8114,7 +9903,7 @@ function openCompModal(nodeId) {
     document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:40px;"><div class="pulse"></div> Loading iMessages...</div>';
     document.getElementById('comp-modal-overlay').classList.add('open');
     loadIMessageMessages(false);
-    _imsgRefreshTimer = setInterval(function() { loadIMessageMessages(true); }, 10000);
+    _imsgRefreshTimer = visibilitySetInterval(function() { loadIMessageMessages(true); }, 10000);
     return;
   }
 
@@ -8122,7 +9911,7 @@ function openCompModal(nodeId) {
     document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:40px;"><div class="pulse"></div> Loading WhatsApp messages...</div>';
     document.getElementById('comp-modal-overlay').classList.add('open');
     loadWhatsAppMessages(false);
-    _waRefreshTimer = setInterval(function() { loadWhatsAppMessages(true); }, 10000);
+    _waRefreshTimer = visibilitySetInterval(function() { loadWhatsAppMessages(true); }, 10000);
     return;
   }
 
@@ -8130,7 +9919,7 @@ function openCompModal(nodeId) {
     document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:40px;"><div class="pulse"></div> Loading Signal messages...</div>';
     document.getElementById('comp-modal-overlay').classList.add('open');
     loadSignalMessages(false);
-    _sigRefreshTimer = setInterval(function() { loadSignalMessages(true); }, 10000);
+    _sigRefreshTimer = visibilitySetInterval(function() { loadSignalMessages(true); }, 10000);
     return;
   }
 
@@ -8138,7 +9927,7 @@ function openCompModal(nodeId) {
     document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:40px;"><div class="pulse"></div> Loading Discord messages...</div>';
     document.getElementById('comp-modal-overlay').classList.add('open');
     loadDiscordMessages(false);
-    _discordRefreshTimer = setInterval(function() { loadDiscordMessages(true); }, 10000);
+    _discordRefreshTimer = visibilitySetInterval(function() { loadDiscordMessages(true); }, 10000);
     return;
   }
 
@@ -8146,7 +9935,7 @@ function openCompModal(nodeId) {
     document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:40px;"><div class="pulse"></div> Loading Slack messages...</div>';
     document.getElementById('comp-modal-overlay').classList.add('open');
     loadSlackMessages(false);
-    _slackRefreshTimer = setInterval(function() { loadSlackMessages(true); }, 10000);
+    _slackRefreshTimer = visibilitySetInterval(function() { loadSlackMessages(true); }, 10000);
     return;
   }
 
@@ -8154,7 +9943,7 @@ function openCompModal(nodeId) {
     document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:40px;"><div class="pulse"></div> Loading Google Chat messages...</div>';
     document.getElementById('comp-modal-overlay').classList.add('open');
     loadGoogleChatMessages(false);
-    _gcRefreshTimer = setInterval(function() { loadGoogleChatMessages(true); }, 10000);
+    _gcRefreshTimer = visibilitySetInterval(function() { loadGoogleChatMessages(true); }, 10000);
     return;
   }
 
@@ -8162,7 +9951,7 @@ function openCompModal(nodeId) {
     document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:40px;"><div class="pulse"></div> Loading MS Teams messages...</div>';
     document.getElementById('comp-modal-overlay').classList.add('open');
     loadMSTeamsMessages(false);
-    _mstRefreshTimer = setInterval(function() { loadMSTeamsMessages(true); }, 10000);
+    _mstRefreshTimer = visibilitySetInterval(function() { loadMSTeamsMessages(true); }, 10000);
     return;
   }
 
@@ -8170,7 +9959,7 @@ function openCompModal(nodeId) {
     document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:40px;"><div class="pulse"></div> Loading Mattermost messages...</div>';
     document.getElementById('comp-modal-overlay').classList.add('open');
     loadMattermostMessages(false);
-    _mmRefreshTimer = setInterval(function() { loadMattermostMessages(true); }, 10000);
+    _mmRefreshTimer = visibilitySetInterval(function() { loadMattermostMessages(true); }, 10000);
     return;
   }
 
@@ -8178,7 +9967,7 @@ function openCompModal(nodeId) {
     document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:40px;"><div class="pulse"></div> Loading WebChat...</div>';
     document.getElementById('comp-modal-overlay').classList.add('open');
     loadWebchatMessages(false);
-    _webchatRefreshTimer = setInterval(function() { loadWebchatMessages(true); }, 12000);
+    _webchatRefreshTimer = visibilitySetInterval(function() { loadWebchatMessages(true); }, 12000);
     return;
   }
 
@@ -8186,7 +9975,7 @@ function openCompModal(nodeId) {
     document.getElementById('comp-modal-body').innerHTML = '<div class="irc-loading">*** Connecting to IRC log... ***</div>';
     document.getElementById('comp-modal-overlay').classList.add('open');
     loadIRCMessages(false);
-    _ircRefreshTimer = setInterval(function() { loadIRCMessages(true); }, 15000);
+    _ircRefreshTimer = visibilitySetInterval(function() { loadIRCMessages(true); }, 15000);
     return;
   }
 
@@ -8194,7 +9983,7 @@ function openCompModal(nodeId) {
     document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:40px;"><div class="pulse"></div> Loading BlueBubbles...</div>';
     document.getElementById('comp-modal-overlay').classList.add('open');
     loadBlueBubblesMessages(false);
-    _bbRefreshTimer = setInterval(function() { loadBlueBubblesMessages(true); }, 12000);
+    _bbRefreshTimer = visibilitySetInterval(function() { loadBlueBubblesMessages(true); }, 12000);
     return;
   }
 
@@ -8208,7 +9997,7 @@ function openCompModal(nodeId) {
     document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:40px;"><div class="pulse"></div> Loading ' + c.name + '...</div>';
     document.getElementById('comp-modal-overlay').classList.add('open');
     loadGenericChannelData(nodeId, c.chKey, c, false);
-    window._genericChannelTimer = setInterval(function() { loadGenericChannelData(nodeId, c.chKey, c, true); }, 15000);
+    window._genericChannelTimer = visibilitySetInterval(function() { loadGenericChannelData(nodeId, c.chKey, c, true); }, 15000);
     return;
   }
 
@@ -8216,7 +10005,7 @@ function openCompModal(nodeId) {
     document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:40px;"><div class="pulse"></div> Loading gateway data...</div>';
     document.getElementById('comp-modal-overlay').classList.add('open');
     loadGatewayData(false);
-    _gwRefreshTimer = setInterval(function() { loadGatewayData(true); }, 10000);
+    _gwRefreshTimer = visibilitySetInterval(function() { loadGatewayData(true); }, 10000);
     return;
   }
 
@@ -8225,7 +10014,7 @@ function openCompModal(nodeId) {
     document.getElementById('comp-modal-overlay').classList.add('open');
     _brainPage = 0;
     loadBrainData(false);
-    _brainRefreshTimer = setInterval(function() { loadBrainData(true); }, 10000);
+    _brainRefreshTimer = visibilitySetInterval(function() { loadBrainData(true); }, 10000);
     return;
   }
 
@@ -8233,7 +10022,7 @@ function openCompModal(nodeId) {
     document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:40px;"><div class="pulse"></div> Analyzing costs...</div>';
     document.getElementById('comp-modal-overlay').classList.add('open');
     loadCostOptimizerData(false);
-    _costOptimizerRefreshTimer = setInterval(function() { loadCostOptimizerData(true); }, 15000);
+    _costOptimizerRefreshTimer = visibilitySetInterval(function() { loadCostOptimizerData(true); }, 15000);
     return;
   }
 
@@ -8250,7 +10039,7 @@ function openCompModal(nodeId) {
     } else {
       loadToolData(toolKey, c, false);
     }
-    _toolRefreshTimer = setInterval(function() { loadToolData(toolKey, c, true); }, 10000);
+    _toolRefreshTimer = visibilitySetInterval(function() { loadToolData(toolKey, c, true); }, 10000);
     return;
   }
 
@@ -8320,7 +10109,7 @@ function openCompModal(nodeId) {
     document.getElementById('comp-modal-overlay').classList.add('open');
     if (typeof loadAutomationAdvisorDataWithTime === 'function') {
       try { loadAutomationAdvisorDataWithTime(); } catch (e) {
-        document.getElementById('comp-modal-body').innerHTML = '<div style="padding:20px;color:var(--text-error);">Failed to load: ' + e.message + '</div>';
+        document.getElementById('comp-modal-body').innerHTML = _compModalError(null, 'automation data', e);
       }
     }
     return;
@@ -8348,7 +10137,7 @@ function openCompModal(nodeId) {
       document.getElementById('comp-modal-footer').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
     }).catch(function(e) {
       if (!isCompModalActive(nodeId)) return;
-      document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-error);">Failed to load: ' + e.message + '</div>';
+      document.getElementById('comp-modal-body').innerHTML = _compModalError('loadComponentWithTimeContext(\'' + nodeId + '\')', c.name, e);
     });
     return;
   }
@@ -8356,6 +10145,23 @@ function openCompModal(nodeId) {
   document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:20px;"><div style="font-size:48px;margin-bottom:16px;">' + c.icon + '</div><div style="font-size:16px;font-weight:600;margin-bottom:8px;">' + c.name + '</div><div style="color:var(--text-muted);">Live view coming soon</div><div style="margin-top:8px;font-size:12px;color:var(--text-muted);text-transform:uppercase;">' + c.type + '</div></div>';
   document.getElementById('comp-modal-footer').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
   document.getElementById('comp-modal-overlay').classList.add('open');
+}
+
+// Issue #1338: shared helper for channel-modal error renders. Mirrors the
+// Failed-to-load + Retry pattern from PRs #1314/#1316/#1337 (panel loaders),
+// adapted for the modal-body shape used by per-channel loaders.
+//   retryFn: name string of the function to invoke (becomes onclick="retryFn()")
+//   label:   human-friendly channel/feature name (e.g. 'Telegram', 'Slack')
+//   err:     thrown Error or string
+function _compModalError(retryFn, label, err) {
+  var msg = err && err.message ? err.message : String(err || '');
+  var call = retryFn ? (retryFn.indexOf('(') !== -1 ? retryFn : retryFn + '()') : '';
+  var btn = call
+    ? ' <button onclick="' + call + '" style="margin-left:8px;background:transparent;border:1px solid var(--border-primary);color:var(--text-secondary);border-radius:4px;padding:2px 10px;font-size:11px;cursor:pointer;">Retry</button>'
+    : '';
+  var labelPart = label ? ' ' + escapeHtml(label) : '';
+  var msgPart   = msg ? ': ' + escapeHtml(msg) : '';
+  return '<div style="text-align:center;padding:20px;color:var(--text-error);">Failed to load' + labelPart + msgPart + btn + '</div>';
 }
 
 function loadTelegramMessages(isRefresh) {
@@ -8390,7 +10196,7 @@ function loadTelegramMessages(isRefresh) {
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
     if (!isRefresh) {
-      document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-error);">Failed to load messages</div>';
+      document.getElementById('comp-modal-body').innerHTML = _compModalError('loadTelegramMessages', 'Telegram messages', null);
     }
   });
 }
@@ -8457,11 +10263,10 @@ function loadTuiMessages(isRefresh) {
     var f = document.getElementById('comp-modal-footer');
     if (f) f.textContent = 'Last updated: ' + new Date().toLocaleTimeString() +
       ' - ' + (data.total || msgs.length) + ' total TUI messages';
-  }).catch(function() {
+  }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
     if (!isRefresh) {
-      document.getElementById('comp-modal-body').innerHTML =
-        '<div style="text-align:center;padding:20px;color:var(--text-error);">Failed to load TUI messages</div>';
+      document.getElementById('comp-modal-body').innerHTML = _compModalError('loadTuiMessages', 'TUI messages', e);
     }
   });
 }
@@ -8521,7 +10326,7 @@ function loadIMessageMessages(isRefresh) {
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
     if (!isRefresh) {
-      document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-error);">Failed to load iMessages: ' + escapeHtml(e.message) + '</div>';
+      document.getElementById('comp-modal-body').innerHTML = _compModalError('loadIMessageMessages', 'iMessages', e);
     }
   });
 }
@@ -8555,7 +10360,7 @@ function loadWhatsAppMessages(isRefresh) {
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
     if (!isRefresh) {
-      document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-error);">Failed to load WhatsApp messages</div>';
+      document.getElementById('comp-modal-body').innerHTML = _compModalError('loadWhatsAppMessages', 'WhatsApp messages', null);
     }
   });
 }
@@ -8589,7 +10394,7 @@ function loadSignalMessages(isRefresh) {
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
     if (!isRefresh) {
-      document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-error);">Failed to load Signal messages</div>';
+      document.getElementById('comp-modal-body').innerHTML = _compModalError('loadSignalMessages', 'Signal messages', null);
     }
   });
 }
@@ -8679,7 +10484,7 @@ function loadDiscordMessages(isRefresh) {
     document.getElementById('comp-modal-footer').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
-    document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-error);">Failed to load Discord: ' + escapeHtml(e.message) + '</div>';
+    document.getElementById('comp-modal-body').innerHTML = _compModalError('loadDiscordMessages', 'Discord', e);
   });
 }
 
@@ -8722,7 +10527,7 @@ function loadSlackMessages(isRefresh) {
     document.getElementById('comp-modal-footer').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
-    document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-error);">Failed to load Slack: ' + escapeHtml(e.message) + '</div>';
+    document.getElementById('comp-modal-body').innerHTML = _compModalError('loadSlackMessages', 'Slack', e);
   });
 }
 
@@ -8766,11 +10571,7 @@ function loadGenericChannelData(nodeId, chKey, comp, isRefresh) {
     document.getElementById('comp-modal-footer').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
   }).catch(function(e) {
     if (!isCompModalActive(nodeId)) return;
-    body.innerHTML = '<div style="text-align:center;padding:24px;color:var(--text-muted);">'
-      + '<div style="font-size:36px;margin-bottom:12px;">' + comp.icon + '</div>'
-      + '<div style="font-weight:600;margin-bottom:6px;">' + escapeHtml(comp.name) + '</div>'
-      + '<div style="font-size:13px;">Could not fetch channel data.</div>'
-      + '</div>';
+    body.innerHTML = _compModalError(null, comp.name, e);
   });
 }
 
@@ -8819,7 +10620,7 @@ function loadWebchatMessages(isRefresh) {
     document.getElementById('comp-modal-footer').textContent = 'WebChat - Last updated: ' + new Date().toLocaleTimeString();
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
-    body.innerHTML = '<div style="text-align:center;padding:24px;color:#6b7280;">Could not fetch WebChat data.</div>';
+    body.innerHTML = _compModalError('loadWebchatMessages', 'WebChat', e);
   });
 }
 
@@ -8868,7 +10669,7 @@ function loadIRCMessages(isRefresh) {
     document.getElementById('comp-modal-footer').textContent = 'IRC - ' + (channels.join(', ') || 'no channels') + ' - ' + new Date().toLocaleTimeString();
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
-    body.innerHTML = '<div style="text-align:center;padding:24px;color:#9ca3af;font-family:monospace;">*** Could not fetch IRC data ***</div>';
+    body.innerHTML = _compModalError('loadIRCMessages', 'IRC', e);
   });
 }
 
@@ -8917,7 +10718,7 @@ function loadBlueBubblesMessages(isRefresh) {
     document.getElementById('comp-modal-footer').textContent = 'BlueBubbles - ' + escapeHtml(status) + ' - ' + new Date().toLocaleTimeString();
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
-    body.innerHTML = '<div style="text-align:center;padding:24px;color:#6b7280;">Could not fetch BlueBubbles data.</div>';
+    body.innerHTML = _compModalError('loadBlueBubblesMessages', 'BlueBubbles', e);
   });
 }
 
@@ -8960,9 +10761,9 @@ function loadGoogleChatMessages(isRefresh) {
     }
     body.innerHTML = html;
     document.getElementById('comp-modal-footer').textContent = 'Google Chat - Last updated: ' + new Date().toLocaleTimeString();
-  }).catch(function() {
+  }).catch(function(e) {
     if (!isCompModalActive(nodeId)) return;
-    body.innerHTML = '<div style="text-align:center;padding:24px;color:var(--text-muted);"><div style="font-size:36px;margin-bottom:12px;">💬</div><div style="font-weight:600;color:#1a73e8;">Google Chat</div><div style="font-size:13px;margin-top:8px;">Could not fetch channel data.</div></div>';
+    body.innerHTML = _compModalError('loadGoogleChatMessages', 'Google Chat', e);
   });
 }
 
@@ -9005,9 +10806,9 @@ function loadMSTeamsMessages(isRefresh) {
     }
     body.innerHTML = html;
     document.getElementById('comp-modal-footer').textContent = 'Microsoft Teams - Last updated: ' + new Date().toLocaleTimeString();
-  }).catch(function() {
+  }).catch(function(e) {
     if (!isCompModalActive(nodeId)) return;
-    body.innerHTML = '<div style="text-align:center;padding:24px;color:var(--text-muted);"><div style="font-size:36px;margin-bottom:12px;">👔</div><div style="font-weight:600;color:#6264A7;">Microsoft Teams</div><div style="font-size:13px;margin-top:8px;">Could not fetch channel data.</div></div>';
+    body.innerHTML = _compModalError('loadMSTeamsMessages', 'Microsoft Teams', e);
   });
 }
 
@@ -9050,9 +10851,9 @@ function loadMattermostMessages(isRefresh) {
     }
     body.innerHTML = html;
     document.getElementById('comp-modal-footer').textContent = 'Mattermost - Last updated: ' + new Date().toLocaleTimeString();
-  }).catch(function() {
+  }).catch(function(e) {
     if (!isCompModalActive(nodeId)) return;
-    body.innerHTML = '<div style="text-align:center;padding:24px;color:var(--text-muted);"><div style="font-size:36px;margin-bottom:12px;">⚓</div><div style="font-weight:600;color:#0058CC;">Mattermost</div><div style="font-size:13px;margin-top:8px;">Could not fetch channel data.</div></div>';
+    body.innerHTML = _compModalError('loadMattermostMessages', 'Mattermost', e);
   });
 }
 
@@ -9166,7 +10967,7 @@ function loadBrainData(isRefresh) {
     if (msg.toLowerCase().includes('abort')) {
       msg = 'Request timed out. The brain panel is heavy; please retry in 2-3 seconds.';
     }
-    document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-error);">Failed to load brain data: ' + msg + '</div>';
+    document.getElementById('comp-modal-body').innerHTML = _compModalError('loadBrainData', 'brain data', { message: msg });
   });
 }
 
@@ -9316,7 +11117,7 @@ function loadCostOptimizerData(isRefresh) {
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
     if (!isRefresh) {
-      document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-error);">Failed to load cost optimizer: ' + e.message + '</div>';
+      document.getElementById('comp-modal-body').innerHTML = _compModalError('loadCostOptimizerData', 'cost optimizer', e);
     }
   });
 }
@@ -9651,7 +11452,7 @@ function loadGatewayData(isRefresh) {
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
     if (!isRefresh) {
-      document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-error);">Failed to load gateway data</div>';
+      document.getElementById('comp-modal-body').innerHTML = _compModalError('loadGatewayData', 'gateway data', null);
     }
   });
 }
@@ -9990,7 +11791,7 @@ function loadToolData(toolKey, comp, isRefresh) {
   }).catch(function(e) {
     if (!isCompModalActive(_expectedNodeId)) return;
     if (!isRefresh) {
-      document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-error);">Failed to load data: ' + e + '</div>';
+      document.getElementById('comp-modal-body').innerHTML = _compModalError(null, 'tool data', e);
     }
   });
 }
@@ -10051,7 +11852,11 @@ function _prefetchToolData() {
 }
 document.addEventListener('DOMContentLoaded', function() {
   setTimeout(_prefetchToolData, 2000); // prefetch 2s after load
-  setInterval(_prefetchToolData, 30000); // refresh cache every 30s
+  // visibilitySetInterval (PR #1270) so the cache-refresh poll pauses
+  // when the browser tab is hidden — completes the lazy-load Phase 2
+  // sweep this PR is closing out. Page-load fires once so no-leak risk
+  // (no per-visit re-arming), but the visibility-gate is still the win.
+  visibilitySetInterval(_prefetchToolData, 30000); // refresh cache every 30s
 });
 
 function openTaskModal(sessionId, taskName, sessionKey) {
@@ -10069,7 +11874,7 @@ function openTaskModal(sessionId, taskName, sessionKey) {
   // and their data is immutable — refreshing just causes flicker. The user
   // can re-enable via the checkbox if needed.
   if (_modalAutoRefresh && sessionId) {
-    _modalRefreshTimer = setInterval(loadModalTranscript, 4000);
+    _modalRefreshTimer = visibilitySetInterval(loadModalTranscript, 4000);
   } else {
     // Reflect the disabled state in the checkbox so the UX matches.
     var cb = document.getElementById('modal-auto-refresh-cb');
@@ -10091,13 +11896,13 @@ function toggleModalAutoRefresh() {
   _modalAutoRefresh = document.getElementById('modal-auto-refresh-cb').checked;
   if (_modalRefreshTimer) { clearInterval(_modalRefreshTimer); _modalRefreshTimer = null; }
   if (_modalAutoRefresh && _modalSessionId) {
-    _modalRefreshTimer = setInterval(loadModalTranscript, 4000);
+    _modalRefreshTimer = visibilitySetInterval(loadModalTranscript, 4000);
   }
 }
 
 function switchModalTab(tab) {
   _modalTab = tab;
-  document.querySelectorAll('.modal-tab').forEach(function(t){ t.classList.toggle('active', t.textContent.toLowerCase().indexOf(tab) >= 0 || (tab==='full' && t.textContent==='Full Logs')); });
+  document.querySelectorAll('.modal-tab').forEach(function(t){ t.classList.toggle('active', t.textContent.toLowerCase().indexOf(tab) >= 0 || (tab==='full' && t.textContent==='Full Logs') || (tab==='models' && t.textContent==='Model Journey')); });
   renderModalContent();
 }
 
@@ -10330,7 +12135,7 @@ async function _renderModalBrainEvents(match) {
     var winStart = startedMs - 30000;        // -30s lead-up
 
     var data = await fetchJsonWithTimeout('/api/brain-history?limit=500', 6000);
-    var events = (data && data.events) ? data.events : [];
+    var events = await unwrapListAsync(data, 'events', 'events_blob');
     var filtered = events.filter(function(ev) {
       if ((ev.type || '').toUpperCase() === 'CONTEXT') return false;
       var src = ev.source || '';
@@ -10402,6 +12207,9 @@ function renderModalContent() {
   }
   if (_modalTab === 'summary') renderModalSummary(el);
   else if (_modalTab === 'narrative') renderModalNarrative(el);
+  else if (_modalTab === 'tools') renderModalTools(el);
+  else if (_modalTab === 'models') renderModalModelJourney(el);
+  else if (_modalTab === 'subagents') renderModalSubagents(el);
   else renderModalFull(el);
 }
 
@@ -10452,6 +12260,10 @@ function renderModalNarrative(el) {
       icon = '🔧'; text = 'Called tool: <code>' + escHtml(evt.toolName||'') + '</code>';
     } else if (evt.type === 'result') {
       icon = '✅'; text = 'Got result (' + (evt.text||'').length + ' chars)';
+    } else if (evt.type === 'model_change') {
+      icon = '🔄'; text = 'Switched to model: <strong>' + escHtml(evt.modelId||'') + '</strong>' + (evt.provider ? ' (' + escHtml(evt.provider) + ')' : '');
+    } else if (evt.type === 'thinking_level_change') {
+      icon = '🧠'; text = 'Thinking level changed to: <strong>' + escHtml(evt.thinkingLevel||'') + '</strong>';
     } else return;
     html += '<div class="narrative-item"><span class="narr-icon">' + icon + '</span>' + text + '</div>';
   });
@@ -10494,6 +12306,26 @@ function renderEvtItem(evt, idx) {
     icon = '✅'; typeClass = 'type-result';
     summary = '<strong>Result</strong> - ' + escHtml((evt.text||'').substring(0, 120));
     body = evt.text || '';
+  } else if (evt.type === 'model_change') {
+    // Render as a visual divider row, not a collapsible event
+    var mcTs = evt.timestamp ? new Date(evt.timestamp).toLocaleTimeString() : '';
+    var mcLabel = escHtml(evt.modelId || 'unknown');
+    var mcProv = evt.provider ? ' <span style="opacity:0.7;">(' + escHtml(evt.provider) + ')</span>' : '';
+    return '<div class="evt-annotation evt-model-change">'
+      + '<span class="evt-annotation-line"></span>'
+      + '<span class="evt-annotation-badge">🔄 Model → ' + mcLabel + mcProv + '</span>'
+      + '<span class="evt-annotation-ts">' + escHtml(mcTs) + '</span>'
+      + '<span class="evt-annotation-line"></span>'
+      + '</div>';
+  } else if (evt.type === 'thinking_level_change') {
+    var tlTs = evt.timestamp ? new Date(evt.timestamp).toLocaleTimeString() : '';
+    var tlLabel = escHtml(evt.thinkingLevel || 'unknown');
+    return '<div class="evt-annotation evt-thinking-change">'
+      + '<span class="evt-annotation-line"></span>'
+      + '<span class="evt-annotation-badge">🧠 Thinking → ' + tlLabel + '</span>'
+      + '<span class="evt-annotation-ts">' + escHtml(tlTs) + '</span>'
+      + '<span class="evt-annotation-line"></span>'
+      + '</div>';
   } else {
     summary = '<strong>' + escHtml(evt.type) + '</strong>';
     body = JSON.stringify(evt, null, 2);
@@ -10553,6 +12385,268 @@ function renderModalFull(el) {
     }
   }
   el.innerHTML = html || '<div style="padding:20px;color:var(--text-muted);">No events yet</div>';
+}
+
+async function renderModalTools(el) {
+  if (!_modalSessionId) {
+    el.innerHTML = '<div style="padding:24px;color:var(--text-muted)">No session loaded.</div>';
+    return;
+  }
+  el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">Loading tool timeline…</div>';
+  var data;
+  try {
+    var r = await fetch('/api/session-tools?session_id=' + encodeURIComponent(_modalSessionId) + '&args_chars=200&result_chars=200&include_unpaired=1');
+    data = await r.json();
+  } catch(e) {
+    el.innerHTML = '<div style="padding:24px;color:#ef5350">Failed to load tool timeline.</div>';
+    return;
+  }
+  var tools = data.tools || [];
+  if (!tools.length) {
+    el.innerHTML = '<div style="padding:24px;color:var(--text-muted)">No tool calls recorded for this session.</div>';
+    return;
+  }
+  var stats = data.stats || {};
+  var span = stats.span_ms || 1;
+  var t0 = stats.first_start_ms || 0;
+  var html = '<div style="padding:16px 20px;overflow-y:auto;">';
+  html += '<div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap;">';
+  html += _statChip('Calls', tools.length);
+  if (stats.error_calls) html += _statChip('Errors', stats.error_calls, '#ef5350');
+  if (stats.distinct_tools) html += _statChip('Distinct tools', stats.distinct_tools);
+  if (span > 0) html += _statChip('Span', _fmtDur(span));
+  html += '</div>';
+  html += '<div style="display:flex;gap:8px;align-items:center;margin-bottom:4px;font-size:10px;color:var(--text-muted);">';
+  html += '<div style="flex:0 0 150px"></div><div style="flex:1">0</div>';
+  html += '<div style="text-align:right">' + escHtml(_fmtDur(span)) + '</div></div>';
+  tools.forEach(function(tool) {
+    var st = (tool.start_ms || t0) - t0;
+    var en = (tool.end_ms && tool.paired ? tool.end_ms : tool.start_ms || t0) - t0;
+    if (en < st) en = st;
+    var startPct = (st / span * 100).toFixed(2);
+    var widthPct = Math.max((en - st) / span * 100, 0.4).toFixed(2);
+    var barColor = tool.is_error ? '#ef5350' : '#4caf50';
+    var name = escHtml((tool.tool_name || 'unknown').replace(/^mcp__[^_]+__/, '').substring(0, 26));
+    var durLabel = tool.paired ? escHtml(_fmtDur(tool.duration_ms)) : '&ndash;';
+    var tip = escHtml((tool.tool_name || '') + (tool.result_preview ? ' → ' + (tool.result_preview || '').substring(0, 80) : ''));
+    html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;" title="' + tip + '">';
+    html += '<div style="flex:0 0 150px;font-size:11px;color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + name + '</div>';
+    html += '<div style="flex:1;position:relative;height:14px;background:var(--bg-secondary);border-radius:3px;">';
+    html += '<div style="position:absolute;left:' + startPct + '%;width:' + widthPct + '%;height:100%;background:' + barColor + ';border-radius:3px;opacity:0.8;"></div>';
+    html += '</div>';
+    html += '<div style="flex:0 0 44px;font-size:10px;color:var(--text-muted);text-align:right;">' + durLabel + '</div>';
+    html += '</div>';
+  });
+  var byTool = data.by_tool || [];
+  if (byTool.length) {
+    html += '<div style="margin-top:20px;">';
+    html += '<div style="font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-muted);margin-bottom:8px;">By tool</div>';
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;">';
+    byTool.forEach(function(bt) {
+      var avg = (bt.total_duration_ms && bt.calls) ? _fmtDur(Math.round(bt.total_duration_ms / bt.calls)) : null;
+      html += '<div style="background:var(--bg-secondary);padding:8px 10px;border-radius:8px;">';
+      html += '<div style="font-size:10px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + escHtml(bt.tool_name||'') + '">';
+      html += escHtml((bt.tool_name||'').replace(/^mcp__[^_]+__/,'').substring(0,22)) + '</div>';
+      html += '<div style="font-size:13px;font-weight:600;">' + (bt.calls||0) + 'x';
+      if (avg) html += ' <span style="font-size:10px;font-weight:400;color:var(--text-muted)">avg ' + escHtml(avg) + '</span>';
+      if (bt.errors) html += ' <span style="font-size:10px;color:#ef5350">' + bt.errors + ' err</span>';
+      html += '</div></div>';
+    });
+    html += '</div></div>';
+  }
+  html += '</div>';
+  el.innerHTML = html;
+}
+
+function _statChip(label, value, color) {
+  return '<div style="background:var(--bg-secondary);padding:6px 12px;border-radius:8px;font-size:12px;">'
+    + '<span style="color:var(--text-muted)">' + escHtml(String(label)) + '</span><br>'
+    + '<strong' + (color ? ' style="color:' + color + '"' : '') + '>' + escHtml(String(value)) + '</strong></div>';
+}
+
+function _fmtDur(ms) {
+  if (ms == null || ms < 0) return '?';
+  if (ms < 1000) return ms + 'ms';
+  return (ms / 1000).toFixed(1) + 's';
+}
+
+async function renderModalModelJourney(el) {
+  if (!_modalSessionId) {
+    el.innerHTML = '<div style="padding:20px;color:var(--text-muted);">No session ID available</div>';
+    return;
+  }
+  el.innerHTML = '<div style="padding:20px;color:var(--text-muted);">Loading model journey...</div>';
+  try {
+    var r = await fetch('/api/session-model-journey/' + encodeURIComponent(_modalSessionId));
+    var data = await r.json();
+    if (data.error) {
+      el.innerHTML = '<div style="padding:20px;color:var(--text-error);">' + escHtml(data.error) + '</div>';
+      return;
+    }
+    var segments = data.segments || [];
+    var thinkingChanges = data.thinking_changes || [];
+    var stats = data.stats || {};
+    if (!segments.length && !thinkingChanges.length) {
+      el.innerHTML = '<div style="padding:20px;color:var(--text-muted);">No model changes detected in this session.</div>';
+      return;
+    }
+    var html = '';
+
+    // Stats summary
+    html += '<div class="model-journey-stats">';
+    html += '<div class="mj-stat"><span class="mj-stat-val">' + (stats.total_models_used || 1) + '</span><span class="mj-stat-label">Models Used</span></div>';
+    html += '<div class="mj-stat"><span class="mj-stat-val">' + (stats.total_segments || 0) + '</span><span class="mj-stat-label">Segments</span></div>';
+    html += '<div class="mj-stat"><span class="mj-stat-val">' + (stats.total_tokens || 0).toLocaleString() + '</span><span class="mj-stat-label">Total Tokens</span></div>';
+    html += '<div class="mj-stat"><span class="mj-stat-val">$' + (stats.total_cost_usd || 0).toFixed(4) + '</span><span class="mj-stat-label">Total Cost</span></div>';
+    var durMs = stats.total_duration_ms || 0;
+    var durStr = durMs < 60000 ? Math.round(durMs/1000) + 's' : durMs < 3600000 ? Math.round(durMs/60000) + 'm' : (durMs/3600000).toFixed(1) + 'h';
+    html += '<div class="mj-stat"><span class="mj-stat-val">' + durStr + '</span><span class="mj-stat-label">Duration</span></div>';
+    html += '</div>';
+
+    // Segments timeline
+    html += '<div class="model-journey-title">Model Segments</div>';
+    html += '<div class="model-journey-segments">';
+    var totalTokens = stats.total_tokens || 1;
+    for (var i = 0; i < segments.length; i++) {
+      var seg = segments[i];
+      var pct = totalTokens > 0 ? Math.round(seg.tokens / totalTokens * 100) : 0;
+      var segDurMs = seg.duration_ms || 0;
+      var segDur = segDurMs < 60000 ? Math.round(segDurMs/1000) + 's' : segDurMs < 3600000 ? Math.round(segDurMs/60000) + 'm' : (segDurMs/3600000).toFixed(1) + 'h';
+      var startTime = seg.start_ms ? new Date(seg.start_ms).toLocaleTimeString() : '--';
+      var endTime = seg.end_ms ? new Date(seg.end_ms).toLocaleTimeString() : '--';
+      // Color coding by model family
+      var modelLower = (seg.modelId || '').toLowerCase();
+      var barColor = modelLower.indexOf('opus') >= 0 ? '#a855f7'
+        : modelLower.indexOf('sonnet') >= 0 ? '#3b82f6'
+        : modelLower.indexOf('haiku') >= 0 ? '#22c55e'
+        : modelLower.indexOf('gpt-4') >= 0 ? '#10b981'
+        : modelLower.indexOf('gpt-3') >= 0 ? '#6b7280'
+        : modelLower.indexOf('o1') >= 0 || modelLower.indexOf('o3') >= 0 || modelLower.indexOf('o4') >= 0 ? '#f59e0b'
+        : modelLower.indexOf('gemini') >= 0 ? '#ef4444'
+        : '#64748b';
+
+      html += '<div class="mj-segment">';
+      html += '<div class="mj-segment-header">';
+      html += '<span class="mj-segment-num">#' + (i + 1) + '</span>';
+      html += '<span class="mj-segment-model" style="color:' + barColor + ';">' + escHtml(seg.modelId || 'unknown') + '</span>';
+      if (seg.provider) html += '<span class="mj-segment-provider">' + escHtml(seg.provider) + '</span>';
+      html += '<span class="mj-segment-time">' + escHtml(startTime) + ' - ' + escHtml(endTime) + '</span>';
+      html += '</div>';
+      html += '<div class="mj-segment-bar-track"><div class="mj-segment-bar-fill" style="width:' + Math.max(2, pct) + '%;background:' + barColor + ';"></div></div>';
+      html += '<div class="mj-segment-details">';
+      html += '<span>' + seg.tokens.toLocaleString() + ' tokens (' + pct + '%)</span>';
+      html += '<span>$' + (seg.cost_usd || 0).toFixed(4) + '</span>';
+      html += '<span>' + segDur + '</span>';
+      html += '</div>';
+      html += '</div>';
+    }
+    html += '</div>';
+
+    // Thinking level changes
+    if (thinkingChanges.length) {
+      html += '<div class="model-journey-title" style="margin-top:16px;">Thinking Level Changes</div>';
+      html += '<div class="model-journey-thinking">';
+      for (var j = 0; j < thinkingChanges.length; j++) {
+        var tc = thinkingChanges[j];
+        var tcTime = tc.timestamp_ms ? new Date(tc.timestamp_ms).toLocaleTimeString() : '--';
+        html += '<div class="mj-thinking-item">';
+        html += '<span class="mj-thinking-icon">🧠</span>';
+        html += '<span class="mj-thinking-level">' + escHtml(tc.thinkingLevel || 'unknown') + '</span>';
+        html += '<span class="mj-thinking-time">' + escHtml(tcTime) + '</span>';
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+
+    el.innerHTML = html;
+  } catch(e) {
+    el.innerHTML = '<div style="padding:20px;color:var(--text-error);">Failed to load model journey: ' + escHtml(e.message || String(e)) + '</div>';
+  }
+}
+
+async function renderModalSubagents(el) {
+  var key = window._modalSessionKey || _modalSessionId;
+  if (!key) {
+    el.innerHTML = '<div style="padding:20px;color:var(--text-muted);">No session key available.</div>';
+    return;
+  }
+  el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">Loading subagents…</div>';
+  var data;
+  try {
+    var r = await fetch('/api/task-runs?requester_session_key=' + encodeURIComponent(key) + '&limit=200');
+    data = await r.json();
+  } catch(e) {
+    el.innerHTML = '<div style="padding:24px;color:#ef5350">Failed to load subagents.</div>';
+    return;
+  }
+  var tasks = data.tasks || [];
+  if (!tasks.length) {
+    el.innerHTML = '<div style="padding:24px;color:var(--text-muted);">'
+      + (data.note ? escHtml(data.note) : 'No subagents spawned by this session.') + '</div>';
+    return;
+  }
+
+  // Build parent→children map; nodes whose parent is not in the result set become roots
+  var byParent = {};
+  var taskIdSet = {};
+  tasks.forEach(function(t) { taskIdSet[t.task_id] = true; });
+  tasks.forEach(function(t) {
+    var pid = (t.parent_task_id && taskIdSet[t.parent_task_id]) ? t.parent_task_id : '__root__';
+    if (!byParent[pid]) byParent[pid] = [];
+    byParent[pid].push(t);
+  });
+  var roots = byParent['__root__'] || tasks;
+
+  function calcDepth(taskId, d) {
+    var children = byParent[taskId] || [];
+    if (!children.length) return d;
+    return Math.max.apply(null, children.map(function(c) { return calcDepth(c.task_id, d + 1); }));
+  }
+  var maxDepth = roots.length
+    ? Math.max.apply(null, roots.map(function(r) { return calcDepth(r.task_id, 1); }))
+    : 1;
+
+  var stats = data.stats || {};
+  var failed = stats.failed || tasks.filter(function(t) { return t.status === 'failed'; }).length;
+  var stColor = { running: '#22c55e', succeeded: '#16a34a', failed: '#ef4444', pending: '#d97706' };
+
+  var html = '<div style="padding:16px 20px;overflow-y:auto;">';
+  html += '<div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap;">';
+  html += _statChip('Subagents', tasks.length);
+  html += _statChip('Loopiness depth', maxDepth);
+  if (failed) html += _statChip('Failed', failed, '#ef4444');
+  html += '</div>';
+
+  function renderNode(task, depth) {
+    var indent = depth * 20;
+    var color = stColor[task.status] || '#6b7280';
+    var dur = task.duration_ms ? _fmtDur(task.duration_ms) : '';
+    var childKey = (task.child_session_key || '').trim();
+    var rawLabel = task.label || task.task || task.task_id || '(unknown)';
+    var label = escHtml(rawLabel.length > 80 ? rawLabel.substring(0, 80) + '…' : rawLabel);
+    var isClickable = !!childKey;
+    var onclick = isClickable
+      ? ' onclick="openTaskModal(\'\',\'' + label.replace(/'/g, "\\'") + '\',\'' + childKey.replace(/'/g, "\\'") + '\')"'
+      : '';
+    html += '<div style="display:flex;align-items:flex-start;gap:8px;padding:7px 0;margin-left:' + indent + 'px;'
+      + 'border-top:1px solid var(--border-primary);' + (isClickable ? 'cursor:pointer;' : '') + '"' + onclick + '>';
+    html += '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + color + ';margin-top:5px;flex-shrink:0;"></span>';
+    html += '<div style="flex:1;min-width:0;">';
+    html += '<div style="font-size:13px;color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + label + '</div>';
+    var pills = [];
+    if (task.status) pills.push('<span style="font-size:10px;color:' + color + ';font-weight:600;text-transform:uppercase;">' + escHtml(task.status) + '</span>');
+    if (dur) pills.push('<span style="font-size:11px;color:var(--text-muted);">' + escHtml(dur) + '</span>');
+    if (task.terminal_outcome) pills.push('<span style="font-size:11px;color:var(--text-muted);">' + escHtml(task.terminal_outcome.substring(0, 50)) + '</span>');
+    if (pills.length) html += '<div style="display:flex;gap:8px;margin-top:2px;align-items:center;">' + pills.join('<span style="color:var(--border-primary);">\xb7</span>') + '</div>';
+    html += '</div>';
+    if (isClickable) html += '<span style="color:var(--text-muted);font-size:14px;padding-top:2px;">›</span>';
+    html += '</div>';
+    (byParent[task.task_id] || []).forEach(function(c) { renderNode(c, depth + 1); });
+  }
+
+  roots.forEach(function(r) { renderNode(r, 0); });
+  html += '</div>';
+  el.innerHTML = html;
 }
 
 function toggleEvtBody(bodyId, idx) {
@@ -10692,7 +12786,115 @@ document.addEventListener('DOMContentLoaded', function() {
   initOverviewCompClickHandlers();
   initFlow();
   bootDashboard();
+  // Issue #950: multi-profile workspace switcher
+  try { initWorkspaceSwitcher(); } catch (e) { /* non-fatal */ }
 });
+
+// ── Workspace switcher (issue #950) ───────────────────────────────────
+// Discovers all OpenClaw workspaces on this machine and lets power users
+// flip the dashboard between them. Hidden entirely when only one
+// workspace is found, so the zero-config single-workspace UX is unchanged.
+var _wsList = [];
+var _wsActive = null;
+
+async function initWorkspaceSwitcher() {
+  // Cloud iframe disables /api/workspaces (multi-workspace is local-only). Skip
+  // the fetch to avoid a 410 console error caught by cloud-contract.mjs gate.
+  if (window.CLOUD_MODE) return;
+  try {
+    var resp = await fetch('/api/workspaces', { credentials: 'same-origin' });
+    if (!resp.ok) return;
+    var data = await resp.json();
+    _wsList = (data && data.workspaces) || [];
+    _wsActive = data && data.active;
+  } catch (e) {
+    return;
+  }
+  renderWorkspaceSwitcher();
+  // Dismiss menu when clicking outside.
+  document.addEventListener('click', function(ev) {
+    var menu = document.getElementById('workspace-switcher-menu');
+    var btn = document.getElementById('workspace-switcher-btn');
+    if (!menu || menu.style.display === 'none') return;
+    if (menu.contains(ev.target) || (btn && btn.contains(ev.target))) return;
+    menu.style.display = 'none';
+  });
+}
+
+function renderWorkspaceSwitcher() {
+  var wrap = document.getElementById('workspace-switcher');
+  if (!wrap) return;
+  if (!_wsList || _wsList.length <= 1) {
+    wrap.style.display = 'none';
+    return;
+  }
+  wrap.style.display = 'inline-block';
+  var label = document.getElementById('workspace-switcher-label');
+  var activeEntry = _wsList.find(function(w) { return w.path === _wsActive; });
+  if (label) label.textContent = (activeEntry && activeEntry.name) || 'default';
+  var menu = document.getElementById('workspace-switcher-menu');
+  if (!menu) return;
+  menu.innerHTML = '';
+  _wsList.forEach(function(w) {
+    var item = document.createElement('div');
+    var isActive = w.path === _wsActive;
+    item.style.cssText = 'padding:8px 10px;border-radius:6px;cursor:pointer;font-size:12px;display:flex;flex-direction:column;gap:2px;' +
+      (isActive ? 'background:rgba(229,68,58,0.12);' : '');
+    item.onmouseover = function() { if (!isActive) item.style.background = 'rgba(255,255,255,0.06)'; };
+    item.onmouseout = function() { if (!isActive) item.style.background = 'transparent'; };
+    item.onclick = function() { selectWorkspace(w); };
+    var name = document.createElement('div');
+    name.style.cssText = 'font-weight:600;color:var(--text-primary,#fff);';
+    name.textContent = (isActive ? '• ' : '') + (w.name || 'workspace');
+    var path = document.createElement('div');
+    path.style.cssText = 'font-size:10px;color:var(--text-muted,#888);font-family:ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+    path.title = w.path;
+    path.textContent = w.path;
+    var meta = document.createElement('div');
+    meta.style.cssText = 'font-size:10px;color:var(--text-muted,#888);';
+    var agents = (typeof w.agent_count === 'number') ? w.agent_count : 0;
+    meta.textContent = agents + (agents === 1 ? ' agent' : ' agents');
+    item.appendChild(name);
+    item.appendChild(path);
+    item.appendChild(meta);
+    menu.appendChild(item);
+  });
+}
+
+function toggleWorkspaceSwitcher(ev) {
+  if (ev) ev.stopPropagation();
+  var menu = document.getElementById('workspace-switcher-menu');
+  if (!menu) return;
+  menu.style.display = (menu.style.display === 'none' || !menu.style.display) ? 'block' : 'none';
+}
+
+async function selectWorkspace(w) {
+  if (!w || !w.path || w.path === _wsActive) {
+    var menu = document.getElementById('workspace-switcher-menu');
+    if (menu) menu.style.display = 'none';
+    return;
+  }
+  try {
+    var resp = await fetch('/api/workspaces/active', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: w.name, path: w.path })
+    });
+    if (!resp.ok) {
+      console.warn('workspace switch failed', resp.status);
+      return;
+    }
+    _wsActive = w.path;
+    renderWorkspaceSwitcher();
+    var menu = document.getElementById('workspace-switcher-menu');
+    if (menu) menu.style.display = 'none';
+    // Cleanest reload — every cached tab re-fetches against the new workspace.
+    window.location.reload();
+  } catch (e) {
+    console.warn('workspace switch error', e);
+  }
+}
 
 // ── History Tab ──────────────────────────────────────────────────────
 var _historyRange = 3600; // seconds

@@ -20,6 +20,7 @@ import os
 import time
 
 from flask import Blueprint, Response, jsonify, request
+from clawmetry.config import is_local_store_read_enabled
 
 bp_brain = Blueprint('brain', __name__)
 
@@ -28,9 +29,272 @@ _BRAIN_HISTORY_CACHE = {}
 _BRAIN_HISTORY_CACHE_TTL_SECONDS = 3.0
 _BRAIN_HISTORY_TAIL_BYTES = 512 * 1024
 
+# ── Task-type classifier (issue #571) ──────────────────────────────────
+_FACTUAL_KW = frozenset([
+    "extract", "list", "summarize", "find", "what is", "how many",
+    "cite", "return json", "schema", "lookup", "search for", "retrieve",
+    "get the", "fetch", "query", "select", "filter", "count", "calculate",
+    "convert", "parse", "format", "validate", "check if", "verify",
+    "translate", "describe", "define", "explain what", "what are",
+    "show me", "give me", "tell me", "output", "return a",
+])
+_CREATIVE_KW = frozenset([
+    "brainstorm", "write", "imagine", "draft", "generate idea",
+    "story", "poem", "essay", "blog post", "ideate", "invent",
+    "compose", "suggest creative", "come up with", "make up",
+    "creative writing", "fiction", "novel", "screenplay", "narrative", "slogan",
+    "copywriting",
+])
+_REASONING_KW = frozenset([
+    "analyze", "analyse", "explain why", "how does", "compare", "evaluate",
+    "assess", "plan", "strategy", "debug", "diagnose", "reason", "decide",
+    "prioritize", "prioritise", "review", "optimize", "optimise", "refactor",
+    "improve", "think through", "step by step", "consider", "tradeoff",
+    "trade-off", "pros and cons", "should i", "which is better",
+])
+
+
+def _classify_task_type(text):
+    """Return 'creative', 'factual', 'reasoning', 'mixed', or None."""
+    if not text:
+        return None
+    t = text.lower()
+    f = sum(1 for kw in _FACTUAL_KW if kw in t)
+    c = sum(1 for kw in _CREATIVE_KW if kw in t)
+    r = sum(1 for kw in _REASONING_KW if kw in t)
+    if not (f or c or r):
+        return None
+    top = max(f, c, r)
+    if sum(1 for s in (f, c, r) if s == top) > 1:
+        return "mixed"
+    if f == top:
+        return "factual"
+    if c == top:
+        return "creative"
+    return "reasoning"
+
 
 def _brain_history_bool_arg(value):
     return str(value or "").strip().lower() in {"1", "true", "yes", "on", "all"}
+
+
+def _v3_message_content_to_text(content) -> str:
+    """Flatten an OpenClaw v3 ``data.message.content`` payload into plain text.
+
+    The trajectory ingest path (sync.py L2090-L2102) stores the WHOLE raw event
+    on ``data``, so user/assistant rows arrive with content nested under
+    ``data.message.content`` — either a plain string (user) or a list of typed
+    blocks (assistant: ``[{type:"text", text:...}, {type:"tool_use", ...}]``).
+    Only the ``text`` and ``thinking`` blocks carry transcript content; the
+    rest (tool_use, image, etc.) are summarised separately upstream.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                t = block.get("text") or ""
+                if t:
+                    parts.append(t)
+            elif btype == "thinking":
+                t = block.get("thinking") or block.get("text") or ""
+                if t:
+                    parts.append(t)
+        return "\n".join(parts)
+    return ""
+
+
+def _extract_brain_detail(row: dict) -> str:
+    """Pull a human-readable ``detail`` snippet from a DuckDB event row.
+
+    Two ingest paths populate ``data`` with different shapes (P0 #1143 fix
+    landed the v3 mapper alongside the legacy trajectory parser); this helper
+    handles both plus the original flat-key fallback so brain-history never
+    returns empty strings for events that DO have content:
+
+      * Legacy/trajectory (event_type=user/assistant/attachment/queue-operation):
+        content lives under ``data.message.content`` (string or block list),
+        ``data.content``, or ``data.attachment.{name,filename}``.
+      * v3 underscore (event_type=prompt.submitted/model.completed/tool.result/
+        model.changed/session.started): content lives at the TOP of ``data``
+        under ``finalPromptText`` / ``completionText`` / ``output`` /
+        ``result`` / ``modelId`` / ``cwd``, with a mirror under ``data.data``.
+      * Anything older: the original ``input/summary/text/name`` flat keys.
+    """
+    data = row.get("data") if isinstance(row, dict) else None
+    if isinstance(data, str):
+        return data
+    if not isinstance(data, dict):
+        return ""
+
+    # --- Legacy/trajectory shape: data.message.content ---------------------
+    msg = data.get("message")
+    has_message_envelope = isinstance(msg, dict)
+    if has_message_envelope:
+        text = _v3_message_content_to_text(msg.get("content"))
+        if text:
+            return text
+        # Encrypted-thinking-only assistant turns ship as
+        # ``[{type:"thinking", thinking:"", signature:"…"}]``. The text is
+        # genuinely absent — bail out with a stable placeholder rather than
+        # falling through to noisy fallbacks like cwd / id.
+        role = msg.get("role")
+        if role in ("assistant", "user"):
+            return "(thinking)" if role == "assistant" else ""
+
+    # --- v3 mapper shape: top-level projection -----------------------------
+    for k in ("finalPromptText", "completionText", "output", "result",
+              "input", "summary", "text", "name", "content"):
+        v = data.get(k)
+        if isinstance(v, str) and v:
+            return v
+        if isinstance(v, list):
+            text = _v3_message_content_to_text(v)
+            if text:
+                return text
+
+    # --- v3 mirror shape: data.data.* --------------------------------------
+    inner = data.get("data")
+    if isinstance(inner, dict):
+        for k in ("finalPromptText", "completionText", "output", "result",
+                  "input", "summary", "text", "name"):
+            v = inner.get(k)
+            if isinstance(v, str) and v:
+                return v
+            if isinstance(v, list):
+                text = _v3_message_content_to_text(v)
+                if text:
+                    return text
+        # Assistant texts list (v3 model.completed)
+        atexts = inner.get("assistantTexts")
+        if isinstance(atexts, list):
+            joined = "\n".join(str(x) for x in atexts if isinstance(x, str) and x)
+            if joined:
+                return joined
+
+    # --- Type-specific fallbacks ------------------------------------------
+    # attachment events: surface filename
+    att = data.get("attachment")
+    if isinstance(att, dict):
+        for k in ("filename", "name", "path", "url"):
+            v = att.get(k)
+            if isinstance(v, str) and v:
+                return v
+    # session.started / model.changed: useful identifying labels
+    for k in ("modelId", "cwd", "id", "operation"):
+        v = data.get(k)
+        if isinstance(v, str) and v:
+            return v
+
+    return ""
+
+
+def _try_local_store_brain(limit: int, include_artifacts: bool):
+    """Epic #964 phase 1b fast path. Returns a brain-history-shaped dict
+    when CLAWMETRY_LOCAL_STORE_READ=1 AND the local DuckDB store has
+    enough events to be useful. Returns ``None`` to defer to the JSONL
+    parser so the caller can fall through cleanly.
+
+    The shape returned is intentionally a SUBSET of the JSONL parser's
+    rich UI metadata — channel icons, source labels, etc. are not yet
+    enriched here. The full read-path migration is a follow-up; this
+    is a measurable proof that the local store is the right answer for
+    the simple list-of-events case.
+    """
+    rows = None
+    # Issue #1088: cross-process fast-path. The standard install runs daemon
+    # + dashboard as separate processes and DuckDB's exclusive writer lock
+    # blocks the dashboard from opening the file even read-only. Ask the
+    # daemon over HTTP first; fall back to direct open for single-process
+    # boots (tests, dev mode).
+    try:
+        from routes.local_query import local_store_via_daemon
+        rows = local_store_via_daemon("query_events", limit=limit)
+    except Exception:
+        rows = None
+    if rows is None:
+        try:
+            from clawmetry import local_store
+            store = local_store.get_store()
+            rows = store.query_events(limit=limit)
+        except Exception:
+            return None
+    if not rows:
+        # Empty store → fall through to JSONL parser so a fresh install
+        # without a populated local DB still gets a useful brain feed.
+        return None
+    # Translate the local-store row shape (id/node_id/agent_id/session_id/
+    # event_type/ts/data/cost_usd/...) into the brain-history event shape
+    # the dashboard JS expects (time/type/detail/src/sessionId/...).
+    out = []
+    for r in rows:
+        # P0 regression fix (#1143): the v3 sync mapper nests content under
+        # ``data.data`` and the legacy trajectory parser nests it under
+        # ``data.message.content`` — neither exposes the flat ``input/summary/
+        # text/name`` keys this fast path used to read, so EVERY row came back
+        # with detail="". ``_extract_brain_detail`` knows about all three
+        # shapes (legacy, v3 mapper top-level, v3 mapper mirror).
+        detail = _extract_brain_detail(r)
+        evt_type = (r.get("event_type") or "").upper()
+        row = {
+            "time":       r.get("ts", ""),
+            "type":       evt_type,
+            "detail":     str(detail)[:200],
+            "src":        (r.get("session_id") or r.get("agent_id") or "")[:32],
+            "sessionId":  r.get("session_id") or "",
+            "agentId":    r.get("agent_id") or "main",
+            "tokens":     r.get("token_count") or 0,
+            "cost":       float(r.get("cost_usd") or 0.0),
+            "model":      r.get("model") or "",
+        }
+        # ── Channel-event enrichment (PR aca53ec8 / Telegram ingest) ─────
+        # Channel turns land here as event_type=channel.in|channel.out with
+        # the raw provider payload under ``data``. Surface a few flat fields
+        # (provider, sender, chat_id, channel, direction) so the Brain row
+        # renderer can paint a provider pill + sender name without having
+        # to re-parse the data blob client-side.
+        if evt_type.startswith("CHANNEL."):
+            data = r.get("data") or {}
+            if isinstance(data, dict):
+                provider = (data.get("provider") or "").lower()
+                if provider:
+                    row["provider"] = provider
+                    row["channel"] = provider
+                # direction: channel.in → "in", channel.out → "out"
+                row["direction"] = "out" if evt_type.endswith(".OUT") else "in"
+                # sender: prefer flat sender_name, fall back to from/sender/user blocks
+                sender = data.get("sender_name") or data.get("sender") or ""
+                if not sender:
+                    for blk_key in ("from", "user"):
+                        blk = data.get(blk_key)
+                        if isinstance(blk, dict):
+                            sender = (
+                                blk.get("username")
+                                or blk.get("first_name")
+                                or blk.get("name")
+                                or ""
+                            )
+                            if sender:
+                                break
+                if sender:
+                    row["sender"] = str(sender)[:80]
+                # chat_id
+                chat_id = data.get("chat_id") or data.get("channel_id") or ""
+                if not chat_id and isinstance(data.get("chat"), dict):
+                    chat_id = data["chat"].get("id") or ""
+                if chat_id:
+                    row["chat_id"] = str(chat_id)[:80]
+        out.append(row)
+    return {
+        "events":  out,
+        "count":   len(out),
+        "_source": "local_store",
+        "_shape":  "brain_history",
+    }
 
 
 def _brain_history_is_artifact(path):
@@ -76,6 +340,14 @@ def api_brain_history():
     include_artifacts = _brain_history_bool_arg(
         request.args.get("include_artifacts") or request.args.get("artifacts")
     )
+    # Epic #964 phase 1b: opt-in local-store fast path. Skip the JSONL
+    # parser entirely when CLAWMETRY_LOCAL_STORE_READ=1 AND the store
+    # has data. Falls through to the full parser otherwise (so a fresh
+    # install with an empty store still gets the rich brain feed).
+    if is_local_store_read_enabled():
+        fast = _try_local_store_brain(limit, include_artifacts)
+        if fast is not None:
+            return jsonify(fast)
     cache_key = (limit, include_artifacts)
     cached = _BRAIN_HISTORY_CACHE.get(cache_key)
     now_cache = time.time()
@@ -304,41 +576,17 @@ def api_brain_history():
                             "color": "#a855f7",
                         }
                     )
-                else:
-                    msg_lower = msg.lower()
-                    for kw in (
-                        "exec",
-                        "browser",
-                        "web_search",
-                        "web_fetch",
-                        "read",
-                        "write",
-                        "edit",
-                        "message",
-                        "spawn",
-                        "subagents",
-                        "tts",
-                        "nodes",
-                        "canvas",
-                    ):
-                        if kw in msg_lower:
-                            ev_type = tool_to_type(kw)
-                            try:
-                                start = msg_lower.index(kw)
-                                detail = msg[start : start + 300].split("\n")[0].strip()
-                            except Exception:
-                                detail = ""
-                            events.append(
-                                {
-                                    "time": ts,
-                                    "source": "main",
-                                    "sourceLabel": "main",
-                                    "type": ev_type,
-                                    "detail": detail,
-                                    "color": "#a855f7",
-                                }
-                            )
-                            break
+                # NOTE: a previous implementation also did substring keyword
+                # matching here ("if 'browser' in msg_lower → BROWSER event").
+                # That mis-classified benign console messages (e.g. "Opened in
+                # your browser. Keep that tab to control OpenClaw." or "Token
+                # auto-auth included in browser/clipboard URL.") as BROWSER
+                # tool invocations and contaminated the Brain stream with
+                # onboarding/lifecycle text. Removed — only bracketed
+                # ``[tool] ...`` log lines now produce events from this path.
+                # DuckDB-first: real tool calls already arrive via local_store
+                # ingestion, so this fallback is pure noise. (issue: brain
+                # onboarding-text contamination, 2026-05-13.)
         except Exception:
             pass
 
@@ -483,6 +731,7 @@ def api_brain_history():
                                 "type": "USER",
                                 "detail": text[:300],
                                 "color": color,
+                                "taskType": _classify_task_type(text),
                             }
                         )
 
@@ -520,6 +769,7 @@ def api_brain_history():
                                         "type": "AGENT",
                                         "detail": text[:300],
                                         "color": color,
+                                        "taskType": _classify_task_type(text),
                                     }
                                 )
                             continue
@@ -811,6 +1061,7 @@ def api_brain_stream():
                             "type": "AGENT",
                             "detail": text[:300],
                             "color": color,
+                            "taskType": _classify_task_type(text),
                         }
                 if btype == "tool_use":
                     tool_name = block.get("name", "")
@@ -848,6 +1099,7 @@ def api_brain_stream():
                     "type": "USER",
                     "detail": text[:300],
                     "color": color,
+                    "taskType": _classify_task_type(text),
                 }
         return None
 

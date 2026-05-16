@@ -1,5 +1,116 @@
 ## [Unreleased]
 
+### MOAT batch: 7 user-visible Tier-1 bypasses → DuckDB fast-path (2026-05-15)
+Single-day push that pulls seven dashboard surfaces off the JSONL/process-stat path and onto the daemon-proxy DuckDB read path. Each migration ships with a synthetic-event E2E test that proves the round-trip (LocalStore.ingest → DuckDB → endpoint returns the expected shape). All seven are paired with `_try_local_store_*` early-returns plus the legacy fallback verbatim — no behavior regression, just latency.
+
+- **`/api/context-anatomy` Session-history bucket → DuckDB** (#1370). Replaces a 5×N JSONL scan with one indexed SQL aggregate; ~200-800ms → <5ms on busy workspaces. Drive-by: also accepts OpenClaw-native `usage.input` token shape so non-Anthropic-SDK nodes stop silent-zeroing.
+- **`/api/spans` surfaces OTel spans we already persist** (#1372 — MOAT cap 1.b structured event capture). New Brain-tab `📐 Spans` toggle, lazy-loaded from the existing `spans` table. No new ingestion — pure exposure of what the OTLP receiver was already capturing.
+- **`/api/loop-signals` exposes LoopDetector signals from clawmetry/proxy.py** (#1373 — MOAT cap 2.f loop/stall detection). New `loop_signals` DuckDB table with `(session_id, signature)` PK + upsert semantics; Brain-tab badge hidden until count > 0.
+- **Brain tab UX clean-up** (#1375). `Show plumbing` toggle (default off) hides QUEUE-OPERATION rows; provenance JSON blocks (`Conversation info (untrusted metadata): {...}`) collapse to inline channel pills (`📱 Telegram · Vivek Chand · 22:15  ⓘ`) with click-to-expand JSON. ~8 rows/Telegram-message → 2-3 rows.
+- **`/api/skills` fidelity counts → DuckDB** (#1378). Replaces a 7d × N-session JSONL scan with one SQL aggregate over `events`. New `query_recent_read_tool_calls()` handles all three on-the-wire shapes (v3 `tool.call`, trajectory `toolMetas`, legacy `data.message.content`).
+- **`/api/fallbacks` model-transition aggregator → DuckDB** (#1380). Replaces opening up to 100 transcript files per request with one CTE+walk over `events`; multi-second → ms.
+
+### Login flow hardening (issue #1356, 2026-05-15)
+- **`pgrep -f "openclaw-gatewa"` typo fix** (#1357). Four callsites in `dashboard.py` had the trailing `y` truncated, so process-env auto-detection silently returned no token; on systems without `OPENCLAW_GATEWAY_TOKEN` env var or matching config-file fallback, `GATEWAY_TOKEN` stayed `None` and `/api/auth/check` rejected every input. +4 bytes.
+- **`/api/auth/detected-token` localhost-only bootstrap endpoint** (#1359 PR-B). Returns the on-disk gateway token to a loopback caller so the dashboard JS can self-bootstrap without a 48-char manual paste. Hardened with four stacked defenses: raw WSGI `REMOTE_ADDR` (not Flask attribute, defends against future ProxyFix wrap), Host-header allowlist (DNS rebinding), reject any `Forwarded`/`X-Forwarded-*`/`X-Real-IP` (proxy markers), refuse to register when bound to non-loopback host (`--host 0.0.0.0`). 27 unit tests.
+- **Zero-click bootstrap JS** (#1358 PR-C). `auth-bootstrap.js` checks `localStorage` first; if empty, fetches `/api/auth/detected-token`, stores the result, and re-enters `checkAuth()` inline (no `location.reload()` — that broke Playwright E2E with "Execution context was destroyed", fixed in followup #1363).
+- **CLI startup banner prints one-click `/auth?token=` URL** (#1360 PR-D). When `GATEWAY_TOKEN` is detected at startup, prints `-> http://localhost:8900/auth?token=<TOKEN>  (one-click sign-in)` next to the dashboard URL. `--host 0.0.0.0` is reframed as `localhost` so the link only works from the local machine.
+- **Playwright E2E coverage for the zero-click flow** (#1361 PR-E).
+- **Hotfix: drop `location.reload()` from PR-C** (#1363). The bootstrap-IIFE-reload anti-pattern caught the entire E2E suite ERRORing at setup; re-entering `checkAuth(token)` inline keeps the token in `localStorage` for the fetch shim without pulling the navigation context out from under the fixture. P0 issue #1368 filed for a fast lint guard.
+
+### Browser-level regression sweep (2026-05-12 evening)
+- **getattr guards for 3 endpoints returning 500** (#1077). `_estimate_usd_per_token` (routes/sessions.py: `/api/delegation-tree`), `AgentReliabilityScorer` (routes/health.py: `/api/reliability`), `_build_clusters` (routes/meta.py: `/api/clusters`). All three returned `AttributeError` 500s when the underlying helper hadn't shipped; now degrade to `{...empty data, _missing: true}` so the dashboard renders cleanly. Caught by a real-browser audit that scraped DevTools console for cloud users; complements PR clawmetry-cloud#750 which suppresses harmless 410/404 calls.
+
+### DuckDB-everywhere + heartbeat-piggyback transport (epic #1032 phase 1–5, partial #964 close-out)
+- **`/api/transcript/<sid>` reads from local DuckDB** (#1056) under `CLAWMETRY_LOCAL_STORE_READ=1`. Closes the explicit local-first blocker surfaced by the real-OpenClaw E2E pipeline.
+- **`/api/memory-files`, `/api/file`, `/api/memory`, `/api/memory-analytics` read from local DuckDB** (#1059) via new `LocalStore.query_memory_blobs()`. POST `/api/file` writes still on the filesystem — read-only by default.
+- **Tier-1 fast paths**: `/api/component/tool/<name>`, `/api/component/brain`, `/api/autonomy`, `/api/advisor/{ask,status}`, `/api/reasoning` (#1057). The 5 OS-state component endpoints (runtime/machine/storage/network/gateway) intentionally stay off the event store.
+- **Daemon dispatches heartbeat-piggybacked queries** (#1054, #1055). Replaces the killed WS relay path. Cloud responds to `/ingest/heartbeat` with `pending_queries`; daemon dispatches via `routes/local_query._dispatch()`, encrypts, POSTs to `/ingest/cache`. Industry-validated by Datadog Remote Config / AWS SSM Run Command / OpenTelemetry OpAMP-HTTP.
+- **Phase 2 — brain cache_push on heartbeat** (#1061). Top-50 brain events ride along with every `/ingest/heartbeat` body under `brain:{owner_hash}:{node}:recent` (3600s TTL). Cloud Brain tab paints in <100ms with zero Cloud SQL hits on the happy path.
+- **Phase 3 — alert rules in DuckDB + cache_push** (#1062). New `alert_rules` table (SCHEMA_VERSION 2 → 3), CRUD via `LocalStore`, fast path on `/api/alerts/rules`, plus a single `alerts:{owner_hash}:rules` cache entry per heartbeat. Cloud reads encrypted blob, browser decrypts.
+- **Phase 4 — approvals queue in DuckDB + decision-via-pending_queries** (#1064). New `approvals` table, fast path on `/api/approvals*`, pending queue pushed to `approvals:{owner_hash}:queue` on heartbeat. Cloud decisions queued back via `pending_queries` actions — no inbound network on the OSS side.
+- **Phase 5 — channel adapter config in DuckDB** (#1063). New `channel_config` table holds E2E-encrypted blobs (Telegram bot tokens, Slack OAuth, etc.) — cloud never sees plaintext. Adapter status summary pushed to `channels:{owner_hash}:status` every heartbeat.
+- **Real OpenClaw binary E2E coverage** (#1058). 8 tests spawn `openclaw agent --local --message ... --json` against a hermetic `OPENCLAW_HOME` and round-trip the produced JSONL through the real daemon → DuckDB → `/api/local/events` + `/api/sessions`. Skips cleanly on CI without the binary.
+- **Coverage**: 32/32 `_try_local_store_*`-gated endpoints have full seed→hit→`_source`-assert tests.
+
+### JS response-shape tolerance (forward-compat, #1071)
+- `app.js` now ships `unwrapList` / `unwrapListAsync` helpers that
+  accept all three Phase 2–5 envelopes (legacy array, local-store
+  `{key:[...], _source:"local_store"}`, cloud cache `{key_blob:"...",
+  _source:"cache"}`). On `_source:"cache"` the helper reaches for the
+  cloud-injected `decryptBlob` to decode ciphertext in-browser; if the
+  decryptor isn't loaded yet we degrade to an empty list silently —
+  never throws, never blocks the dashboard from painting. Applied to
+  `loadAlertRules` + the three `/api/brain-history` consumers.
+- Pre-publish `tests/e2e/cloud-contract.mjs` per-tab JS-error check
+  now goes through the same `isHarmlessConsoleError()` filter as the
+  global rollup. Stops `/api/diagnostics` 410 + `/api/config-diagnostics`
+  404 from false-failing every tab. Flow node-click test now degrades
+  to a SKIP on empty-activity instead of hard-asserting modal-open.
+
+### Local store: multi-agent foundation + naming (epic #964)
+- **Local DB renamed** `events.duckdb` → `clawmetry.duckdb`. The DB now
+  holds events, sessions, memory blobs, heartbeats, system snapshots
+  (and soon spans for tracing) — `events.duckdb` was outgrowing its name.
+  **Auto-migrates** an existing `events.duckdb` (and its `.wal` sibling)
+  on next start. Lossless, no schema change. Skipped if you've set
+  `CLAWMETRY_LOCAL_STORE_PATH` to a custom location.
+- **Multi-agent schema** (SCHEMA_VERSION 1 → 2). New tables: `sessions`,
+  `memory_blobs`, `heartbeats`, `system_snapshots`, `crons`, `subagents`,
+  `openclaw_channels`. `agent_type` discriminator added to `events` and
+  `daily_aggregates` so OpenClaw / Claude Code / Hermes / Cursor / Codex /
+  Aider all coexist in one store. v1 stores auto-upgraded with `ALTER
+  TABLE ADD COLUMN agent_type DEFAULT 'openclaw'` — legacy rows preserved.
+- **Daemon write-through for sessions / memory / heartbeats**. Each cloud
+  sync (`/ingest/sessions`, `/ingest/memory`, `/ingest/heartbeat`) now also
+  persists locally before shipping to cloud. Best-effort; local failures
+  never block cloud sync.
+- **Dashboard reads sessions from local DB** under
+  `CLAWMETRY_LOCAL_STORE_READ=1` (opt-in, falls through to gateway/JSONL
+  when unset OR store is empty).
+
+### Cloud cold-data relay (epic #964 phases 3b + 4)
+- **WebSocket relay client** (`clawmetry/relay.py`) — long-lived WS to
+  `wss://app.clawmetry.com/api/node/relay`. Listens for `{type:"query"}`
+  frames from the cloud, dispatches via the same `relay_dispatch()` the
+  local HTTP API uses, returns chunked responses. Reconnect with
+  exponential backoff (2s → 60s cap). Cloud dashboard can now ask the
+  user's machine for data older than the 24h hot window without us paying
+  for permanent cloud storage.
+- **`websocket-client` is now a base install dep** (was previously
+  `extras_require["relay"]`). The opt-in caused cloud users to silently
+  miss the relay. `pip install clawmetry && clawmetry connect` "just works"
+  again. The `[relay]` extra is kept as a no-op for backwards compat with
+  old install scripts.
+- Cloud-side broker shipped in `clawmetry-cloud#705` + `#711` + `#712`
+  (gunicorn + gevent-websocket migration so flask-sock can do WS upgrades
+  in production).
+
+### Heartbeat
+- **`local_store_size_mb`** + `local_store` health block on every
+  heartbeat. Cloud-side rollout playbook will gate phase 2 (cloud
+  retention slim) on ≥80% of nodes reporting healthy local stores.
+
+### Brain history
+- **Opt-in fast path** under `CLAWMETRY_LOCAL_STORE_READ=1` —
+  `/api/brain-history` returns directly from the local DuckDB (tagged
+  `_source: "local_store"`) instead of re-parsing JSONL. Falls through to
+  the legacy parser when the env var is unset OR the store is empty.
+
+### Tests
+- 70+ new tests covering: relay dispatch, chunking, error frames,
+  capability drift, brain fast-path, sessions fast-path, schema
+  migration v1→v2, ingest_session/memory_blob/heartbeat helpers, daemon
+  write-through, the events.duckdb→clawmetry.duckdb rename + WAL move,
+  env-override skip, no-clobber when both files exist.
+
+### Local-first foundation (epic #964 phase 1) — first shipped in 0.12.164
+- **Local DuckDB event store** at `~/.clawmetry/events.duckdb` — durable record of every telemetry event the daemon parses. Switched from SQLite to DuckDB (decision in clawmetry-cloud meta-PRD): columnar storage makes the dashboard's GROUP BY / time-window analytics 10–100× faster, and unlocks future Parquet export. Adds `duckdb>=0.10` as a dependency.
+- **Daemon writes through to local store** at parse time — local is now the source of truth, cloud is a hot cache. Failures in the local path never block cloud sync.
+- **Two new diagnostic endpoints** — `/api/local-store/health` and `/api/local-store/events` for verification + test harnesses
+- 27 passing tests cover ingest validation, idempotency, batch flush, query filters, restart persistence, ring overflow, and the full sync→store wire-through
+- Note: 0.12.164's SQLite `events.db` file is left in place but no longer read; safe to delete after upgrade.
+
 ---
 
 ## v0.12.120

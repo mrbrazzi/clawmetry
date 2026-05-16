@@ -1,3 +1,6 @@
+import io
+import json
+import urllib.error
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -81,3 +84,58 @@ def test_pod_name_xml_escaping():
 </plist>"""
 
     ET.fromstring(plist)
+
+
+def _fake_http_error(code, body_dict):
+    raw = json.dumps(body_dict).encode()
+    err = urllib.error.HTTPError(
+        "http://x", code, "Service Unavailable", {}, io.BytesIO(raw)
+    )
+    return err
+
+
+def test_post_json_returns_status_and_retry_after_on_503():
+    """_post_json should expose the HTTP status and any retry_after hint."""
+
+    err = _fake_http_error(503, {"error": "otp_store_failed", "retry_after": 7})
+
+    def _fake_urlopen(req, timeout=None):
+        raise err
+
+    import urllib.request as _ur
+
+    orig = _ur.urlopen
+    _ur.urlopen = _fake_urlopen
+    try:
+        result, status = cli._post_json("http://example", {"action": "send"})
+    finally:
+        _ur.urlopen = orig
+
+    assert status == 503
+    assert result["error"] == "otp_store_failed"
+    assert result["retry_after"] == 7
+
+
+def test_post_json_handles_non_json_body():
+    """Non-JSON error bodies are truncated to a string, not crashed on."""
+
+    err = _fake_http_error(500, "boom")
+    err = urllib.error.HTTPError(
+        "http://x", 500, "boom", {}, io.BytesIO(b"oh no plain text")
+    )
+
+    def _fake_urlopen(req, timeout=None):
+        raise err
+
+    import urllib.request as _ur
+
+    orig = _ur.urlopen
+    _ur.urlopen = _fake_urlopen
+    try:
+        result, status = cli._post_json("http://example", {})
+    finally:
+        _ur.urlopen = orig
+
+    assert status == 500
+    assert "oh no" in result["error"]
+    assert result["retry_after"] is None

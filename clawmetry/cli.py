@@ -5,6 +5,41 @@ import sys
 import os
 from pathlib import Path
 
+
+def _post_json(url, body, timeout=15):
+    """POST JSON and return (result_dict, status).
+
+    On 2xx: returns (parsed_json, 200).
+    On HTTPError: returns ({"error": msg, "retry_after": int|None}, status_code).
+    On other errors: returns ({"error": str(e)}, 0).
+    """
+    import urllib.request
+    import urllib.error
+    import json as _json
+
+    data = _json.dumps(body).encode()
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return _json.loads(resp.read()), 200
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode()
+        try:
+            payload = _json.loads(raw)
+        except Exception:
+            payload = {}
+        return (
+            {
+                "error": payload.get("error") or raw[:200],
+                "retry_after": payload.get("retry_after"),
+            },
+            e.code,
+        )
+    except Exception as e:
+        return {"error": str(e)}, 0
+
 # Auto-activate HTTP interceptor when CLAWMETRY_INTERCEPT=1
 if os.environ.get("CLAWMETRY_INTERCEPT") == "1":
     try:
@@ -122,6 +157,21 @@ def _is_sync_running() -> bool:
     return False
 
 
+def _count_sync_daemons() -> int:
+    """Return number of running clawmetry.sync processes (best-effort)."""
+    import subprocess as _sp
+    try:
+        r = _sp.run(
+            ["pgrep", "-f", "clawmetry.sync"],
+            capture_output=True, text=True, check=False,
+        )
+        if r.returncode == 0:
+            return len([l for l in r.stdout.splitlines() if l.strip()])
+    except Exception:
+        pass
+    return 0
+
+
 def _kill_sync_daemon() -> None:
     """Kill clawmetry.sync processes — no pkill needed."""
     import os
@@ -152,6 +202,15 @@ def _kill_sync_daemon() -> None:
                 pass
     except Exception:
         pass
+    # macOS without psutil + no /proc — fall back to pkill (universally
+    # available on Darwin/Linux/BSD).
+    import shutil as _sh
+    import subprocess as _sp2
+    if _sh.which("pkill"):
+        _sp2.run(
+            ["pkill", "-f", "clawmetry.sync"],
+            check=False, capture_output=True,
+        )
 
 
 def _stop_existing_daemon() -> None:
@@ -251,18 +310,10 @@ def _get_api_key_interactive() -> str:
     INGEST_URL = os.environ.get("CLAWMETRY_INGEST_URL", "https://ingest.clawmetry.com")
 
     def _api_call(path, body):
-        url = INGEST_URL.rstrip("/") + path
-        data = _json.dumps(body).encode()
-        req = urllib.request.Request(
-            url, data=data, headers={"Content-Type": "application/json"}, method="POST"
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return _json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            return {"error": e.read().decode()[:200]}
-        except Exception as e:
-            return {"error": str(e)}
+        result, status = _post_json(INGEST_URL.rstrip("/") + path, body)
+        if isinstance(result, dict) and status and status >= 400:
+            result["_status"] = status
+        return result
 
     print()
     entry = _input("  📧 Enter your email: ").strip()
@@ -281,6 +332,23 @@ def _get_api_key_interactive() -> str:
     email = entry.lower()
     print(f"\n  📨 Sending code to {email}…", end="", flush=True)
     r = _api_call("/api/auth/email-otp", {"action": "send", "email": email})
+    if r.get("_status") == 503:
+        import time as _time
+
+        retry_after = r.get("retry_after") or 5
+        try:
+            retry_after = max(1, min(int(retry_after), 30))
+        except (TypeError, ValueError):
+            retry_after = 5
+        print(f"\n  ⏳ Server's busy — retrying in {retry_after}s…", flush=True)
+        _time.sleep(retry_after)
+        print(f"  📨 Sending code to {email}…", end="", flush=True)
+        r = _api_call("/api/auth/email-otp", {"action": "send", "email": email})
+        if r.get("_status") == 503:
+            print(" ❌")
+            print("\n  Couldn't reach our servers right now.")
+            print("  Please try `clawmetry connect` again in a minute.\n")
+            sys.exit(1)
     if r.get("error"):
         print(f" ❌  {r['error']}")
         print("  Visit https://clawmetry.com/connect to get your API key.")
@@ -342,23 +410,32 @@ def _verify_key_ownership(api_key: str) -> None:
     INGEST_URL = os.environ.get("CLAWMETRY_INGEST_URL", "https://ingest.clawmetry.com")
 
     def _api(path, body):
-        url = INGEST_URL.rstrip("/") + path
-        data = _json.dumps(body).encode()
-        req = urllib.request.Request(
-            url, data=data, headers={"Content-Type": "application/json"}, method="POST"
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return _json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            return {"error": e.read().decode()[:200]}
-        except Exception as e:
-            return {"error": str(e)}
+        result, status = _post_json(INGEST_URL.rstrip("/") + path, body)
+        if isinstance(result, dict) and status and status >= 400:
+            result["_status"] = status
+        return result
 
     print()
     print("  🔐 Verify account ownership")
     print("  📨 Sending verification code…", end="", flush=True)
     r = _api("/api/auth/email-otp", {"action": "send_by_key", "api_key": api_key})
+    if r.get("_status") == 503:
+        import time as _time
+
+        retry_after = r.get("retry_after") or 5
+        try:
+            retry_after = max(1, min(int(retry_after), 30))
+        except (TypeError, ValueError):
+            retry_after = 5
+        print(f"\n  ⏳ Server's busy — retrying in {retry_after}s…", flush=True)
+        _time.sleep(retry_after)
+        print("  📨 Sending verification code…", end="", flush=True)
+        r = _api("/api/auth/email-otp", {"action": "send_by_key", "api_key": api_key})
+        if r.get("_status") == 503:
+            print(" ❌")
+            print("\n  Couldn't reach our servers right now.")
+            print("  Please try this command again in a minute.\n")
+            sys.exit(1)
     if r.get("error"):
         print(f" ❌  {r['error']}")
         sys.exit(1)
@@ -522,8 +599,17 @@ def _cmd_connect(args) -> None:
         print()
         return
 
-    # Start daemon
-    _start_daemon(config, args)
+    # Default: defer the sync daemon until the user runs `clawmetry sync`.
+    # --start-sync-now restores the historical auto-spawn behavior.
+    _start_now = getattr(args, "start_sync_now", False)
+
+    if _start_now:
+        _start_daemon(config, args)
+    else:
+        print("  Sync is paused. Start it whenever you're ready:")
+        print("    clawmetry sync")
+        print("  (or run `clawmetry connect --start-sync-now` to keep today's auto-start)")
+        print()
 
     # Open browser with encryption key in URL fragment (never sent to server)
     # The #key=... fragment stays client-side — true E2E encryption
@@ -561,6 +647,31 @@ def _start_daemon(config: dict, args) -> None:
     else:
         # Windows / fallback: subprocess
         _start_subprocess()
+
+
+def _cmd_sync(args) -> None:
+    """clawmetry sync — start the deferred sync daemon for an already-connected node."""
+    import json
+    from clawmetry.sync import CONFIG_FILE
+
+    if not CONFIG_FILE.exists():
+        print("❌  No clawmetry config found. Run `clawmetry connect` first.")
+        sys.exit(1)
+
+    try:
+        config = json.loads(CONFIG_FILE.read_text())
+    except Exception as e:
+        print(f"❌  Could not read {CONFIG_FILE}: {e}")
+        sys.exit(1)
+
+    if not config.get("api_key"):
+        print("❌  Config has no api_key. Run `clawmetry connect` first.")
+        sys.exit(1)
+
+    print(f"  Starting sync daemon for {config.get('node_id', '<unknown>')}…")
+    _start_daemon(config, args)
+    if not getattr(args, "foreground", False):
+        print("  ✅  Sync daemon started.")
 
 
 def _register_nemoclaw_sandbox_daemons() -> None:
@@ -696,6 +807,16 @@ def _register_launchd(config: dict) -> None:
         <string>-m</string>
         <string>clawmetry.sync</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Issue #1310: gateway WS tap is opt-in (PR #1228) because
+             OpenClaw upstream may not grant operator.read scope. Default
+             ON in the daemon plist so Telegram/Signal/Slack channel
+             messages reach DuckDB on a fresh install; the tap silently
+             no-ops on scope rejection (with a single warning) so this
+             can't make things worse. -->
+        <key>CLAWMETRY_ENABLE_WS_TAP</key><string>1</string>
+    </dict>
     <key>RunAtLoad</key>         <true/>
     <key>KeepAlive</key>         <true/>
     <key>StandardOutPath</key>   <string>{LOG_FILE}</string>
@@ -743,6 +864,9 @@ After=network.target
 
 [Service]
 ExecStart={python} -m clawmetry.sync
+# Issue #1310 — gateway WS tap default-on so Telegram/Signal/Slack
+# channel messages reach DuckDB. Tap silently no-ops on scope rejection.
+Environment=CLAWMETRY_ENABLE_WS_TAP=1
 Restart=always
 RestartSec=30
 StandardOutput=append:{LOG_FILE}
@@ -1077,6 +1201,15 @@ def _cmd_uninstall() -> None:
             )
             plist.unlink()
             print("  ✅  Stopped and removed launchd daemon")
+        # Belt-and-suspenders: kill any sync daemons started by hand (not via
+        # launchd). Without this, install.sh's pkill is the only thing that takes
+        # them down, which surfaces to the user as "Killed stray pre-existing
+        # daemon" right after a 'clean' uninstall — undermining trust that
+        # uninstall actually worked.
+        _stray = _count_sync_daemons()
+        if _stray > 0:
+            _kill_sync_daemon()
+            print(f"  ✅  Killed {_stray} stray sync process(es)")
     elif system == "Linux":
         svc = home / ".config" / "systemd" / "user" / "clawmetry-sync.service"
         if shutil.which("systemctl"):
@@ -1085,10 +1218,11 @@ def _cmd_uninstall() -> None:
                 check=False,
                 capture_output=True,
             )
+        _stray = _count_sync_daemons()
         _kill_sync_daemon()
         if svc.exists():
             svc.unlink()
-        print("  ✅  Stopped and removed sync daemon")
+        print("  ✅  Stopped and removed sync daemon" + (f" + {_stray} stray process(es)" if _stray else ""))
 
     # 2. Pip uninstall (BEFORE removing venv, since sys.executable may live there)
     print("  ⏳  Uninstalling pip package...")
@@ -1428,11 +1562,38 @@ def _instant_register(BOLD, GREEN, DIM):
     req = urllib.request.Request(
         url, data=body, headers={"Content-Type": "application/json"}, method="POST"
     )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            result = _json.loads(resp.read())
-    except Exception as e:
-        print(f"  {DIM(f'Could not reach cloud: {e}')}")
+    # Cloud Run scales `ingest.clawmetry.com` to zero between traffic bursts.
+    # A cold start (container boot + DB pool warm-up) can exceed 15s on the
+    # first hit, which used to drop fresh installs into "local mode" silently.
+    # Match the cold-start-retry pattern we use for the daemon heartbeat
+    # (OSS PR #135): 3 attempts, longer per-attempt timeout, exponential
+    # backoff on timeout / 5xx / connection reset.
+    import time as _t_reg
+    _attempts = 3
+    _per_attempt_timeout = 30
+    _last_err = None
+    for _i in range(_attempts):
+        try:
+            with urllib.request.urlopen(req, timeout=_per_attempt_timeout) as resp:
+                result = _json.loads(resp.read())
+                break
+        except urllib.error.HTTPError as e:
+            # Retry only on transient 5xx (502/503/504 = cold start / LB).
+            if e.code in (502, 503, 504) and _i < _attempts - 1:
+                _last_err = e
+                _t_reg.sleep(2 * (_i + 1))
+                continue
+            print(f"  {DIM(f'Could not reach cloud: {e}')}")
+            return None
+        except Exception as e:
+            _last_err = e
+            if _i < _attempts - 1:
+                _t_reg.sleep(2 * (_i + 1))
+                continue
+            print(f"  {DIM(f'Could not reach cloud: {e}')}")
+            return None
+    else:
+        print(f"  {DIM(f'Could not reach cloud after {_attempts} attempts: {_last_err}')}")
         return None
 
     if not result.get("ok"):
@@ -1675,18 +1836,10 @@ def _cmd_account(args) -> None:
     INGEST_URL = _os.environ.get("CLAWMETRY_INGEST_URL", "https://ingest.clawmetry.com")
 
     def _api_call(path, body):
-        url = INGEST_URL.rstrip("/") + path
-        data = _json.dumps(body).encode()
-        req = urllib.request.Request(
-            url, data=data, headers={"Content-Type": "application/json"}, method="POST"
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return _json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            return {"error": e.read().decode()[:200]}
-        except Exception as e:
-            return {"error": str(e)}
+        result, status = _post_json(INGEST_URL.rstrip("/") + path, body)
+        if isinstance(result, dict) and status and status >= 400:
+            result["_status"] = status
+        return result
 
     # Show account info
     print()
@@ -1721,6 +1874,21 @@ def _cmd_account(args) -> None:
     # Send OTP
     print(f"\n  Sending verification code to {email_input}...", end="", flush=True)
     r = _api_call("/api/auth/email-otp", {"action": "send", "email": email_input})
+    if r.get("_status") == 503:
+        import time as _time
+
+        retry_after = r.get("retry_after") or 5
+        try:
+            retry_after = max(1, min(int(retry_after), 30))
+        except (TypeError, ValueError):
+            retry_after = 5
+        print(f"\n  {DIM(f'Server busy — retrying in {retry_after}s…')}", flush=True)
+        _time.sleep(retry_after)
+        print(f"  Sending verification code to {email_input}...", end="", flush=True)
+        r = _api_call("/api/auth/email-otp", {"action": "send", "email": email_input})
+        if r.get("_status") == 503:
+            print(f" {DIM('could not reach servers — try again in a minute')}")
+            return
     if r.get("error"):
         print(f" {DIM(r['error'])}")
         return
@@ -2043,6 +2211,21 @@ def main() -> None:
     import argparse
     from dashboard import main as dashboard_main
 
+    # Anonymous, opt-out, once-per-install ping. See clawmetry/telemetry.py
+    # for the privacy contract. Fires on a daemon thread so a network
+    # failure can't slow CLI startup; honours CLAWMETRY_NO_TELEMETRY=1
+    # and ~/.clawmetry/notelemetry.
+    try:
+        from clawmetry import telemetry as _telemetry
+        try:
+            from dashboard import __version__ as _ver
+        except Exception:
+            _ver = "unknown"
+        _telemetry.maybe_ping(_ver)
+    except Exception:
+        # Never let telemetry plumbing break startup.
+        pass
+
     # Windows: protect against closed/detached stdout/stderr before any library
     # (argparse colour detection, click._winconsole) calls fileno() on them.
     #
@@ -2117,6 +2300,12 @@ def main() -> None:
         help="Connect but do not start daemon (daemon managed externally, e.g. supervisord)",
     )
     p_connect.add_argument(
+        "--start-sync-now",
+        action="store_true",
+        dest="start_sync_now",
+        help="Start the sync daemon immediately after connect (default: defer until `clawmetry sync`)",
+    )
+    p_connect.add_argument(
         "--foreground", action="store_true", help="Run daemon in foreground"
     )
     p_connect.add_argument(
@@ -2152,6 +2341,14 @@ def main() -> None:
 
     # disconnect
     sub.add_parser("disconnect", help="Stop cloud sync and remove key")
+
+    # sync — start the deferred sync daemon (for nodes connected with default deferred-sync behavior)
+    p_sync = sub.add_parser(
+        "sync", help="Start the sync daemon (after `clawmetry connect`)"
+    )
+    p_sync.add_argument(
+        "--foreground", action="store_true", help="Run daemon in foreground"
+    )
 
     # status
     p_status = sub.add_parser("status", help="Show local + cloud sync status")
@@ -2223,6 +2420,7 @@ def main() -> None:
         "account",
         "connect",
         "disconnect",
+        "sync",
         "status",
         "proxy",
         "update",
@@ -2243,6 +2441,8 @@ def main() -> None:
             _cmd_connect(args)
         elif args.cmd == "disconnect":
             _cmd_disconnect(args)
+        elif args.cmd == "sync":
+            _cmd_sync(args)
         elif args.cmd == "status":
             _cmd_status(args)
         elif args.cmd == "proxy":

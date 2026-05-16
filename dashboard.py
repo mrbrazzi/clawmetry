@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 ClawMetry - See your agent think 🦞
 
@@ -110,7 +109,13 @@ from routes.skills import bp_skills
 from routes.heartbeat import bp_heartbeat
 from routes.autonomy import bp_autonomy
 from routes.selfconfig import bp_selfconfig
+from routes.agents import bp_agents
 from routes.reasoning import bp_reasoning
+from routes.plugins import bp_plugins
+from routes.local_query import bp_local_query
+from routes.update_check import bp_update_check, start_update_check_thread
+from routes.workspaces import bp_workspaces
+from routes.bootstrap import bp_bootstrap
 from helpers.openapi import bp_openapi
 
 # History / time-series module
@@ -138,7 +143,7 @@ except ImportError:
     metrics_service_pb2 = None
     trace_service_pb2 = None
 
-__version__ = "0.12.163"
+__version__ = "0.12.230"
 
 # Extensions (Phase 2) — load plugins at import time; safe no-op if package not installed
 try:
@@ -206,6 +211,9 @@ _security_posture_hash = ""
 _VELOCITY_TOKENS_PER_2MIN = 10000  # tokens in any 2-minute window
 _VELOCITY_CONSECUTIVE_TOOLS = 20  # consecutive tool calls without human turn
 _VELOCITY_COST_PER_MIN = 0.10  # USD/min cost rate
+# Error-spike alert thresholds (GH#954)
+_ERROR_SPIKE_THRESHOLD = int(os.environ.get("ERROR_SPIKE_THRESHOLD", "3"))
+_ERROR_SPIKE_WINDOW_SEC = int(os.environ.get("ERROR_SPIKE_WINDOW_SEC", "60"))
 
 # ── OTLP Metrics Store ─────────────────────────────────────────────────
 METRICS_FILE = None  # Set via CLI/env, defaults to {WORKSPACE}/.clawmetry-metrics.json
@@ -694,6 +702,249 @@ def _get_budget_status():
     }
 
 
+# ── Per-agent budgets (issue #951) ─────────────────────────────────────
+#
+# Per-agent overrides live in the DuckDB ``agent_budgets`` table (see
+# ``clawmetry/local_store.py``) so they survive process restarts and ride
+# the same heartbeat-piggyback relay as the rest of the local store.
+# ``_get_agent_budget`` returns ``None`` when no override is present —
+# callers fall back to the global ``daily_limit`` / ``monthly_limit``.
+#
+# Tiered alerts: the in-memory ``_budget_agent_tier_state`` dict tracks
+# {(agent_id, period): "warning" | "critical" | None} for the *current*
+# period bucket (today / this month). Once we fire a warning we don't fire
+# it again until the period resets; once we fire critical we never
+# re-fire warning for the same period. This is the dedup contract the
+# spec asks for: same threshold, same period, same agent → one alert.
+
+
+# (agent_id, period, period_key) -> tier last fired. period_key is the
+# date string for the current bucket so the slot auto-resets at midnight /
+# month-start without an explicit cron.
+_budget_agent_tier_state: dict[tuple, str] = {}
+
+
+def _get_agent_budget(agent_id):
+    """Read one per-agent budget override from the local store. Returns
+    ``None`` when the local store isn't available or the agent has no
+    override row — callers fall back to global limits."""
+    if not agent_id:
+        return None
+    try:
+        from clawmetry import local_store
+
+        store = local_store.get_store()
+        return store.get_agent_budget(agent_id)
+    except Exception:
+        return None
+
+
+def _list_agent_budgets():
+    """Return all per-agent overrides as a list. Returns [] on any error."""
+    try:
+        from clawmetry import local_store
+
+        store = local_store.get_store()
+        return store.query_agent_budgets(limit=500)
+    except Exception:
+        return []
+
+
+def _set_agent_budget(agent_id, daily_limit_usd=None, monthly_limit_usd=None):
+    """Write a per-agent override row. Returns True on success."""
+    if not agent_id:
+        return False
+    try:
+        from clawmetry import local_store
+
+        store = local_store.get_store()
+        store.set_agent_budget(
+            agent_id,
+            daily_limit_usd=daily_limit_usd,
+            monthly_limit_usd=monthly_limit_usd,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _delete_agent_budget(agent_id):
+    """Remove a per-agent override row. Returns 1 on delete, 0 when missing."""
+    if not agent_id:
+        return 0
+    try:
+        from clawmetry import local_store
+
+        store = local_store.get_store()
+        return store.delete_agent_budget(agent_id)
+    except Exception:
+        return 0
+
+
+def _agent_spend_for_period(agent_id, period_start):
+    """Sum cost-store USD entries for one agent since ``period_start``.
+
+    Cost entries written without an ``agent`` key default to ``"main"``,
+    matching how the rest of the dashboard names the primary agent."""
+    total = 0.0
+    with _metrics_lock:
+        for entry in metrics_store["cost"]:
+            ts = entry.get("timestamp", 0)
+            if ts < period_start:
+                continue
+            ent_agent = entry.get("agent", "main") or "main"
+            if ent_agent != agent_id:
+                continue
+            total += float(entry.get("usd", 0) or 0)
+    return total
+
+
+def _period_bounds():
+    """Return (today_start_ts, today_key, month_start_ts, month_key)."""
+    now_dt = datetime.now()
+    today_start = now_dt.replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).timestamp()
+    today_key = now_dt.strftime("%Y-%m-%d")
+    month_start = now_dt.replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    ).timestamp()
+    month_key = now_dt.strftime("%Y-%m")
+    return today_start, today_key, month_start, month_key
+
+
+def _get_agent_budget_status(agent_id):
+    """Return per-agent budget status dict for the API. Combines per-agent
+    override (when present) with global fallback and current MTD/daily
+    spend. Always returns a populated dict — never ``None``."""
+    config = _get_budget_config()
+    override = _get_agent_budget(agent_id) or {}
+    today_start, _, month_start, _ = _period_bounds()
+    daily_spent = _agent_spend_for_period(agent_id, today_start)
+    monthly_spent = _agent_spend_for_period(agent_id, month_start)
+
+    def _effective(override_val, global_key):
+        if override_val is not None and override_val > 0:
+            return float(override_val), "agent"
+        gv = config.get(global_key, 0) or 0
+        try:
+            gv = float(gv)
+        except (TypeError, ValueError):
+            gv = 0.0
+        return gv, ("global" if gv > 0 else "none")
+
+    daily_limit, daily_source = _effective(
+        override.get("daily_limit_usd"), "daily_limit"
+    )
+    monthly_limit, monthly_source = _effective(
+        override.get("monthly_limit_usd"), "monthly_limit"
+    )
+
+    def _pct(spent, limit):
+        return round((spent / limit * 100), 1) if limit > 0 else 0.0
+
+    def _status(pct):
+        if pct >= 100:
+            return "critical"
+        if pct >= 80:
+            return "warning"
+        if pct >= 50:
+            return "ok"
+        return "ok"
+
+    daily_pct = _pct(daily_spent, daily_limit)
+    monthly_pct = _pct(monthly_spent, monthly_limit)
+    overall_pct = max(daily_pct, monthly_pct)
+
+    return {
+        "agent_id": agent_id,
+        "daily_limit": daily_limit,
+        "daily_limit_usd": daily_limit,
+        "daily_limit_source": daily_source,
+        "daily_spent": round(daily_spent, 4),
+        "daily_pct": daily_pct,
+        "monthly_limit": monthly_limit,
+        "monthly_limit_usd": monthly_limit,
+        "monthly_limit_source": monthly_source,
+        "monthly_spent": round(monthly_spent, 4),
+        "mtd_spend": round(monthly_spent, 4),
+        "monthly_pct": monthly_pct,
+        "status": _status(overall_pct),
+        "has_override": bool(override),
+    }
+
+
+def _budget_check_for_agent(agent_id, *, auto_pause_enabled=None,
+                            warning_pct=80, pause_pct=100):
+    """Tiered-alert check for one agent. Honours dedup-per-period-per-tier.
+
+    Returns True when a critical (100%) breach fired AND auto-pause is
+    enabled — caller (``_budget_check``) treats that as a signal to pause
+    the gateway. Returns False otherwise."""
+    global _budget_agent_tier_state
+    override = _get_agent_budget(agent_id)
+    if not override:
+        return False
+    config = _get_budget_config()
+    if auto_pause_enabled is None:
+        auto_pause_enabled = config.get("auto_pause_enabled", False)
+    today_start, today_key, month_start, month_key = _period_bounds()
+    pause_triggered = False
+
+    for period, period_start, period_key, override_key, global_key in (
+        ("daily", today_start, today_key, "daily_limit_usd", "daily_limit"),
+        ("monthly", month_start, month_key, "monthly_limit_usd", "monthly_limit"),
+    ):
+        limit = override.get(override_key)
+        if limit is None or limit <= 0:
+            # Fall back to global limit for this period if not overridden.
+            try:
+                limit = float(config.get(global_key, 0) or 0)
+            except (TypeError, ValueError):
+                limit = 0.0
+            if limit <= 0:
+                continue
+        spent = _agent_spend_for_period(agent_id, period_start)
+        pct = (spent / limit * 100) if limit > 0 else 0
+        slot_key = (agent_id, period, period_key)
+        prior_tier = _budget_agent_tier_state.get(slot_key)
+
+        # Critical (>=100%) — supersedes warning. Dedup: once per period.
+        if pct >= pause_pct:
+            if prior_tier != "critical":
+                _budget_agent_tier_state[slot_key] = "critical"
+                _fire_alert(
+                    rule_id=f"budget_agent_{agent_id}_{period}_critical_{period_key}",
+                    alert_type="budget.critical",
+                    message=(
+                        f"BUDGET CRITICAL: agent '{agent_id}' {period} spend "
+                        f"${spent:.2f} of ${limit:.2f} (100%) limit"
+                    ),
+                    channels=["banner", "telegram"],
+                )
+                if auto_pause_enabled:
+                    pause_triggered = True
+            continue
+
+        # Warning (>=80% but <100%). Dedup: only fire when crossing from
+        # nothing → warning (don't fire if already at critical, can't
+        # happen here since we continued above, but defensive).
+        if pct >= warning_pct:
+            if prior_tier not in ("warning", "critical"):
+                _budget_agent_tier_state[slot_key] = "warning"
+                _fire_alert(
+                    rule_id=f"budget_agent_{agent_id}_{period}_warning_{period_key}",
+                    alert_type="budget.warning",
+                    message=(
+                        f"Budget warning: agent '{agent_id}' {period} spend "
+                        f"${spent:.2f} is {pct:.0f}% of ${limit:.2f} limit"
+                    ),
+                    channels=["banner", "telegram"],
+                )
+
+    return pause_triggered
+
+
 def _budget_check():
     """Check budget limits and fire alerts/auto-pause if needed."""
     global _budget_paused, _budget_paused_at, _budget_paused_reason
@@ -705,7 +956,44 @@ def _budget_check():
     warning_pct = config.get("warning_threshold_pct", 80)
     pause_pct = config.get("auto_pause_threshold_pct", 100)
 
-    # Check each period
+    # ── Per-agent budgets first (issue #951) ────────────────────────────
+    # We collect the unique set of agents that have either spent something
+    # in the cost store today/this-month OR have an override configured.
+    # Either source can trip a tier, so we union them.
+    agents_to_check = set()
+    try:
+        for ov in _list_agent_budgets():
+            aid = ov.get("agent_id")
+            if aid:
+                agents_to_check.add(aid)
+    except Exception:
+        pass
+    try:
+        with _metrics_lock:
+            for entry in metrics_store["cost"]:
+                agents_to_check.add(entry.get("agent", "main") or "main")
+    except Exception:
+        pass
+    for agent_id in agents_to_check:
+        try:
+            if _budget_check_for_agent(
+                agent_id,
+                auto_pause_enabled=config.get("auto_pause_enabled", False),
+                warning_pct=warning_pct,
+                pause_pct=pause_pct,
+            ):
+                _budget_paused = True
+                _budget_paused_at = time.time()
+                _budget_paused_reason = (
+                    f"Agent '{agent_id}' budget exceeded; gateway paused."
+                )
+                _pause_gateway()
+                return
+        except Exception:
+            # Never let one agent's check kill the whole sweep.
+            continue
+
+    # Check each period (global)
     for period in ["daily", "weekly", "monthly"]:
         limit = config.get(f"{period}_limit", 0)
         if limit <= 0:
@@ -769,7 +1057,7 @@ def _pause_gateway():
     if sys.platform != 'win32':
         try:
             result = subprocess.run(
-                ["pgrep", "-f", "openclaw-gatewa"],
+                ["pgrep", "-f", "openclaw-gateway"],
                 capture_output=True,
                 text=True,
                 timeout=3,
@@ -797,7 +1085,7 @@ def _resume_gateway():
     if sys.platform != "win32":
         try:
             result = subprocess.run(
-                ["pgrep", "-f", "openclaw-gatewa"],
+                ["pgrep", "-f", "openclaw-gateway"],
                 capture_output=True,
                 text=True,
                 timeout=3,
@@ -1542,10 +1830,204 @@ def _process_otlp_metrics(pb_data):
                         )
 
 
+_OTEL_SPAN_KIND_NAMES = {
+    0: "UNSPECIFIED",
+    1: "INTERNAL",
+    2: "SERVER",
+    3: "CLIENT",
+    4: "PRODUCER",
+    5: "CONSUMER",
+}
+
+_OTEL_STATUS_CODE_NAMES = {
+    0: "UNSET",
+    1: "OK",
+    2: "ERROR",
+}
+
+
+def _hex(b):
+    """OTel proto carries trace_id / span_id / parent_span_id as raw bytes.
+    DuckDB stores them as hex strings (matches the OTel spec's canonical
+    text form). ``b'' → ''`` so parent_span_id stays falsy for root spans."""
+    if not b:
+        return ""
+    try:
+        return b.hex() if isinstance(b, (bytes, bytearray)) else str(b)
+    except Exception:
+        return ""
+
+
+def _otel_to_row(span, resource_attrs):
+    """Translate one OTel proto Span (plus its resource attributes) to the
+    dict shape :func:`clawmetry.local_store.LocalStore.ingest_span` expects.
+
+    Issue #1007 / epic #1006. Maps common OTel attribute conventions onto
+    typed columns so the dashboard's usage / trace-tree views don't have
+    to JSON-extract on every read:
+
+      * ``gen_ai.request.model`` / ``llm.model`` / ``model`` → ``model``
+      * ``gen_ai.usage.input_tokens`` / ``llm.usage.prompt_tokens`` →
+        ``tokens_input``
+      * ``gen_ai.usage.output_tokens`` / ``llm.usage.completion_tokens`` →
+        ``tokens_output``
+      * ``gen_ai.usage.total_tokens`` → ``token_count``
+      * ``gen_ai.usage.cost_usd`` / ``llm.usage.cost`` → ``cost_usd``
+      * ``tool.name`` / ``code.function`` → ``tool_name``
+      * ``session.id`` / ``openclaw.session_id`` → ``session_id``
+      * ``agent.id`` / ``openclaw.agent_id`` (also from resource) → ``agent_id``
+      * ``agent.type`` (also from resource) → ``agent_type``
+      * Resource ``service.name`` → ``service_name``
+
+    Everything not projected lands in the ``attributes`` JSON blob so the
+    span-detail panel can render any custom attributes the SDK exporter
+    set. Span events / links are passed through as JSON arrays.
+    """
+    attrs = {}
+    for attr in span.attributes:
+        attrs[attr.key] = _otel_attr_value(attr.value)
+
+    # Time columns. OTel proto carries unix-nano; we store unix-seconds in
+    # ``start_ts`` / ``end_ts`` (DOUBLE) so chart libs can format them
+    # without converting twice.
+    start_ts = (span.start_time_unix_nano or 0) / 1e9
+    end_ts = (span.end_time_unix_nano or 0) / 1e9 or start_ts
+    duration_ns = max(0, (span.end_time_unix_nano or 0) - (span.start_time_unix_nano or 0))
+    duration_ms = duration_ns / 1_000_000.0
+
+    # Status + kind.
+    kind_id = getattr(span, "kind", 0) or 0
+    kind_name = _OTEL_SPAN_KIND_NAMES.get(kind_id, str(kind_id))
+    status_code_id = 0
+    status_message = ""
+    if span.HasField("status"):
+        status_code_id = span.status.code
+        status_message = span.status.message or ""
+    status_code_name = _OTEL_STATUS_CODE_NAMES.get(status_code_id, str(status_code_id))
+
+    # Attribute → typed-column projection. ``attrs`` first (per-span) so it
+    # wins over ``resource_attrs`` (resource-level fallback) — same
+    # precedence the OTel spec uses.
+    def _pick(*keys):
+        for k in keys:
+            v = attrs.get(k)
+            if v not in (None, ""):
+                return v
+            v = resource_attrs.get(k)
+            if v not in (None, ""):
+                return v
+        return None
+
+    def _pick_int(*keys):
+        v = _pick(*keys)
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _pick_float(*keys):
+        v = _pick(*keys)
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    model = _pick("gen_ai.request.model", "gen_ai.response.model", "llm.model", "model")
+    tokens_input = _pick_int("gen_ai.usage.input_tokens", "llm.usage.prompt_tokens", "input_tokens")
+    tokens_output = _pick_int("gen_ai.usage.output_tokens", "llm.usage.completion_tokens", "output_tokens")
+    token_count = _pick_int("gen_ai.usage.total_tokens", "llm.usage.total_tokens", "total_tokens")
+    if token_count is None and (tokens_input or tokens_output):
+        token_count = (tokens_input or 0) + (tokens_output or 0)
+    cost_usd = _pick_float("gen_ai.usage.cost_usd", "llm.usage.cost", "cost_usd")
+    tool_name = _pick("tool.name", "code.function")
+    session_id = _pick("session.id", "openclaw.session_id", "session_id")
+    agent_id = _pick("agent.id", "openclaw.agent_id", "agent_id") or "main"
+    agent_type = _pick("agent.type", "openclaw.agent_type", "agent_type") or "openclaw"
+    service_name = resource_attrs.get("service.name") or attrs.get("service.name")
+    node_id = _pick("node.id", "openclaw.node_id", "host.name")
+
+    # Span events: array of {time_unix_nano, name, attributes}.
+    events = []
+    for ev in span.events:
+        ev_attrs = {}
+        for a in ev.attributes:
+            ev_attrs[a.key] = _otel_attr_value(a.value)
+        events.append({
+            "time_unix_nano": ev.time_unix_nano,
+            "name": ev.name,
+            "attributes": ev_attrs,
+        })
+
+    # Span links: array of {trace_id, span_id, attributes}.
+    links = []
+    for ln in span.links:
+        ln_attrs = {}
+        for a in ln.attributes:
+            ln_attrs[a.key] = _otel_attr_value(a.value)
+        links.append({
+            "trace_id": _hex(ln.trace_id),
+            "span_id": _hex(ln.span_id),
+            "attributes": ln_attrs,
+        })
+
+    return {
+        "span_id": _hex(span.span_id),
+        "trace_id": _hex(span.trace_id),
+        "parent_span_id": _hex(span.parent_span_id) or None,
+        "agent_type": agent_type,
+        "agent_id": agent_id,
+        "node_id": node_id,
+        "session_id": session_id,
+        "service_name": service_name,
+        "name": span.name,
+        "kind": kind_name,
+        "status_code": status_code_name,
+        "status_message": status_message,
+        "status": status_code_name,
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "duration_ms": duration_ms,
+        "duration_ns": duration_ns,
+        "model": model,
+        "tool_name": tool_name,
+        "cost_usd": cost_usd,
+        "token_count": token_count,
+        "tokens_input": tokens_input,
+        "tokens_output": tokens_output,
+        "input": attrs.get("gen_ai.prompt") or attrs.get("llm.prompts") or attrs.get("input"),
+        "output": attrs.get("gen_ai.completion") or attrs.get("llm.completions") or attrs.get("output"),
+        "attributes": attrs,
+        "events": events,
+        "links": links,
+    }
+
+
 def _process_otlp_traces(pb_data):
-    """Decode OTLP traces protobuf and extract relevant span data."""
+    """Decode OTLP traces protobuf and extract relevant span data.
+
+    Two-path design (issue #1007): we still feed the in-memory metrics
+    cache (the live dashboard's hot path — sub-second tiles for tokens /
+    runs / messages) AND persist every span to DuckDB via
+    ``local_store.put_span`` so the trace tree / span detail views can
+    query historical traces. The DuckDB write is best-effort wrapped in
+    try/except — a write failure must NOT break the metrics cache path.
+    """
     req = trace_service_pb2.ExportTraceServiceRequest()
     req.ParseFromString(pb_data)
+
+    # Resolve the local store lazily so unit tests that monkeypatch the
+    # singleton in advance (or run without DuckDB) don't pay the import
+    # cost upfront.
+    _store = None
+    try:
+        from clawmetry import local_store as _ls
+        _store = _ls.get_store()
+    except Exception:
+        _store = None
 
     for resource_spans in req.resource_spans:
         resource_attrs = {}
@@ -1590,6 +2072,22 @@ def _process_otlp_traces(pb_data):
                             "duration_ms": duration_ms,
                         },
                     )
+
+                # DuckDB write-through. Failures here are logged but do not
+                # break the metrics cache path above (which is what the
+                # live tiles read from). Idempotent on span_id — OTLP
+                # retries land as INSERT OR REPLACE without duping.
+                if _store is not None:
+                    try:
+                        _store.put_span(_otel_to_row(span, resource_attrs))
+                    except Exception as e:
+                        try:
+                            import logging as _lg
+                            _lg.getLogger("clawmetry.dashboard").warning(
+                                "local_store.put_span failed: %s", e
+                            )
+                        except Exception:
+                            pass
 
 
 def _get_otel_usage_data():
@@ -2038,7 +2536,7 @@ def _detect_gateway_token():
         import subprocess as _sp
 
         result = _sp.run(
-            ["pgrep", "-f", "openclaw-gatewa"],
+            ["pgrep", "-f", "openclaw-gateway"],
             capture_output=True,
             text=True,
             timeout=3,
@@ -2070,10 +2568,19 @@ def _detect_gateway_token():
 
             with open(jp) as f:
                 cfg = _json.load(f)
+            # Primary path on current OpenClaw: cfg["gateway"]["auth"]["token"].
+            # Some installs / older schemas store the token at top-level
+            # cfg["auth"]["token"] (issue #1127). Try the nested gateway
+            # path first, then the top-level auth path so we cover both
+            # without breaking the common case.
             gw = cfg.get("gateway", {})
-            auth = gw.get("auth", {})
-            if isinstance(auth, dict) and "token" in auth:
-                return auth["token"]
+            if isinstance(gw, dict):
+                gw_auth = gw.get("auth", {})
+                if isinstance(gw_auth, dict) and gw_auth.get("token"):
+                    return gw_auth["token"]
+            top_auth = cfg.get("auth", {})
+            if isinstance(top_auth, dict) and top_auth.get("token"):
+                return top_auth["token"]
         except (FileNotFoundError, ValueError, KeyError, TypeError):
             pass
     return None
@@ -3290,9 +3797,16 @@ function clawmetryLogout(){
 <div class="nav">
   <h1><a href="https://clawmetry.com" style="display:flex;align-items:center;gap:7px;text-decoration:none;color:inherit"><img src="/static/img/logo.svg" width="22" height="22" style="border-radius:4px;vertical-align:middle;flex-shrink:0" alt="ClawMetry"><span><span style="color:#ffffff">Claw</span><span style="color:#E5443A">Metry</span></span></a></h1>
   <span id="version-badge" class="version-badge" title="ClawMetry version">v{{ version }}</span>
+  <div id="workspace-switcher" style="display:none;position:relative;margin-left:8px;">
+    <button id="workspace-switcher-btn" onclick="toggleWorkspaceSwitcher(event)" title="Switch OpenClaw workspace" style="background:transparent;color:inherit;border:1px solid rgba(255,255,255,0.15);border-radius:6px;padding:4px 10px;font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:6px;">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+      <span id="workspace-switcher-label">default</span>
+      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+    </button>
+    <div id="workspace-switcher-menu" style="display:none;position:absolute;top:calc(100% + 6px);left:0;min-width:240px;max-height:320px;overflow-y:auto;background:var(--bg-card,#1c2333);border:1px solid var(--border-color,rgba(255,255,255,0.1));border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,0.35);z-index:200;padding:4px;"></div>
+  </div>
   <div class="theme-toggle" onclick="var o=document.getElementById('gw-setup-overlay');o.dataset.mandatory='false';document.getElementById('gw-setup-close').style.display='';o.style.display='flex'" title="Gateway settings" style="cursor:pointer;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></div>
-  <!-- Budget & Alerts hidden until mature -->
-  <!-- <div class="theme-toggle" onclick="openBudgetModal()" title="Budget & Alerts" style="cursor:pointer;">&#128176;</div> -->
+  <div class="theme-toggle" id="alerts-bell-btn" onclick="switchTab('alerts')" title="Active alerts" style="cursor:pointer;position:relative;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg><span id="alerts-bell-badge" style="display:none;position:absolute;top:-4px;right:-4px;background:#ef4444;color:#fff;border-radius:10px;padding:0 4px;font-size:9px;font-weight:700;min-width:14px;line-height:14px;text-align:center;">0</span></div>
 
   <div class="theme-toggle" id="logout-btn" onclick="clawmetryLogout()" title="Logout" style="display:none;cursor:pointer;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg></div>
   <div class="zoom-controls">
@@ -3303,9 +3817,9 @@ function clawmetryLogout(){
   <div class="nav-tabs">
     <div class="nav-tab" onclick="switchTab('flow')">Flow</div>
     <div class="nav-tab" onclick="switchTab('brain')">Brain</div>
-    <div class="nav-tab active" onclick="switchTab('overview')">Overview</div>
+    <div class="nav-tab active" onclick="switchTab('overview')">Overview <span id="nav-stuck-badge" style="display:none;background:#ef4444;color:#fff;border-radius:10px;padding:1px 6px;font-size:10px;font-weight:700;margin-left:4px;">0</span></div>
     <div class="nav-tab" onclick="switchTab('approvals')" title="Cloud-mediated approval queue">Approvals <span id="nav-approvals-badge" style="display:none;background:#ef4444;color:#fff;border-radius:10px;padding:1px 6px;font-size:10px;font-weight:700;margin-left:4px;">0</span></div>
-    <div class="nav-tab" onclick="switchTab('alerts')" title="Get notified when something goes wrong">Alerts</div>
+    <div class="nav-tab" onclick="switchTab('alerts')" title="Get notified when something goes wrong">Alerts <span id="nav-alerts-badge" style="display:none;background:#ef4444;color:#fff;border-radius:10px;padding:1px 6px;font-size:10px;font-weight:700;margin-left:4px;">0</span></div>
     <div class="nav-tab" onclick="switchTab('notifications')" title="Slack / Email / PagerDuty / Telegram channels">Notifications</div>
     <div class="nav-tab" onclick="switchTab('context')" title="See what context the LLM receives each turn">Context</div>
     <div class="nav-tab" onclick="switchTab('usage')">Tokens</div>
@@ -3324,6 +3838,15 @@ function clawmetryLogout(){
   <span id="alert-banner-msg" style="flex:1;"></span>
   <button onclick="ackAllAlerts()" style="background:var(--text-error);color:#fff;border:none;border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer;font-weight:600;">Dismiss</button>
   <button id="alert-resume-btn" onclick="resumeGateway()" style="display:none;background:#16a34a;color:#fff;border:none;border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer;font-weight:600;">Resume Gateway</button>
+</div>
+
+<!-- Issue #556: Anthropic OAuth migration banner. Hidden until /api/overview
+     returns client_health.using_oauth=true. Dismiss is sticky via localStorage. -->
+<div id="oauth-banner" style="display:none;padding:10px 16px;background:#451a03;border-bottom:2px solid #f59e0b;color:#fbbf24;font-size:13px;font-weight:500;align-items:center;gap:10px;">
+  <span style="font-size:16px;">&#9888;&#65039;</span>
+  <span id="oauth-banner-msg" style="flex:1;">You appear to be using an Anthropic <b>OAuth token</b> (Claude.ai). OAuth tokens have lower rate limits and different pricing than API keys &mdash; switch to an API key from <code>console.anthropic.com</code> for higher limits and metered billing.</span>
+  <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener" style="background:#f59e0b;color:#1a1a2e;text-decoration:none;border:none;border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer;font-weight:600;">Why migrate?</a>
+  <button onclick="dismissOauthBanner()" style="background:transparent;color:#fbbf24;border:1px solid #f59e0b80;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;">Dismiss</button>
 </div>
 
 <!-- Upgrade Impact Banner -->
@@ -3345,6 +3868,7 @@ function clawmetryLogout(){
       <div class="modal-tab active" onclick="switchBudgetTab('limits',this)">Budget Limits</div>
       <div class="modal-tab" onclick="switchBudgetTab('alerts',this)">Alert Rules</div>
       <div class="modal-tab" onclick="switchBudgetTab('telegram',this)">Telegram</div>
+      <div class="modal-tab" onclick="switchBudgetTab('agents',this)">Per-Agent</div>
       <div class="modal-tab" onclick="switchBudgetTab('history',this)">History</div>
     </div>
     <!-- Budget Limits Tab -->
@@ -3459,6 +3983,25 @@ function clawmetryLogout(){
         <div id="tg-status" style="font-size:12px;color:var(--text-muted);"></div>
       </div>
     </div>
+    <!-- Per-Agent Tab (issue #951) -->
+    <div id="budget-tab-agents" style="display:none;">
+      <div style="font-size:12px;color:var(--text-muted);line-height:1.5;margin-bottom:12px;">
+        Override the global daily / monthly limits for a specific agent. Leave a field blank to fall back to the global limit. Tiered alerts fire at 80% (warning) and 100% (critical) of whichever limit applies.
+      </div>
+      <div style="padding:12px;background:var(--bg-secondary);border:1px solid var(--border-primary);border-radius:8px;margin-bottom:12px;">
+        <div style="font-size:13px;font-weight:700;color:var(--text-primary);margin-bottom:10px;">Add / Update Override</div>
+        <div style="display:grid;gap:8px;">
+          <input id="agent-budget-id" type="text" placeholder="Agent ID (e.g. main, my-subagent)" style="padding:8px;border:1px solid var(--border-primary);border-radius:6px;background:var(--bg-tertiary);color:var(--text-primary);">
+          <input id="agent-budget-daily" type="number" step="0.01" min="0" placeholder="Daily limit USD (blank = global)" style="padding:8px;border:1px solid var(--border-primary);border-radius:6px;background:var(--bg-tertiary);color:var(--text-primary);">
+          <input id="agent-budget-monthly" type="number" step="0.01" min="0" placeholder="Monthly limit USD (blank = global)" style="padding:8px;border:1px solid var(--border-primary);border-radius:6px;background:var(--bg-tertiary);color:var(--text-primary);">
+          <div style="display:flex;gap:8px;">
+            <button onclick="saveAgentBudget()" style="background:var(--bg-accent);color:#fff;border:none;border-radius:6px;padding:6px 14px;font-size:12px;cursor:pointer;">Save Override</button>
+            <span id="agent-budget-status" style="font-size:12px;color:var(--text-muted);display:flex;align-items:center;"></span>
+          </div>
+        </div>
+      </div>
+      <div id="agent-budget-list" style="font-size:13px;color:var(--text-secondary);">Loading...</div>
+    </div>
     <!-- History Tab -->
     <div id="budget-tab-history" style="display:none;">
       <div id="alert-history-list" style="font-size:13px;color:var(--text-secondary);max-height:400px;overflow-y:auto;">Loading...</div>
@@ -3521,6 +4064,15 @@ function clawmetryLogout(){
     <div id="velocity-flagged-list" style="margin-top:8px;display:flex;flex-wrap:wrap;gap:8px;"></div>
   </div>
 
+  <!-- Prompt-Error Banner (GH #601) -->
+  <div id="prompt-error-banner" style="display:none;margin-bottom:8px;border-radius:8px;padding:10px 16px;font-size:13px;font-weight:600;background:rgba(220,38,38,0.15);border:1px solid rgba(239,68,68,0.4);color:#fca5a5;">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+      <span id="prompt-error-msg"></span>
+      <button onclick="document.getElementById('prompt-error-banner').style.display='none'" style="background:none;border:none;color:inherit;opacity:0.7;cursor:pointer;font-size:18px;line-height:1;padding:0;">&times;</button>
+    </div>
+    <div id="prompt-error-list" style="margin-top:8px;display:flex;flex-direction:column;gap:4px;font-weight:400;font-size:12px;"></div>
+  </div>
+
   <!-- Stats Bar (top) -->
   <div class="stats-footer">
     <div class="stats-footer-item">
@@ -3557,6 +4109,7 @@ function clawmetryLogout(){
       <div>
         <div class="stats-footer-label">Sessions</div>
         <div class="stats-footer-value" id="hot-sessions-count">--</div>
+        <div id="hot-sessions-sub" style="font-size:10px;color:var(--text-muted);margin-top:2px;line-height:1.3;"></div>
       </div>
       <div id="hot-sessions-list" style="display:none;">Loading...</div>
     </div>
@@ -3607,6 +4160,8 @@ function clawmetryLogout(){
         <div id="sh-security" style="margin-bottom:14px;"></div></div>
         <div id="sh-reliability-wrap" style="display:none;"><div style="font-size:11px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-muted);font-weight:600;margin-bottom:6px;">📊 Agent Reliability</div>
         <div id="sh-reliability" style="margin-bottom:14px;"></div></div>
+        <div id="sh-mcp-wrap" style="display:none;"><div style="font-size:11px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-muted);font-weight:600;margin-bottom:6px;">🔌 MCP Tool Activity</div>
+        <div id="sh-mcp" style="margin-bottom:14px;"></div></div>
         <!-- 🔍 Diagnostics Panel (GH#28) -->
         <div id="sh-diagnostics-wrap">
           <div style="display:flex;align-items:center;justify-content:space-between;cursor:pointer;padding:4px 0;" onclick="var b=document.getElementById(\'sh-diagnostics-body\');b.style.display=b.style.display===\'none\'?\'block\':\'none\';this.querySelector(\'.diag-chevron\').textContent=b.style.display===\'none\'?\'▶\':\'▼\';">
@@ -3770,6 +4325,11 @@ function clawmetryLogout(){
   <div class="section-title" id="cost-comparison-section" style="display:flex;align-items:center;">💱 Cost Comparison <span style="font-size:11px;font-weight:400;color:var(--text-muted);margin-left:8px;">what same workload costs elsewhere · 30 days</span></div>
   <div class="card" id="cost-comparison-card" style="display:none;">
     <div id="cost-comparison-content" style="min-height:60px;color:var(--text-muted);">Loading...</div>
+  </div>
+  <!-- Prompt Cache Analytics (GH #979) -->
+  <div class="section-title" id="cache-perf-title" style="display:none;">⚡ Prompt Cache <span style="font-size:11px;font-weight:400;color:var(--text-muted);margin-left:8px;">hit rate · savings · per model · 14 days</span></div>
+  <div class="card" id="cache-perf-card" style="display:none;">
+    <div id="cache-perf-content" style="min-height:48px;color:var(--text-muted);"></div>
   </div>
     <div class="section-title">🔮 Trace Clusters <span style="font-size:11px;font-weight:400;color:var(--text-muted);margin-left:8px;">auto-group sessions by behavior pattern</span></div>
   <div class="card">
@@ -3984,6 +4544,13 @@ function clawmetryLogout(){
 
 <!-- FLOW -->
 <div class="page" id="page-flow">
+  <!-- Flow sub-tabs: Live | Runs (#611) -->
+  <div id="flow-subtabs" style="display:flex;gap:4px;border-bottom:1px solid var(--border-primary);margin:0 0 12px 0;padding:0;font-size:12px;">
+    <div class="flow-subtab active" data-sub="live" onclick="switchFlowSubtab('live')" style="padding:8px 16px;cursor:pointer;border-bottom:2px solid var(--accent-primary,#3b82f6);font-weight:600;color:var(--text-primary);">Live</div>
+    <div class="flow-subtab" data-sub="runs" onclick="switchFlowSubtab('runs')" style="padding:8px 16px;cursor:pointer;border-bottom:2px solid transparent;font-weight:600;color:var(--text-muted);">Runs</div>
+  </div>
+
+  <div id="flow-live-pane">
   <div class="flow-stats">
     <div class="flow-stat"><span class="flow-stat-label">Messages / min</span><span class="flow-stat-value" id="flow-msg-rate">0</span></div>
     <div class="flow-stat"><span class="flow-stat-label">Actions Taken</span><span class="flow-stat-value" id="flow-event-count">0</span></div>
@@ -4249,14 +4816,99 @@ function clawmetryLogout(){
       <div style="color:#555;">Waiting for activity...</div>
     </div>
   </div>
+  </div><!-- end flow-live-pane -->
+
+  <!-- FLOW RUNS PANE (#611) — historical runs aggregated from DuckDB events -->
+  <div id="flow-runs-pane" style="display:none;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
+      <div style="font-size:14px;font-weight:700;color:var(--text-primary);">&#128202; Flow Runs <span id="flow-runs-count" style="font-size:11px;color:var(--text-muted);font-weight:400;margin-left:6px;"></span></div>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <label style="font-size:11px;color:var(--text-muted);">Limit:</label>
+        <select id="flow-runs-limit" onchange="loadFlowRuns()" style="font-size:11px;padding:3px 8px;background:var(--bg-primary,#0a0a1a);border:1px solid var(--border-secondary,#2a2a4a);border-radius:6px;color:var(--text-primary);">
+          <option value="10">10</option>
+          <option value="30" selected>30</option>
+          <option value="100">100</option>
+        </select>
+        <button onclick="loadFlowRuns()" style="font-size:11px;padding:3px 10px;border:1px solid var(--border-secondary,#2a2a4a);border-radius:6px;background:var(--bg-primary,#0a0a1a);color:var(--text-primary);cursor:pointer;">&#8635; Refresh</button>
+      </div>
+    </div>
+    <div style="background:var(--bg-secondary,#111128);border:1px solid var(--border-secondary,#2a2a4a);border-radius:10px;overflow:hidden;">
+      <table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <thead>
+          <tr style="background:var(--bg-tertiary,#0d0d1f);color:var(--text-muted);text-align:left;">
+            <th style="padding:10px 14px;font-weight:600;">Session</th>
+            <th style="padding:10px 14px;font-weight:600;">Started</th>
+            <th style="padding:10px 14px;font-weight:600;text-align:right;">Duration</th>
+            <th style="padding:10px 14px;font-weight:600;">Channel</th>
+            <th style="padding:10px 14px;font-weight:600;text-align:right;">Models</th>
+            <th style="padding:10px 14px;font-weight:600;text-align:right;">Tools</th>
+            <th style="padding:10px 14px;font-weight:600;text-align:right;">Cost</th>
+            <th style="padding:10px 14px;font-weight:600;">Status</th>
+          </tr>
+        </thead>
+        <tbody id="flow-runs-tbody">
+          <tr><td colspan="8" style="padding:24px;text-align:center;color:var(--text-muted);font-size:12px;">Loading flow runs&hellip;</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div id="flow-runs-detail" style="margin-top:16px;display:none;background:var(--bg-secondary,#111128);border:1px solid var(--border-secondary,#2a2a4a);border-radius:10px;padding:14px 18px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <div id="flow-runs-detail-title" style="font-size:13px;font-weight:700;color:var(--text-primary);"></div>
+        <button onclick="hideFlowRunDetail()" style="background:transparent;border:none;color:var(--text-muted);font-size:18px;cursor:pointer;">&times;</button>
+      </div>
+      <div id="flow-runs-detail-body" style="font-size:12px;color:var(--text-muted);line-height:1.7;"></div>
+    </div>
+  </div><!-- end flow-runs-pane -->
 </div><!-- end page-flow -->
 
 <!-- BRAIN -->
 <div class="page" id="page-brain">
   <div style="padding:12px 0 8px 0;">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
-      <span style="font-size:14px;font-weight:700;color:var(--text-primary);">🧠 Brain -- Unified Activity Stream</span>
-      <button class="refresh-btn" onclick="loadBrainPage()">↻ Refresh</button>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <span style="font-size:14px;font-weight:700;color:var(--text-primary);">🧠 Brain -- Unified Activity Stream</span>
+        <!-- Loop-signals badge (#1364): hidden until /api/loop-signals returns >0 rows. -->
+        <button id="brain-loops-badge" type="button" onclick="toggleLoopSignalsList()" style="display:none;background:rgba(239,68,68,0.15);color:#ef4444;border:1px solid rgba(239,68,68,0.4);border-radius:10px;padding:2px 9px;font-size:11px;font-weight:700;cursor:pointer;font-family:inherit;" title="LoopDetector signals from clawmetry/proxy.py">
+          <span id="brain-loops-badge-count">0</span> loops
+        </button>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center;">
+        <!-- MOAT #1364: surface OTel spans we already persist. Toggles the
+             #spans-panel below; defers fetch until first click so the
+             default Brain-tab paint stays unchanged for users with no
+             OTLP exporter wired up. -->
+        <button id="spans-toggle-btn" class="refresh-btn" onclick="toggleSpansPanel()" title="OpenTelemetry spans from local DuckDB">📐 Spans</button>
+        <button class="refresh-btn" onclick="loadBrainPage()">↻ Refresh</button>
+      </div>
+    </div>
+    <!-- Spans panel — hidden until the user clicks the toggle. Flat table
+         (Time | Name | Duration | Session | Kind), sorted newest-first
+         by the API. No charts, no tree — that's a follow-up surface. -->
+    <div id="spans-panel" style="display:none;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:12px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <span style="font-size:11px;color:var(--text-muted);">OTel spans (newest first) — <span id="spans-count">0</span></span>
+        <button class="refresh-btn" onclick="loadSpansPanel()" style="font-size:10px;padding:2px 8px;">↻</button>
+      </div>
+      <div id="spans-table-wrap" style="max-height:400px;overflow-y:auto;">
+        <div style="color:var(--text-muted);padding:20px;font-size:12px;">Loading spans...</div>
+      </div>
+    </div>
+    <!-- Loop signals list — collapsed until the badge is clicked. -->
+    <div id="brain-loops-panel" style="display:none;background:var(--bg-secondary);border:1px solid rgba(239,68,68,0.4);border-radius:8px;padding:10px 14px;margin-bottom:12px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <span style="font-size:11px;font-weight:600;color:#ef4444;text-transform:uppercase;letter-spacing:1px;">Loops detected (proxy)</span>
+        <span style="font-size:10px;color:var(--text-muted);">From clawmetry proxy LoopDetector — last 60 min</span>
+      </div>
+      <div id="brain-loops-table" style="font-size:11px;font-family:'JetBrains Mono','SF Mono',monospace;color:var(--text-secondary);"></div>
+    </div>
+    <!-- Context Window Anatomy (#566) -->
+    <div id="ctx-anatomy-wrap" style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:12px;display:none;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+        <span style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:1px;">Context window anatomy</span>
+        <span id="ctx-pct-label" style="font-size:11px;color:var(--text-muted);">--</span>
+      </div>
+      <div id="ctx-bar" style="display:flex;height:10px;border-radius:4px;overflow:hidden;background:var(--bg-primary);width:100%;margin-bottom:6px;"></div>
+      <div id="ctx-legend" style="display:flex;flex-wrap:wrap;gap:6px;"></div>
     </div>
     <!-- Activity density chart -->
     <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:12px;">
@@ -4662,13 +5314,98 @@ function openBudgetModal() {
 function switchBudgetTab(tab, el) {
   document.querySelectorAll('#budget-modal-tabs .modal-tab').forEach(function(t){t.classList.remove('active');});
   if(el) el.classList.add('active');
-  ['limits','alerts','telegram','history'].forEach(function(t){
+  ['limits','alerts','telegram','agents','history'].forEach(function(t){
     var d = document.getElementById('budget-tab-'+t);
     if(d) d.style.display = t===tab ? 'block' : 'none';
   });
   if(tab==='alerts') { loadAlertRules(); loadWebhookConfig(); }
   if(tab==='telegram') loadTelegramConfig();
+  if(tab==='agents') loadAgentBudgets();
   if(tab==='history') loadAlertHistory();
+}
+
+// Per-agent budgets (issue #951)
+async function loadAgentBudgets() {
+  try {
+    var data = await fetch('/api/budget').then(function(r){return r.json();});
+    var agents = (data && data.agents) || {};
+    var ids = Object.keys(agents);
+    if (ids.length === 0) {
+      document.getElementById('agent-budget-list').innerHTML =
+        '<div style="padding:20px;text-align:center;color:var(--text-muted);">No per-agent overrides yet.</div>';
+      return;
+    }
+    var html = '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
+    html += '<tr style="border-bottom:1px solid var(--border-primary);">'
+         + '<th style="text-align:left;padding:6px;">Agent</th>'
+         + '<th style="text-align:right;padding:6px;">Daily</th>'
+         + '<th style="text-align:right;padding:6px;">Monthly</th>'
+         + '<th style="text-align:right;padding:6px;">Spend (MTD)</th>'
+         + '<th style="text-align:right;padding:6px;">Usage</th>'
+         + '<th style="padding:6px;"></th></tr>';
+    // Fetch live status for each agent (sequential is fine — tiny N).
+    var rows = await Promise.all(ids.map(async function(aid){
+      try {
+        var s = await fetch('/api/agents/'+encodeURIComponent(aid)+'/budget').then(function(r){return r.json();});
+        return [aid, agents[aid], s];
+      } catch(e) { return [aid, agents[aid], null]; }
+    }));
+    rows.forEach(function(t){
+      var aid = t[0], ov = t[1], s = t[2] || {};
+      var pct = Math.max(s.daily_pct||0, s.monthly_pct||0);
+      var barColor = pct >= 80 ? '#dc2626' : (pct >= 50 ? '#f59e0b' : '#16a34a');
+      html += '<tr style="border-bottom:1px solid var(--border-secondary);">';
+      html += '<td style="padding:6px;font-weight:600;">' + escHtml(aid) + '</td>';
+      html += '<td style="padding:6px;text-align:right;">' + (ov.daily_limit_usd != null ? '$' + (+ov.daily_limit_usd).toFixed(2) : '<span style="color:var(--text-muted);">global</span>') + '</td>';
+      html += '<td style="padding:6px;text-align:right;">' + (ov.monthly_limit_usd != null ? '$' + (+ov.monthly_limit_usd).toFixed(2) : '<span style="color:var(--text-muted);">global</span>') + '</td>';
+      html += '<td style="padding:6px;text-align:right;">$' + (+(s.mtd_spend||0)).toFixed(2) + '</td>';
+      html += '<td style="padding:6px;text-align:right;"><div style="display:inline-block;width:80px;height:8px;background:var(--bg-tertiary);border-radius:4px;overflow:hidden;"><div style="width:'+Math.min(100,pct)+'%;height:100%;background:'+barColor+';"></div></div> <span style="font-size:11px;color:var(--text-muted);">'+Math.round(pct)+'%</span></td>';
+      html += '<td style="padding:6px;text-align:right;"><span data-agent-id="'+escHtml(aid)+'" style="cursor:pointer;color:var(--text-error);font-size:14px;" onclick="deleteAgentBudget(this.dataset.agentId)" title="Remove override">&#x1f5d1;</span></td>';
+      html += '</tr>';
+    });
+    html += '</table>';
+    document.getElementById('agent-budget-list').innerHTML = html;
+  } catch(e) {
+    document.getElementById('agent-budget-list').textContent = 'Failed to load';
+  }
+}
+
+async function saveAgentBudget() {
+  var aid = (document.getElementById('agent-budget-id').value || '').trim();
+  if (!aid) {
+    document.getElementById('agent-budget-status').textContent = 'Agent ID required';
+    return;
+  }
+  var d = document.getElementById('agent-budget-daily').value;
+  var m = document.getElementById('agent-budget-monthly').value;
+  var body = {};
+  if (d !== '' && d !== null) body.daily_limit_usd = parseFloat(d);
+  if (m !== '' && m !== null) body.monthly_limit_usd = parseFloat(m);
+  try {
+    var r = await fetch('/api/agents/'+encodeURIComponent(aid)+'/budget', {
+      method:'PUT',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
+    var j = await r.json();
+    if (j && j.ok) {
+      document.getElementById('agent-budget-status').textContent = 'Saved';
+      document.getElementById('agent-budget-id').value = '';
+      document.getElementById('agent-budget-daily').value = '';
+      document.getElementById('agent-budget-monthly').value = '';
+      loadAgentBudgets();
+    } else {
+      document.getElementById('agent-budget-status').textContent = (j && j.error) || 'Save failed';
+    }
+  } catch(e) {
+    document.getElementById('agent-budget-status').textContent = 'Save failed';
+  }
+}
+
+async function deleteAgentBudget(aid) {
+  if (!aid) return;
+  await fetch('/api/agents/'+encodeURIComponent(aid)+'/budget', {method:'DELETE'});
+  loadAgentBudgets();
 }
 
 async function loadBudgetConfig() {
@@ -4944,6 +5681,39 @@ async function testTelegram() {
   }
 }
 
+// === Update Check Functions ===
+async function checkUpdateStatus() {
+  try {
+    var data = await fetch('/api/update-check/status').then(function(r){return r.json();});
+    var banner = document.getElementById('update-banner');
+    var msg = document.getElementById('update-banner-msg');
+    if (data.show_banner && banner && msg) {
+      var latest = data.latest_check && data.latest_check.latest || 'newer';
+      msg.innerHTML = 'Update available: v' + escHtml(latest) + ' is now available. You are running v' + escHtml(data.latest_check.current) + '.';
+      banner.style.display = 'flex';
+    }
+  } catch(e) {}
+}
+
+async function dismissUpdateBanner() {
+  try {
+    var data = await fetch('/api/update-check/status').then(function(r){return r.json();});
+    if (data.latest_check && data.latest_check.latest) {
+      await fetch('/api/update-check/dismiss', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({version: data.latest_check.latest})
+      });
+    }
+    var banner = document.getElementById('update-banner');
+    if (banner) banner.style.display = 'none';
+  } catch(e) {}
+}
+
+// Check for updates periodically
+setInterval(checkUpdateStatus, 3600000); // Check every hour
+setTimeout(checkUpdateStatus, 5000); // Check 5s after load
+
 function switchTab(name) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
@@ -4966,7 +5736,7 @@ function switchTab(name) {
   if (name === 'limits') loadRateLimits();
   if (name === 'flow') initFlow();
   if (name === 'history') loadHistory();
-  if (name === 'brain') loadBrainPage();
+  if (name === 'brain') { if (typeof loadBrainPage === 'function') loadBrainPage(); loadContextAnatomy(); }
   if (name === 'security') { loadSecurityPage(); loadSecurityPosture(); }
   if (name === 'actions') loadQAHistory();
   if (name === 'logs') { if (!logStream || logStream.readyState === EventSource.CLOSED) startLogStream(); loadLogs(); }
@@ -4986,6 +5756,13 @@ async function loadSkills() {
   var summaryEl = document.getElementById('skills-summary-row');
   var listEl = document.getElementById('skills-list');
   if (!summaryEl || !listEl) return;
+  // /api/skills is cloud-disabled (410 Gone). Render an empty state instead
+  // of triggering a console-error-generating fetch on the cloud iframe.
+  if (window.CLOUD_MODE) {
+    listEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;">Skills inspector is local-only. Open the dashboard on the host running OpenClaw to view installed skills.</div>';
+    summaryEl.innerHTML = '';
+    return;
+  }
   listEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;">Loading...</div>';
   try {
     var data = await fetch('/api/skills').then(function(r){return r.json();});
@@ -5424,6 +6201,34 @@ async function loadTokenVelocity() {
   }
 }
 
+async function loadPromptErrors() {
+  try {
+    var d = await fetchJsonWithTimeout('/api/prompt-errors', 5000);
+    var banner = document.getElementById('prompt-error-banner');
+    var msgEl  = document.getElementById('prompt-error-msg');
+    var listEl = document.getElementById('prompt-error-list');
+    if (!banner) return;
+    if (!d.errors || d.errors.length === 0) { banner.style.display = 'none'; return; }
+
+    msgEl.textContent = '⚠️ ' + d.count + ' prompt error' + (d.count === 1 ? '' : 's') + ' detected';
+
+    if (listEl) {
+      listEl.innerHTML = d.errors.slice(0, 5).map(function(e) {
+        var when = e.ts ? new Date(e.ts).toLocaleTimeString() : '';
+        var who = [e.provider, e.model].filter(Boolean).join('/') || 'unknown provider';
+        var msg = e.error ? String(e.error).slice(0, 120) : 'unknown error';
+        return '<div style="background:rgba(0,0,0,0.25);border-radius:5px;padding:4px 8px;">'
+          + (when ? '<span style="opacity:0.6;">' + when + '</span> ' : '')
+          + '<span style="opacity:0.8;">' + who + '</span>'
+          + ' — ' + msg
+          + '</div>';
+      }).join('');
+    }
+
+    banner.style.display = 'block';
+  } catch(e) { /* non-critical */ }
+}
+
 async function killSession(sessionId) {
   if (!confirm('Stop session ' + sessionId + '?')) return;
   try {
@@ -5567,12 +6372,14 @@ async function loadAll() {
     loadAutonomy().catch(function(e){console.warn('autonomy failed',e)});
     loadActivityStream().catch(function(e){console.warn('activity stream failed',e)});
     loadHealth().catch(function(e){console.warn('health failed',e)});
-    loadMCTasks().catch(function(e){console.warn('mctasks failed',e)});
+    // /api/mc-tasks removed in commit 62e1fe7 — see issue #1127.
     if (typeof loadReliabilityCard === 'function') loadReliabilityCard().catch(function(e){console.warn('reliability card failed',e)});
     if (typeof loadAnomalyPanel === 'function') loadAnomalyPanel().catch(function(e){console.warn('anomaly panel failed',e)});
     if (typeof loadTokenVelocity === 'function') loadTokenVelocity().catch(function(e){console.warn('velocity check failed',e)});
+    if (typeof loadPromptErrors === 'function') loadPromptErrors().catch(function(e){console.warn('prompt errors failed',e)});
     if (typeof loadDiagnostics === 'function') loadDiagnostics().catch(function(e){console.warn('diagnostics failed',e)});
     if (typeof loadHeartbeat === 'function') loadHeartbeat().catch(function(e){console.warn('heartbeat panel failed',e)});
+    if (typeof loadMcpStats === 'function') loadMcpStats().catch(function(e){console.warn('mcp stats failed',e)});
     document.getElementById('refresh-time').textContent = 'Updated ' + new Date().toLocaleTimeString();
 
     if (overview.infra) {
@@ -5630,6 +6437,46 @@ async function loadReliabilityCard() {
     el = document.getElementById('reliability-detail-lt');
     if (el) el.textContent = r.session_count + ' sessions / ' + r.window_days + 'd';
   } catch(e) { console.warn('reliability card load failed', e); }
+}
+
+async function loadMcpStats() {
+  try {
+    var d = await fetchJsonWithTimeout('/api/mcp-stats', 8000);
+    var wrap = document.getElementById('sh-mcp-wrap');
+    var el = document.getElementById('sh-mcp');
+    if (!wrap || !el) return;
+    if (!d.tools || d.tools.length === 0) {
+      wrap.style.display = 'block';
+      el.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">No MCP tool calls detected in recent sessions.</div>';
+      return;
+    }
+    var rows = d.tools.map(function(t) {
+      var errCell = t.errors > 0
+        ? '<span style="color:#e05;">' + t.errors + ' (' + t.error_rate_pct + '%)</span>'
+        : '<span style="color:var(--text-muted);">0</span>';
+      var latCell = t.avg_latency_ms != null
+        ? (t.avg_latency_ms >= 1000
+            ? (t.avg_latency_ms / 1000).toFixed(1) + 's'
+            : t.avg_latency_ms + 'ms')
+        : '<span style="color:var(--text-faint);">—</span>';
+      return '<tr style="border-top:1px solid var(--border-secondary);">'
+        + '<td style="padding:4px 6px 4px 0;font-size:12px;font-family:\'JetBrains Mono\',monospace;color:var(--text-primary);">' + t.name + '</td>'
+        + '<td style="padding:4px 6px;font-size:12px;color:var(--text-secondary);text-align:right;">' + t.calls + '</td>'
+        + '<td style="padding:4px 6px;font-size:12px;text-align:right;">' + errCell + '</td>'
+        + '<td style="padding:4px 0 4px 6px;font-size:12px;color:var(--text-secondary);text-align:right;">' + latCell + '</td>'
+        + '</tr>';
+    }).join('');
+    el.innerHTML = '<table style="width:100%;border-collapse:collapse;">'
+      + '<thead><tr>'
+      + '<th style="padding:0 6px 4px 0;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text-faint);text-align:left;font-weight:500;">Tool</th>'
+      + '<th style="padding:0 6px 4px;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text-faint);text-align:right;font-weight:500;">Calls</th>'
+      + '<th style="padding:0 6px 4px;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text-faint);text-align:right;font-weight:500;">Errors</th>'
+      + '<th style="padding:0 0 4px 6px;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text-faint);text-align:right;font-weight:500;">Avg Latency</th>'
+      + '</tr></thead>'
+      + '<tbody>' + rows + '</tbody>'
+      + '</table>';
+    wrap.style.display = 'block';
+  } catch(e) { console.warn('mcp stats failed', e); }
 }
 
 async function loadHeartbeat() {
@@ -5718,6 +6565,35 @@ async function loadHeartbeat() {
       sparkEl.innerHTML = '<span style="font-size:11px;color:var(--text-muted);">no beats yet</span>';
     }
   } catch(e) { console.warn('heartbeat panel load failed', e); }
+}
+
+async function loadContextAnatomy() {
+  try {
+    var d = await fetchJsonWithTimeout('/api/context-anatomy', 4000);
+    if (!d || !d.buckets || !d.buckets.length) return;
+    var wrap = document.getElementById('ctx-anatomy-wrap');
+    if (!wrap) return;
+    wrap.style.display = '';
+    var pct = document.getElementById('ctx-pct-label');
+    if (pct) pct.textContent = (d.pct_used || 0) + '% of ' + Math.round((d.context_limit || 200000) / 1000) + 'K window';
+    var total = d.total_estimated || 1;
+    var bar = document.getElementById('ctx-bar');
+    if (bar) {
+      bar.innerHTML = d.buckets.map(function(b) {
+        var w = Math.max(0.5, b.tokens / total * 100).toFixed(1);
+        return '<div title="' + b.label + ': ~' + b.tokens.toLocaleString() + ' tok" style="width:' + w + '%;background:' + b.color + ';"></div>';
+      }).join('');
+    }
+    var legend = document.getElementById('ctx-legend');
+    if (legend) {
+      legend.innerHTML = d.buckets.map(function(b) {
+        var tok = b.tokens > 999 ? Math.round(b.tokens / 1000) + 'K' : b.tokens;
+        return '<span style="display:inline-flex;align-items:center;gap:3px;font-size:10px;color:var(--text-secondary);">' +
+          '<span style="width:8px;height:8px;border-radius:2px;flex-shrink:0;background:' + b.color + ';"></span>' +
+          b.label + ' ~' + tok + '</span>';
+      }).join('');
+    }
+  } catch(e) { /* silent — panel stays hidden when data unavailable */ }
 }
 
 async function loadMiniWidgets(overview, usage) {
@@ -5813,6 +6689,15 @@ async function loadMiniWidgets(overview, usage) {
     var sl = sd.sessions || sd || [];
     if (!Array.isArray(sl)) sl = [];
     document.getElementById('hot-sessions-count').textContent = sl.length;
+    // Build session-type breakdown subtitle (heartbeat / user / sub-agent)
+    var typeCounts = {};
+    sl.forEach(function(s) { var t = s.session_type || 'main'; typeCounts[t] = (typeCounts[t] || 0) + 1; });
+    var parts = [];
+    ['heartbeat', 'user', 'sub-agent'].forEach(function(t) {
+      if (typeCounts[t]) parts.push(typeCounts[t] + ' ' + t);
+    });
+    var sub = document.getElementById('hot-sessions-sub');
+    if (sub) sub.textContent = parts.length ? parts.join(' · ') : '';
   }).catch(function() {
     document.getElementById('hot-sessions-count').textContent = overview.sessionCount || 0;
   });
@@ -6580,6 +7465,13 @@ FLEET_API_KEY = os.environ.get("CLAWMETRY_FLEET_KEY", "")
 FLEET_DB_PATH = None  # Set via CLI or auto-detected
 FLEET_NODE_TIMEOUT = 300  # seconds before node is considered offline
 
+# ── Stuck-Session Detection ────────────────────────────────────────────
+STUCK_SESSION_TIMEOUT_SEC = 300   # 5 min silent → warning alert
+STUCK_SESSION_CRITICAL_SEC = 900  # 15 min silent → critical alert
+_STUCK_SESSION_MAX_WINDOW_SEC = 7200  # beyond 2 h, assume completed — stop alerting
+_STUCK_SESSION_COOLDOWN_SEC = 1800  # per-session alert cooldown (30 min)
+_stuck_session_cooldowns: dict = {}  # session_id → last alert timestamp
+
 # ── Budget & Alert Configuration ───────────────────────────────────────
 _budget_paused = False
 _budget_paused_at = 0
@@ -7008,6 +7900,67 @@ def _fleet_maintenance_loop():
 def _start_fleet_maintenance_thread():
     """Start the background fleet maintenance thread."""
     t = threading.Thread(target=_fleet_maintenance_loop, daemon=True)
+    t.start()
+
+
+# ── Stuck-Session Health Loop ──────────────────────────────────────────
+
+
+def _check_stuck_sessions() -> None:
+    """Fire a stuck_session alert for any session silent longer than STUCK_SESSION_TIMEOUT_SEC.
+
+    Uses the session's updatedAt (ms) as the last-activity proxy.  For the
+    gateway-RPC path, sessions.list only contains live sessions, making this
+    reliable.  For the file-based fallback, file mtime serves as the proxy;
+    we cap the upper window at 2 h to avoid alerting on sessions that simply
+    finished without a terminal event.
+    """
+    global _stuck_session_cooldowns
+    now = time.time()
+    try:
+        sessions = _get_sessions()
+    except Exception:
+        return
+    for s in sessions:
+        sid = s.get("sessionId", "")
+        if not sid:
+            continue
+        updated_ms = s.get("updatedAt") or 0
+        if not updated_ms:
+            continue
+        age_sec = now - (updated_ms / 1000.0)
+        if age_sec < STUCK_SESSION_TIMEOUT_SEC:
+            continue  # still active
+        if age_sec > _STUCK_SESSION_MAX_WINDOW_SEC:
+            continue  # too old — likely completed, not stuck
+        last_alerted = _stuck_session_cooldowns.get(sid, 0)
+        if now - last_alerted < _STUCK_SESSION_COOLDOWN_SEC:
+            continue
+        _stuck_session_cooldowns[sid] = now
+        severity = "critical" if age_sec >= STUCK_SESSION_CRITICAL_SEC else "warning"
+        minutes = int(age_sec / 60)
+        label = s.get("displayName") or sid[:16]
+        agent = s.get("agent", "main")
+        msg = (
+            f'Session "{label}" appears stuck — no activity for {minutes} min'
+            f" (agent: {agent})"
+        )
+        _fire_alert(f"stuck_session_{sid[:32]}", "stuck_session", msg, severity=severity)
+
+
+def _session_health_loop() -> None:
+    """Background thread: check for stuck sessions every 30 s."""
+    while True:
+        time.sleep(30)
+        try:
+            _check_stuck_sessions()
+        except Exception as e:
+            print(f"Warning: stuck-session check error: {e}")
+
+
+def _start_session_health_thread() -> None:
+    """Start the background stuck-session detection thread."""
+    t = threading.Thread(target=_session_health_loop, daemon=True)
     t.start()
 
 
@@ -7476,6 +8429,97 @@ def _get_active_alerts():
         return []
 
 
+def _detect_error_spikes():
+    """Scan recent session JSONL files for per-agent error spikes (GH#954).
+
+    Fires one grouped alert when a session emits >= ERROR_SPIKE_THRESHOLD
+    error events within the last ERROR_SPIKE_WINDOW_SEC seconds, instead of
+    N separate alerts.  Dedup is handled by _fire_alert's per-rule_id cooldown.
+    """
+    from collections import Counter as _Counter
+
+    now = time.time()
+    window_start = now - _ERROR_SPIKE_WINDOW_SEC
+    sessions_dir = _get_sessions_dir()
+    if not os.path.isdir(sessions_dir):
+        return
+
+    for fname in os.listdir(sessions_dir):
+        if not fname.endswith(".jsonl"):
+            continue
+        if ".deleted." in fname or ".trajectory." in fname or ".checkpoint." in fname:
+            continue
+        fpath = os.path.join(sessions_dir, fname)
+        try:
+            if os.path.getmtime(fpath) < window_start - 5:
+                continue
+        except OSError:
+            continue
+
+        sid = fname[: -len(".jsonl")]
+        error_events = []
+        try:
+            with open(fpath, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if obj.get("type") != "error":
+                        continue
+                    raw_ts = (
+                        obj.get("timestamp")
+                        or obj.get("time")
+                        or obj.get("created_at")
+                    )
+                    dt = _parse_event_timestamp(raw_ts, None)
+                    if dt is None:
+                        continue
+                    try:
+                        ts = dt.timestamp()
+                    except Exception:
+                        continue
+                    if ts < window_start:
+                        continue
+                    error_events.append(obj)
+        except OSError:
+            continue
+
+        if len(error_events) < _ERROR_SPIKE_THRESHOLD:
+            continue
+
+        msgs = []
+        for ev in error_events:
+            raw = ev.get("error") or ev.get("message") or ev.get("content") or ""
+            if isinstance(raw, dict):
+                raw = raw.get("content") or raw.get("text") or str(raw)
+            msgs.append(str(raw)[:80])
+        dominant = _Counter(msgs).most_common(1)[0][0] if msgs else "unknown error"
+
+        agent_label = sid if len(sid) <= 24 else sid[:24]
+        count = len(error_events)
+        alert_msg = (
+            f"Error spike: {agent_label}: {dominant} "
+            f"({count}× in {_ERROR_SPIKE_WINDOW_SEC}s)"
+        )
+        rule_id = (
+            "error_spike_"
+            + sid[:20]
+            + "_"
+            + dominant[:30].replace(" ", "_").replace("/", "_")
+        )
+        _fire_alert(
+            rule_id=rule_id,
+            alert_type="error_spike",
+            message=alert_msg,
+            channels=["banner"],
+            severity="error",
+        )
+
+
 def _budget_monitor_loop():
     """Background thread: check for anomalies, agent-down, and custom alert rules."""
     global \
@@ -7562,6 +8606,12 @@ def _budget_monitor_loop():
                     )
             except Exception as _vel_err:
                 print(f"Warning: velocity check failed: {_vel_err}")
+            # Error-spike detection (GH#954): per-session N-errors-in-window grouping
+            try:
+                _detect_error_spikes()
+            except Exception as _spike_err:
+                print(f"Warning: error spike check failed: {_spike_err}")
+
 
             # Agent error-rate check from webhook channel metrics (last 60 minutes)
             window_start = now - 3600
@@ -7966,10 +9016,204 @@ def _process_otlp_metrics(pb_data):
                         )
 
 
+_OTEL_SPAN_KIND_NAMES = {
+    0: "UNSPECIFIED",
+    1: "INTERNAL",
+    2: "SERVER",
+    3: "CLIENT",
+    4: "PRODUCER",
+    5: "CONSUMER",
+}
+
+_OTEL_STATUS_CODE_NAMES = {
+    0: "UNSET",
+    1: "OK",
+    2: "ERROR",
+}
+
+
+def _hex(b):
+    """OTel proto carries trace_id / span_id / parent_span_id as raw bytes.
+    DuckDB stores them as hex strings (matches the OTel spec's canonical
+    text form). ``b'' → ''`` so parent_span_id stays falsy for root spans."""
+    if not b:
+        return ""
+    try:
+        return b.hex() if isinstance(b, (bytes, bytearray)) else str(b)
+    except Exception:
+        return ""
+
+
+def _otel_to_row(span, resource_attrs):
+    """Translate one OTel proto Span (plus its resource attributes) to the
+    dict shape :func:`clawmetry.local_store.LocalStore.ingest_span` expects.
+
+    Issue #1007 / epic #1006. Maps common OTel attribute conventions onto
+    typed columns so the dashboard's usage / trace-tree views don't have
+    to JSON-extract on every read:
+
+      * ``gen_ai.request.model`` / ``llm.model`` / ``model`` → ``model``
+      * ``gen_ai.usage.input_tokens`` / ``llm.usage.prompt_tokens`` →
+        ``tokens_input``
+      * ``gen_ai.usage.output_tokens`` / ``llm.usage.completion_tokens`` →
+        ``tokens_output``
+      * ``gen_ai.usage.total_tokens`` → ``token_count``
+      * ``gen_ai.usage.cost_usd`` / ``llm.usage.cost`` → ``cost_usd``
+      * ``tool.name`` / ``code.function`` → ``tool_name``
+      * ``session.id`` / ``openclaw.session_id`` → ``session_id``
+      * ``agent.id`` / ``openclaw.agent_id`` (also from resource) → ``agent_id``
+      * ``agent.type`` (also from resource) → ``agent_type``
+      * Resource ``service.name`` → ``service_name``
+
+    Everything not projected lands in the ``attributes`` JSON blob so the
+    span-detail panel can render any custom attributes the SDK exporter
+    set. Span events / links are passed through as JSON arrays.
+    """
+    attrs = {}
+    for attr in span.attributes:
+        attrs[attr.key] = _otel_attr_value(attr.value)
+
+    # Time columns. OTel proto carries unix-nano; we store unix-seconds in
+    # ``start_ts`` / ``end_ts`` (DOUBLE) so chart libs can format them
+    # without converting twice.
+    start_ts = (span.start_time_unix_nano or 0) / 1e9
+    end_ts = (span.end_time_unix_nano or 0) / 1e9 or start_ts
+    duration_ns = max(0, (span.end_time_unix_nano or 0) - (span.start_time_unix_nano or 0))
+    duration_ms = duration_ns / 1_000_000.0
+
+    # Status + kind.
+    kind_id = getattr(span, "kind", 0) or 0
+    kind_name = _OTEL_SPAN_KIND_NAMES.get(kind_id, str(kind_id))
+    status_code_id = 0
+    status_message = ""
+    if span.HasField("status"):
+        status_code_id = span.status.code
+        status_message = span.status.message or ""
+    status_code_name = _OTEL_STATUS_CODE_NAMES.get(status_code_id, str(status_code_id))
+
+    # Attribute → typed-column projection. ``attrs`` first (per-span) so it
+    # wins over ``resource_attrs`` (resource-level fallback) — same
+    # precedence the OTel spec uses.
+    def _pick(*keys):
+        for k in keys:
+            v = attrs.get(k)
+            if v not in (None, ""):
+                return v
+            v = resource_attrs.get(k)
+            if v not in (None, ""):
+                return v
+        return None
+
+    def _pick_int(*keys):
+        v = _pick(*keys)
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _pick_float(*keys):
+        v = _pick(*keys)
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    model = _pick("gen_ai.request.model", "gen_ai.response.model", "llm.model", "model")
+    tokens_input = _pick_int("gen_ai.usage.input_tokens", "llm.usage.prompt_tokens", "input_tokens")
+    tokens_output = _pick_int("gen_ai.usage.output_tokens", "llm.usage.completion_tokens", "output_tokens")
+    token_count = _pick_int("gen_ai.usage.total_tokens", "llm.usage.total_tokens", "total_tokens")
+    if token_count is None and (tokens_input or tokens_output):
+        token_count = (tokens_input or 0) + (tokens_output or 0)
+    cost_usd = _pick_float("gen_ai.usage.cost_usd", "llm.usage.cost", "cost_usd")
+    tool_name = _pick("tool.name", "code.function")
+    session_id = _pick("session.id", "openclaw.session_id", "session_id")
+    agent_id = _pick("agent.id", "openclaw.agent_id", "agent_id") or "main"
+    agent_type = _pick("agent.type", "openclaw.agent_type", "agent_type") or "openclaw"
+    service_name = resource_attrs.get("service.name") or attrs.get("service.name")
+    node_id = _pick("node.id", "openclaw.node_id", "host.name")
+
+    # Span events: array of {time_unix_nano, name, attributes}.
+    events = []
+    for ev in span.events:
+        ev_attrs = {}
+        for a in ev.attributes:
+            ev_attrs[a.key] = _otel_attr_value(a.value)
+        events.append({
+            "time_unix_nano": ev.time_unix_nano,
+            "name": ev.name,
+            "attributes": ev_attrs,
+        })
+
+    # Span links: array of {trace_id, span_id, attributes}.
+    links = []
+    for ln in span.links:
+        ln_attrs = {}
+        for a in ln.attributes:
+            ln_attrs[a.key] = _otel_attr_value(a.value)
+        links.append({
+            "trace_id": _hex(ln.trace_id),
+            "span_id": _hex(ln.span_id),
+            "attributes": ln_attrs,
+        })
+
+    return {
+        "span_id": _hex(span.span_id),
+        "trace_id": _hex(span.trace_id),
+        "parent_span_id": _hex(span.parent_span_id) or None,
+        "agent_type": agent_type,
+        "agent_id": agent_id,
+        "node_id": node_id,
+        "session_id": session_id,
+        "service_name": service_name,
+        "name": span.name,
+        "kind": kind_name,
+        "status_code": status_code_name,
+        "status_message": status_message,
+        "status": status_code_name,
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "duration_ms": duration_ms,
+        "duration_ns": duration_ns,
+        "model": model,
+        "tool_name": tool_name,
+        "cost_usd": cost_usd,
+        "token_count": token_count,
+        "tokens_input": tokens_input,
+        "tokens_output": tokens_output,
+        "input": attrs.get("gen_ai.prompt") or attrs.get("llm.prompts") or attrs.get("input"),
+        "output": attrs.get("gen_ai.completion") or attrs.get("llm.completions") or attrs.get("output"),
+        "attributes": attrs,
+        "events": events,
+        "links": links,
+    }
+
+
 def _process_otlp_traces(pb_data):
-    """Decode OTLP traces protobuf and extract relevant span data."""
+    """Decode OTLP traces protobuf and extract relevant span data.
+
+    Two-path design (issue #1007): we still feed the in-memory metrics
+    cache (the live dashboard's hot path — sub-second tiles for tokens /
+    runs / messages) AND persist every span to DuckDB via
+    ``local_store.put_span`` so the trace tree / span detail views can
+    query historical traces. The DuckDB write is best-effort wrapped in
+    try/except — a write failure must NOT break the metrics cache path.
+    """
     req = trace_service_pb2.ExportTraceServiceRequest()
     req.ParseFromString(pb_data)
+
+    # Resolve the local store lazily so unit tests that monkeypatch the
+    # singleton in advance (or run without DuckDB) don't pay the import
+    # cost upfront.
+    _store = None
+    try:
+        from clawmetry import local_store as _ls
+        _store = _ls.get_store()
+    except Exception:
+        _store = None
 
     for resource_spans in req.resource_spans:
         resource_attrs = {}
@@ -8014,6 +9258,22 @@ def _process_otlp_traces(pb_data):
                             "duration_ms": duration_ms,
                         },
                     )
+
+                # DuckDB write-through. Failures here are logged but do not
+                # break the metrics cache path above (which is what the
+                # live tiles read from). Idempotent on span_id — OTLP
+                # retries land as INSERT OR REPLACE without duping.
+                if _store is not None:
+                    try:
+                        _store.put_span(_otel_to_row(span, resource_attrs))
+                    except Exception as e:
+                        try:
+                            import logging as _lg
+                            _lg.getLogger("clawmetry.dashboard").warning(
+                                "local_store.put_span failed: %s", e
+                            )
+                        except Exception:
+                            pass
 
 
 def _get_otel_usage_data():
@@ -8360,8 +9620,28 @@ def detect_config(args=None):
     app.register_blueprint(bp_skills)
     app.register_blueprint(bp_heartbeat)
     app.register_blueprint(bp_selfconfig)
+    app.register_blueprint(bp_agents)
     app.register_blueprint(bp_reasoning)
+    app.register_blueprint(bp_plugins)
+    app.register_blueprint(bp_local_query)
+
+    # Register built-in agent adapters. External plugins can register more
+    # via clawmetry.extensions entry points — see clawmetry/adapters/.
+    from clawmetry.adapters import registry as _adapter_registry
+    from clawmetry.adapters.openclaw import OpenClawAdapter
+    _adapter_registry.register(OpenClawAdapter())
     app.register_blueprint(bp_openapi)
+    app.register_blueprint(bp_update_check)
+    app.register_blueprint(bp_workspaces)
+    app.register_blueprint(bp_bootstrap)
+
+    # Register built-in agent adapters. External plugins can register more
+    # via clawmetry.extensions entry points — see clawmetry/adapters/.
+    from clawmetry.adapters import registry as _adapter_registry
+    from clawmetry.adapters.openclaw import OpenClawAdapter
+    from clawmetry.adapters.hermes import HermesAdapter
+    _adapter_registry.register(OpenClawAdapter())
+    _adapter_registry.register(HermesAdapter())
 
     # Local-OSS shims for cloud-only endpoints. Return empty arrays so the
     # Approvals tab renders cleanly without cloud sync.
@@ -8389,6 +9669,52 @@ def detect_config(args=None):
             return _jsonify({"error": "Connect to ClawMetry Cloud to save "
                              "integrations.", "note": _oss_note}), 402
         return _jsonify({"integrations": [], "count": 0, "note": _oss_note})
+
+    # vivekchand/clawmetry#748 — Initial-sync progress for the dashboard
+    # banner. The sync daemon writes ~/.clawmetry/sync_progress.json after
+    # each phase; we just stream it through. Local-only, no auth.
+    @app.route("/api/sync-progress", endpoint="sync_progress")
+    def _sync_progress():
+        from flask import jsonify as _jsonify
+        progress_path = os.path.expanduser("~/.clawmetry/sync_progress.json")
+        if not os.path.isfile(progress_path):
+            return _jsonify({"error": "no sync progress yet"}), 404
+        try:
+            with open(progress_path) as _f:
+                return _jsonify(json.load(_f))
+        except Exception as _e:
+            return _jsonify({"error": f"unreadable: {_e}"}), 500
+
+    # Local SQLite event store (epic #964 / phase 1) — proves the daemon is
+    # writing through to ~/.clawmetry/events.db. The dashboard's main read
+    # paths are migrating to this store progressively; in the meantime this
+    # endpoint exposes the store's own metrics so we can verify the
+    # write-through is working in prod and start the cutover safely.
+    @app.route("/api/local-store/health", endpoint="local_store_health")
+    def _local_store_health():
+        from flask import jsonify as _jsonify
+        try:
+            from clawmetry import local_store
+            return _jsonify(local_store.get_store().health())
+        except Exception as _e:
+            return _jsonify({"error": str(_e)[:300]}), 503
+
+    @app.route("/api/local-store/events", endpoint="local_store_events")
+    def _local_store_events():
+        from flask import jsonify as _jsonify, request as _req
+        try:
+            from clawmetry import local_store
+            store = local_store.get_store()
+            rows = store.query_events(
+                session_id=_req.args.get("session_id"),
+                event_type=_req.args.get("event_type"),
+                since=_req.args.get("since"),
+                until=_req.args.get("until"),
+                limit=int(_req.args.get("limit", "200")),
+            )
+            return _jsonify({"events": rows, "count": len(rows)})
+        except Exception as _e:
+            return _jsonify({"error": str(_e)[:300]}), 500
     # ────────────────────────────────────────────────────────────────────────
 
 
@@ -8468,7 +9794,7 @@ def _detect_gateway_token():
     # 2. Try reading from running gateway process env (Linux only)
     try:
         import subprocess as _sp
-        result = _sp.run(['pgrep', '-f', 'openclaw-gatewa'], capture_output=True, text=True, timeout=3)
+        result = _sp.run(['pgrep', '-f', 'openclaw-gateway'], capture_output=True, text=True, timeout=3)
         for pid in result.stdout.strip().split('\n'):
             pid = pid.strip()
             if pid:
@@ -8495,10 +9821,17 @@ def _detect_gateway_token():
             import json as _json
             with open(jp) as f:
                 cfg = _json.load(f)
+            # Primary path on current OpenClaw: cfg["gateway"]["auth"]["token"].
+            # Older / alternate schemas put it at top-level cfg["auth"]["token"]
+            # (issue #1127). Try gateway-nested first, fall back to top-level.
             gw = cfg.get('gateway', {})
-            auth = gw.get('auth', {})
-            if isinstance(auth, dict) and 'token' in auth:
-                return auth['token']
+            if isinstance(gw, dict):
+                gw_auth = gw.get('auth', {})
+                if isinstance(gw_auth, dict) and gw_auth.get('token'):
+                    return gw_auth['token']
+            top_auth = cfg.get('auth', {})
+            if isinstance(top_auth, dict) and top_auth.get('token'):
+                return top_auth['token']
         except (FileNotFoundError, ValueError, KeyError, TypeError):
             pass
     return None
@@ -8562,9 +9895,9 @@ DASHBOARD_HTML = r"""
 <link rel="icon" href="/static/img/logo.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}">
-<script src="{{ url_for('static', filename='js/nav-dropdown.js') }}"></script>
-<script src="{{ url_for('static', filename='js/alerts.js') }}" defer></script>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css', v=version) }}">
+<script src="{{ url_for('static', filename='js/nav-dropdown.js', v=version) }}"></script>
+<script src="{{ url_for('static', filename='js/alerts.js', v=version) }}" defer></script>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
@@ -8575,9 +9908,16 @@ DASHBOARD_HTML = r"""
 <div class="nav">
   <h1><a href="https://clawmetry.com" style="display:flex;align-items:center;gap:7px;text-decoration:none;color:inherit"><img src="/static/img/logo.svg" width="22" height="22" style="border-radius:4px;vertical-align:middle;flex-shrink:0" alt="ClawMetry"><span><span style="color:#ffffff">Claw</span><span style="color:#E5443A">Metry</span></span></a></h1>
   <span id="version-badge" class="version-badge" title="ClawMetry version">v{{ version }}</span>
+  <div id="workspace-switcher" style="display:none;position:relative;margin-left:8px;">
+    <button id="workspace-switcher-btn" onclick="toggleWorkspaceSwitcher(event)" title="Switch OpenClaw workspace" style="background:transparent;color:inherit;border:1px solid rgba(255,255,255,0.15);border-radius:6px;padding:4px 10px;font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:6px;">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+      <span id="workspace-switcher-label">default</span>
+      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+    </button>
+    <div id="workspace-switcher-menu" style="display:none;position:absolute;top:calc(100% + 6px);left:0;min-width:240px;max-height:320px;overflow-y:auto;background:var(--bg-card,#1c2333);border:1px solid var(--border-color,rgba(255,255,255,0.1));border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,0.35);z-index:200;padding:4px;"></div>
+  </div>
   <div class="theme-toggle" onclick="var o=document.getElementById('gw-setup-overlay');o.dataset.mandatory='false';document.getElementById('gw-setup-close').style.display='';o.style.display='flex'" title="Gateway settings" style="cursor:pointer;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></div>
-  <!-- Budget & Alerts hidden until mature -->
-  <!-- <div class="theme-toggle" onclick="openBudgetModal()" title="Budget & Alerts" style="cursor:pointer;">&#128176;</div> -->
+  <div class="theme-toggle" id="alerts-bell-btn" onclick="switchTab('alerts')" title="Active alerts" style="cursor:pointer;position:relative;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg><span id="alerts-bell-badge" style="display:none;position:absolute;top:-4px;right:-4px;background:#ef4444;color:#fff;border-radius:10px;padding:0 4px;font-size:9px;font-weight:700;min-width:14px;line-height:14px;text-align:center;">0</span></div>
 
   <div class="theme-toggle" id="logout-btn" onclick="clawmetryLogout()" title="Logout" style="display:none;cursor:pointer;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg></div>
   <div class="zoom-controls">
@@ -8588,9 +9928,9 @@ DASHBOARD_HTML = r"""
   <div class="nav-tabs">
     <div class="nav-tab" onclick="switchTab('flow')">Flow</div>
     <div class="nav-tab" onclick="switchTab('brain')">Brain</div>
-    <div class="nav-tab active" onclick="switchTab('overview')">Overview</div>
+    <div class="nav-tab active" onclick="switchTab('overview')">Overview <span id="nav-stuck-badge" style="display:none;background:#ef4444;color:#fff;border-radius:10px;padding:1px 6px;font-size:10px;font-weight:700;margin-left:4px;">0</span></div>
     <div class="nav-tab" onclick="switchTab('approvals')" title="Cloud-mediated approval queue">Approvals <span id="nav-approvals-badge" style="display:none;background:#ef4444;color:#fff;border-radius:10px;padding:1px 6px;font-size:10px;font-weight:700;margin-left:4px;">0</span></div>
-    <div class="nav-tab" onclick="switchTab('alerts')" title="Get notified when something goes wrong">Alerts</div>
+    <div class="nav-tab" onclick="switchTab('alerts')" title="Get notified when something goes wrong">Alerts <span id="nav-alerts-badge" style="display:none;background:#ef4444;color:#fff;border-radius:10px;padding:1px 6px;font-size:10px;font-weight:700;margin-left:4px;">0</span></div>
     <div class="nav-tab" onclick="switchTab('notifications')" title="Slack / Email / PagerDuty / Telegram channels">Notifications</div>
     <div class="nav-tab" onclick="switchTab('context')" title="See what context the LLM receives each turn">Context</div>
     <div class="nav-tab" onclick="switchTab('usage')">Tokens</div>
@@ -8601,7 +9941,7 @@ DASHBOARD_HTML = r"""
     <!-- History tab hidden until mature -->
     <!-- <div class="nav-tab" onclick="switchTab('history')">History</div> -->
   <div id="cloud-cta-btn" onclick="openCloudModal()" style="display:none;margin-left:8px;cursor:pointer;padding:6px 12px;border:1px solid rgba(96,165,250,0.5);border-radius:8px;font-size:12px;font-weight:600;color:#60a5fa;white-space:nowrap;transition:all 0.2s;user-select:none;" onmouseover="this.style.background='rgba(96,165,250,0.1)'" onmouseout="this.style.background='transparent'"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:inline;vertical-align:middle;margin-right:4px"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>Enable Cloud Sync</div>
-  <div id="cloud-connected-badge" onclick="window.open('https://app.clawmetry.com','_blank')" style="display:none;margin-left:8px;cursor:pointer;padding:6px 12px;border:1px solid rgba(34,197,94,0.4);border-radius:8px;font-size:12px;font-weight:600;color:#22c55e;white-space:nowrap;transition:all 0.2s;user-select:none;" onmouseover="this.style.background='rgba(34,197,94,0.08)'" onmouseout="this.style.background='transparent'">&#9679; Cloud Connected</div>
+  <div id="cloud-connected-badge" onclick="window.open('https://app.clawmetry.com/cloud','_blank')" style="display:none;margin-left:8px;cursor:pointer;padding:6px 12px;border:1px solid rgba(34,197,94,0.4);border-radius:8px;font-size:12px;font-weight:600;color:#22c55e;white-space:nowrap;transition:all 0.2s;user-select:none;" onmouseover="this.style.background='rgba(34,197,94,0.08)'" onmouseout="this.style.background='transparent'">&#9679; Cloud Connected</div>
   </div>
 </div>
 {% include 'partials/cloud-modal.html' %}
@@ -8678,7 +10018,7 @@ DASHBOARD_HTML = r"""
 
 {% include 'tabs/logs.html' %}
 
-<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+<script src="{{ url_for('static', filename='js/app.js', v=version) }}"></script>
 </div> <!-- end zoom-wrapper -->
 
 <!-- Component Detail Modal -->
@@ -8726,6 +10066,9 @@ DASHBOARD_HTML = r"""
       <div class="modal-tab active" onclick="switchModalTab('summary')">Summary</div>
       <div class="modal-tab" onclick="switchModalTab('narrative')">Narrative</div>
       <div class="modal-tab" onclick="switchModalTab('full')">Full Logs</div>
+      <div class="modal-tab" onclick="switchModalTab('tools')">Tools</div>
+      <div class="modal-tab" onclick="switchModalTab('models')">Model Journey</div>
+      <div class="modal-tab" onclick="switchModalTab('subagents')">Subagents</div>
     </div>
     <div class="modal-content" id="modal-content">Loading...</div>
     <div class="modal-footer">
@@ -8745,7 +10088,12 @@ DASHBOARD_HTML = r"""
     <input id="gw-token-input" type="password" placeholder="Paste your gateway token" 
       style="width:100%; padding:12px 16px; border:1px solid var(--border-primary, #444); border-radius:8px; background:var(--bg-primary, #111); color:var(--text-primary, #fff); font-size:14px; font-family:monospace; box-sizing:border-box; outline:none; margin-bottom:8px;"
       onkeydown="if(event.key==='Enter')gwSetupConnect()">
-    <p id="gw-setup-hint" style="color:var(--text-muted, #888); font-size:12px; margin:0 0 4px; text-align:left;">Find it: <code style="color:var(--text-accent, #0af); background:rgba(0,170,255,0.1); padding:2px 6px; border-radius:4px;">docker exec $(docker ps -q) env | grep TOKEN</code> or <code style="color:var(--text-accent, #0af); background:rgba(0,170,255,0.1); padding:2px 6px; border-radius:4px;">gateway.auth.token</code></p>
+    <div id="gw-setup-hint" style="color:var(--text-muted, #888); font-size:12px; margin:0 0 4px; text-align:left;">
+      <div style="font-weight:600;color:var(--text-secondary, #aaa);margin:6px 0 4px;">Local install (pip / brew / install.sh)</div>
+      <code style="display:block;color:var(--text-accent, #0af); background:rgba(0,170,255,0.1); padding:6px 8px; border-radius:4px; font-size:11px; word-break:break-all;">cat ~/.openclaw/openclaw.json | python3 -c "import json,sys;print(json.load(sys.stdin)['gateway']['auth']['token'])"</code>
+      <div style="font-weight:600;color:var(--text-secondary, #aaa);margin:8px 0 4px;">Docker install</div>
+      <code style="display:block;color:var(--text-accent, #0af); background:rgba(0,170,255,0.1); padding:6px 8px; border-radius:4px; font-size:11px; word-break:break-all;">docker exec $(docker ps -q) env | grep TOKEN</code>
+    </div>
     <p id="gw-url-hint" style="color:var(--text-muted, #666); font-size:11px; margin:0 0 16px; text-align:left;">Optional: <input id="gw-url-input" type="text" placeholder="http://localhost:18789 (auto-detected)" style="width:70%; padding:4px 8px; border:1px solid var(--border-primary, #444); border-radius:4px; background:var(--bg-primary, #111); color:var(--text-primary, #fff); font-size:11px; font-family:monospace;"></p>
     <div id="gw-setup-error" style="color:#ff4444; font-size:13px; margin-bottom:12px; display:none;"></div>
     <div id="gw-setup-status" style="color:var(--text-accent, #0af); font-size:13px; margin-bottom:12px; display:none;"></div>
@@ -8757,7 +10105,7 @@ DASHBOARD_HTML = r"""
   </div>
 </div>
 
-<script src="{{ url_for('static', filename='js/gw-setup.js') }}"></script>
+<script src="{{ url_for('static', filename='js/gw-setup.js', v=version) }}"></script>
 
 </body>
 </html>
@@ -9087,6 +10435,33 @@ def _auto_discover_gateway(token):
 
 
 # (bp_auth handlers moved to routes/meta.py: /api/auth/check, /auth, /)
+
+
+@app.before_request
+def _latency_probe_start():
+    """Issue #1283: per-endpoint p50/p95 timing for /api/handler-latency."""
+    try:
+        from flask import g
+        import time as _t
+        g._lat_start = _t.perf_counter()
+    except Exception:
+        pass
+
+
+@app.after_request
+def _latency_probe_record(response):
+    try:
+        from flask import g, request
+        import time as _t
+        start = getattr(g, "_lat_start", None)
+        path = request.path or ""
+        if start is not None and path.startswith("/api/"):
+            elapsed_ms = (_t.perf_counter() - start) * 1000.0
+            from clawmetry import latency_tracker as _lt
+            _lt.record(request.endpoint or path, elapsed_ms)
+    except Exception:
+        pass
+    return response
 
 
 @app.before_request
@@ -9757,7 +11132,13 @@ def _extract_usage_metrics(obj):
     if not isinstance(usage, dict):
         usage = obj.get("tokens_used")
     if not isinstance(usage, dict):
-        return {"tokens": 0, "cost": 0.0}
+        return {
+            "tokens": 0, "cost": 0.0,
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_write_tokens": 0,
+            "input_cost": 0.0, "output_cost": 0.0,
+            "cache_read_cost": 0.0, "cache_write_cost": 0.0,
+        }
 
     in_toks = usage.get("input", usage.get("input_tokens", 0)) or 0
     out_toks = usage.get("output", usage.get("output_tokens", 0)) or 0
@@ -9768,6 +11149,10 @@ def _extract_usage_metrics(obj):
         total = in_toks + out_toks + cache_read + cache_write
 
     cost = 0.0
+    cost_input = 0.0
+    cost_output = 0.0
+    cost_cache_read = 0.0
+    cost_cache_write = 0.0
     cost_data = usage.get("cost", {})
     if isinstance(cost_data, dict):
         raw = cost_data.get("total", cost_data.get("usd", 0))
@@ -9775,12 +11160,25 @@ def _extract_usage_metrics(obj):
             cost = float(raw or 0)
         except Exception:
             cost = 0.0
+        # Extract granular cost breakdown if available
+        cost_input = float(cost_data.get("input", 0) or 0)
+        cost_output = float(cost_data.get("output", 0) or 0)
+        cost_cache_read = float(cost_data.get("cacheRead", 0) or 0)
+        cost_cache_write = float(cost_data.get("cacheWrite", 0) or 0)
     elif isinstance(cost_data, (int, float)):
         cost = float(cost_data)
 
     return {
         "tokens": int(total or 0),
         "cost": float(cost or 0.0),
+        "input_tokens": int(in_toks or 0),
+        "output_tokens": int(out_toks or 0),
+        "cache_read_tokens": int(cache_read or 0),
+        "cache_write_tokens": int(cache_write or 0),
+        "input_cost": float(cost_input),
+        "output_cost": float(cost_output),
+        "cache_read_cost": float(cost_cache_read),
+        "cache_write_cost": float(cost_cache_write),
     }
 
 
@@ -9906,6 +11304,10 @@ def _compute_transcript_analytics():
     plugin_stats = defaultdict(lambda: {"tokens": 0.0, "cost": 0.0, "calls": 0})
     daily_tokens = {}
     daily_cost = {}
+    daily_input_tokens = {}
+    daily_output_tokens = {}
+    daily_cache_read_tokens = {}
+    daily_cache_write_tokens = {}
     model_usage = {}
 
     if os.path.isdir(sessions_dir):
@@ -9970,6 +11372,10 @@ def _compute_transcript_analytics():
                         usage_metrics = _extract_usage_metrics(obj)
                         tokens = usage_metrics["tokens"]
                         cost = usage_metrics["cost"]
+                        input_tokens = usage_metrics.get("input_tokens", 0)
+                        output_tokens = usage_metrics.get("output_tokens", 0)
+                        cache_read_tokens = usage_metrics.get("cache_read_tokens", 0)
+                        cache_write_tokens = usage_metrics.get("cache_write_tokens", 0)
 
                         if tokens > 0:
                             s_tokens += tokens
@@ -9983,6 +11389,10 @@ def _compute_transcript_analytics():
                             _ev_date = (ts or fallback_dt).strftime("%Y-%m-%d")
                             daily_tokens[_ev_date] = daily_tokens.get(_ev_date, 0) + tokens
                             daily_cost[_ev_date] = daily_cost.get(_ev_date, 0.0) + cost
+                            daily_input_tokens[_ev_date] = daily_input_tokens.get(_ev_date, 0) + input_tokens
+                            daily_output_tokens[_ev_date] = daily_output_tokens.get(_ev_date, 0) + output_tokens
+                            daily_cache_read_tokens[_ev_date] = daily_cache_read_tokens.get(_ev_date, 0) + cache_read_tokens
+                            daily_cache_write_tokens[_ev_date] = daily_cache_write_tokens.get(_ev_date, 0) + cache_write_tokens
 
                             plugins = _extract_tool_plugins(obj)
                             if plugins:
@@ -10050,6 +11460,10 @@ def _compute_transcript_analytics():
         "plugin_stats": plugin_stats,
         "daily_tokens": daily_tokens,
         "daily_cost": daily_cost,
+        "daily_input_tokens": daily_input_tokens,
+        "daily_output_tokens": daily_output_tokens,
+        "daily_cache_read_tokens": daily_cache_read_tokens,
+        "daily_cache_write_tokens": daily_cache_write_tokens,
         "model_usage": model_usage,
     }
     _transcript_analytics_cache["data"] = result
@@ -10091,7 +11505,13 @@ def _extract_usage_metrics(obj):
     if not isinstance(usage, dict):
         usage = obj.get("tokens_used")
     if not isinstance(usage, dict):
-        return {"tokens": 0, "cost": 0.0}
+        return {
+            "tokens": 0, "cost": 0.0,
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_write_tokens": 0,
+            "input_cost": 0.0, "output_cost": 0.0,
+            "cache_read_cost": 0.0, "cache_write_cost": 0.0,
+        }
 
     in_toks = usage.get("input", usage.get("input_tokens", 0)) or 0
     out_toks = usage.get("output", usage.get("output_tokens", 0)) or 0
@@ -10102,6 +11522,10 @@ def _extract_usage_metrics(obj):
         total = in_toks + out_toks + cache_read + cache_write
 
     cost = 0.0
+    cost_input = 0.0
+    cost_output = 0.0
+    cost_cache_read = 0.0
+    cost_cache_write = 0.0
     cost_data = usage.get("cost", {})
     if isinstance(cost_data, dict):
         raw = cost_data.get("total", cost_data.get("usd", 0))
@@ -10109,12 +11533,25 @@ def _extract_usage_metrics(obj):
             cost = float(raw or 0)
         except Exception:
             cost = 0.0
+        # Extract granular cost breakdown if available
+        cost_input = float(cost_data.get("input", 0) or 0)
+        cost_output = float(cost_data.get("output", 0) or 0)
+        cost_cache_read = float(cost_data.get("cacheRead", 0) or 0)
+        cost_cache_write = float(cost_data.get("cacheWrite", 0) or 0)
     elif isinstance(cost_data, (int, float)):
         cost = float(cost_data)
 
     return {
         "tokens": int(total or 0),
         "cost": float(cost or 0.0),
+        "input_tokens": int(in_toks or 0),
+        "output_tokens": int(out_toks or 0),
+        "cache_read_tokens": int(cache_read or 0),
+        "cache_write_tokens": int(cache_write or 0),
+        "input_cost": float(cost_input),
+        "output_cost": float(cost_output),
+        "cache_read_cost": float(cost_cache_read),
+        "cache_write_cost": float(cost_cache_write),
     }
 
 
@@ -10504,6 +11941,48 @@ def _get_anomaly_db():
         return _anomaly_db_conn
 
 
+def _fire_token_spike_alerts(new_anomalies):
+    """Fire configured token_spike alert rules for freshly inserted anomalies.
+
+    Called from _detect_and_store_anomalies() with only the anomalies that
+    were actually new (not deduped-out re-detections).  Matches each token_spike
+    anomaly against enabled token_spike rules; fires _fire_alert() when the
+    anomaly ratio meets or exceeds the rule's threshold multiplier.
+    """
+    if not new_anomalies:
+        return
+    token_spikes = [a for a in new_anomalies if a.get("metric") == "token_spike"]
+    if not token_spikes:
+        return
+    rules = [
+        r for r in _get_alert_rules()
+        if r.get("type") == "token_spike" and r.get("enabled")
+    ]
+    if not rules:
+        return
+    for anomaly in token_spikes:
+        ratio = float(anomaly.get("ratio", 0.0))
+        session_key = str(anomaly.get("session_key", "unknown"))
+        value = int(anomaly.get("value", 0))
+        baseline = float(anomaly.get("baseline", 0.0))
+        severity = str(anomaly.get("severity", "warning"))
+        for rule in rules:
+            threshold = float(rule.get("threshold", 2.0))
+            if ratio < threshold:
+                continue
+            rule_id = rule.get("id", "")
+            cooldown_key = f"token_spike_{rule_id}_{session_key}"
+            try:
+                channels = json.loads(rule.get("channels") or '["banner"]')
+            except Exception:
+                channels = ["banner"]
+            msg = (
+                f"Token spike: session {session_key} used {value:,} tokens "
+                f"({ratio:.1f}× the {baseline:.0f}-token baseline)"
+            )
+            _fire_alert(cooldown_key, "token_spike", msg, channels, severity)
+
+
 def _detect_and_store_anomalies():
     """Compute rolling-baseline anomalies and persist new ones to SQLite.
 
@@ -10647,6 +12126,7 @@ def _detect_and_store_anomalies():
             )
 
     # ── Persist new anomalies (deduplicate by session_key + metric within 24h) ──
+    truly_new_anomalies = []
     try:
         db = _get_anomaly_db()
         with _anomaly_db_lock:
@@ -10668,9 +12148,12 @@ def _detect_and_store_anomalies():
                             a["severity"],
                         ),
                     )
+                    truly_new_anomalies.append(a)
             db.commit()
     except Exception as _e:
         pass  # Non-critical — continue with in-memory results
+
+    _fire_token_spike_alerts(truly_new_anomalies)
 
     # ── Return stored anomalies from last 48h ──────────────────────────────
     try:
@@ -13143,6 +14626,27 @@ def _get_crons_from_files():
     return []
 
 
+def _normalize_next_run_at_ms(state):
+    """Ensure nextRunAtMs is a number (ms timestamp) or null (closes #685)."""
+    if not isinstance(state, dict):
+        return None
+    val = state.get("nextRunAtMs")
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return int(val)
+    if isinstance(val, str):
+        try:
+            # ISO timestamp or numeric string
+            if "T" in val:
+                from dateutil import parser as _dtp
+                return int(_dtp.parse(val).timestamp() * 1000)
+            return int(float(val))
+        except Exception:
+            return None
+    return None
+
+
 def _get_memory_files():
     """List workspace memory files."""
     result = []
@@ -14097,13 +15601,42 @@ def _get_uptime_str(pid):
 
 
 def _read_cloud_token():
+    """Resolve the cloud bearer the dashboard uses for /api/cloud-proxy/*.
+
+    Two sources of truth (audit P0 #5, clawmetry-cloud#779):
+
+      1. ``~/.openclaw/openclaw.json`` → ``clawmetry.cloudToken`` (legacy
+         OpenClaw sidecar path; written by ``clawmetry connect``).
+      2. ``~/.clawmetry/config.json`` → ``api_key`` (the daemon's own
+         config, written by ``python -m clawmetry.sync`` once the node is
+         paired). Validated by the ``cm_`` prefix.
+
+    Without (2) the dashboard would 401 the entire Alerts UI even on
+    machines where the daemon is fully cloud-paired but never had the
+    OpenClaw sidecar config written.
+    """
+    # Source 1 — OpenClaw sidecar (existing path, kept first so an explicit
+    # `clawmetry connect` write wins over the daemon-side copy).
     cfg_path = os.path.expanduser("~/.openclaw/openclaw.json")
     try:
         with open(cfg_path) as f:
             data = json.load(f)
-        return data.get("clawmetry", {}).get("cloudToken")
+        tok = (data.get("clawmetry", {}) or {}).get("cloudToken", "")
+        if tok:
+            return tok
     except Exception:
-        return None
+        pass
+    # Source 2 — daemon's own config (audit P0 #5 fallback).
+    daemon_cfg = os.path.expanduser("~/.clawmetry/config.json")
+    try:
+        with open(daemon_cfg) as f:
+            data = json.load(f)
+        tok = data.get("api_key", "")
+        if isinstance(tok, str) and tok.startswith("cm_"):
+            return tok
+    except Exception:
+        pass
+    return None
 
 
 def _write_cloud_token(token):
@@ -14623,7 +16156,32 @@ def cmd_uninstall(args):
     print("[ok] ClawMetry service removed.")
 
 
+_SERVER_HOST = None  # populated by _run_server; routes/meta.py reads this for the
+                     # /api/auth/detected-token bind-host gate.
+
+
+def _print_login_url_banner(port, host, token):
+    """Print a one-click /auth?token= URL when GATEWAY_TOKEN is set (#1356 PR-D).
+
+    Behavior:
+      - If token is empty/None -> no-op (preserves prior banner output).
+      - If host binds publicly (0.0.0.0 / ::), still print but reference
+        ``localhost`` so the link only works from the local machine.
+      - Always uses the URL framing (never logs the bare token alone).
+    """
+    if not token:
+        return
+    # Always frame the token inside the /auth URL; never print the bare token.
+    # 0.0.0.0 / :: are bind-all sentinels; the user clicks from localhost.
+    public_binds = ("0.0.0.0", "::", "")
+    display_host = "localhost" if host in public_binds else host
+    url = f"http://{display_host}:{port}/auth?token={token}"
+    print(f"  -> {url}  (one-click sign-in)")
+
+
 def _run_server(args):
+    global _SERVER_HOST
+    _SERVER_HOST = getattr(args, "host", None)
     import sys as _sys
 
     # Windows: guard against closed/detached stdout/stderr before Flask or
@@ -14750,6 +16308,8 @@ def _run_server(args):
     _detect_heartbeat_interval()
     _start_fleet_maintenance_thread()
     _start_budget_monitor_thread()
+    _start_session_health_thread()
+    start_update_check_thread()
 
     try:
         print(BANNER.format(version=__version__))
@@ -14804,6 +16364,16 @@ def _run_server(args):
             )
         if _HAS_OTEL_PROTO:
             print(f"  -> OTLP endpoint: http://{local_ip}:{args.port}/v1/metrics")
+        # One-click login URL when gateway token was detected (#1356 PR-D).
+        # Defense against shoulder-surfing screenshots: only the framed URL is
+        # printed (never the bare token), and only on the interactive startup
+        # banner (stdout). We never log this line to /tmp/clawmetry.log because
+        # the daemon-mode launcher redirects only the noisy server output, not
+        # this one-shot banner that runs before serve().
+        try:
+            _print_login_url_banner(args.port, args.host, GATEWAY_TOKEN)
+        except Exception:
+            pass  # Never let banner printing break the dashboard
         print()
         # Cloud nudge — only if not already connected
         _already_connected = bool(

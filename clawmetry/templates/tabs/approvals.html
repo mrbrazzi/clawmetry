@@ -15,13 +15,47 @@
     </div>
   </div>
 
-  <!-- ═══ SECTION 1: Pending Queue (always visible at top) ═══ -->
+  <!-- 2-column layout (#1343): LEFT = review (queue + history),
+       RIGHT = configure (rules + notifications). Collapses to single
+       column below 900px so narrow viewports keep working. -->
+  <div class="approvals-2col" style="display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:16px;align-items:start;">
+  <style>@media (max-width: 900px) { .approvals-2col { grid-template-columns: 1fr !important; } }</style>
+
+  <!-- ═══ LEFT COLUMN — Review (queue + history) ═══ -->
+  <div>
+
+  <!-- ═══ SECTION 1: Pending Queue (top of LEFT col) ═══ -->
   <div id="approvals-pending-section" style="margin-bottom:16px;">
     <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:6px;">Pending Approvals</div>
+
+    <!-- Bulk-action header (#1343 Phase 1.3) — hidden until ≥1 selected.
+         Lets operators triage a flood (e.g. "approve all 12 pending HTTP
+         requests from the same trusted session") without per-row clicks. -->
+    <div id="approvals-bulk-header" style="display:none;background:var(--bg-secondary);border:1px solid var(--border-secondary);border-radius:8px;padding:8px 12px;margin-bottom:8px;align-items:center;gap:10px;flex-wrap:wrap;">
+      <span id="approvals-bulk-count" style="font-size:12px;font-weight:700;color:var(--text-primary);"></span>
+      <input type="text" id="approvals-bulk-reason" placeholder="Bulk decision reason (optional, applied to all)" style="flex:1;min-width:200px;padding:5px 10px;border:1px solid var(--border-secondary);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);font-size:12px;">
+      <button onclick="bulkDecide('approve')" style="background:#22c55e;color:#062614;border:0;padding:6px 14px;border-radius:6px;font-weight:600;font-size:12px;cursor:pointer;">Approve selected</button>
+      <button onclick="bulkDecide('deny')" style="background:#ef4444;color:#fff;border:0;padding:6px 14px;border-radius:6px;font-weight:600;font-size:12px;cursor:pointer;">Deny selected</button>
+      <button onclick="bulkClearSelection()" style="background:transparent;color:var(--text-muted);border:1px solid var(--border-secondary);padding:6px 12px;border-radius:6px;font-size:12px;cursor:pointer;">Clear</button>
+    </div>
+
     <div id="approvals-pending-list">
       <div style="padding:18px;text-align:center;color:var(--text-muted);font-size:12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;">Loading...</div>
     </div>
   </div>
+
+  <!-- ═══ SECTION 4: Recent Decisions (bottom of LEFT col) ═══ -->
+  <div>
+    <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:6px;">Recent Decisions</div>
+    <div id="approvals-history-list">
+      <div style="padding:14px;text-align:center;color:var(--text-faint);font-size:12px;">No history yet.</div>
+    </div>
+  </div>
+
+  </div><!-- end LEFT column -->
+
+  <!-- ═══ RIGHT COLUMN — Configure (rules + notifications) ═══ -->
+  <div>
 
   <!-- ═══ SECTION 2: Protection Rules (visual policy builder) ═══ -->
   <div style="margin-bottom:16px;">
@@ -99,13 +133,8 @@
     </div>
   </div>
 
-  <!-- ═══ SECTION 4: Recent Decisions ═══ -->
-  <div>
-    <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:6px;">Recent Decisions</div>
-    <div id="approvals-history-list">
-      <div style="padding:14px;text-align:center;color:var(--text-faint);font-size:12px;">No history yet.</div>
-    </div>
-  </div>
+  </div><!-- end RIGHT column -->
+  </div><!-- end .approvals-2col grid -->
 
   <!-- ═══ Upgrade Modal ═══ -->
   <div id="approvals-upgrade-modal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;" onclick="if(event.target===this)closeUpgradeModal()">
@@ -381,35 +410,63 @@
     } catch(e) { alert('Failed: ' + e); }
   };
 
-  /* ── Approval row renderer (kept from v1) ── */
+  /* ── Approval row renderer ──
+   * Phase 1.2 (#1343): richer per-row context.
+   *   - Pretty-printed args (2-space indent, capped at 800 chars vs old 200)
+   *   - Session/node chips for spotting "always the same source" patterns
+   *   - Decision-reason input on pending rows; surfaced from history rows
+   */
   function _renderRow(r, pending) {
     var statusColors = {pending:'#f59e0b', approved:'#22c55e', denied:'#ef4444',
                         timeout:'#6b7280', expired:'#6b7280'};
     var c = statusColors[r.status] || '#6b7280';
-    var argsPreview = '';
-    try { argsPreview = JSON.stringify(r.args || {}).slice(0, 200); } catch(e) {}
+    var argsPretty = '';
+    try {
+      argsPretty = JSON.stringify(r.args || {}, null, 2);
+      if (argsPretty.length > 800) argsPretty = argsPretty.slice(0, 800) + '\n…';
+    } catch(e) {
+      try { argsPretty = JSON.stringify(r.args || {}).slice(0, 800); } catch(e2) {}
+    }
     var when = (r.requested_at || '').replace('T',' ').slice(0,19);
     var html = '<div style="background:var(--bg-secondary);border:1px solid var(--border);border-left:3px solid ' + c + ';border-radius:8px;padding:12px 14px;margin-bottom:8px;">';
-    html += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">';
+    html += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap;">';
+    if (pending) {
+      // Phase 1.3 (#1343): bulk-select checkbox. Event delegation in
+      // initBulkSelection() listens for change events on the list.
+      html += '<input type="checkbox" class="approval-bulk-checkbox" data-approval-id="' + escHtml(r.id) + '" style="cursor:pointer;flex-shrink:0;" title="Select for bulk action">';
+    }
     html += '<span style="font-weight:700;color:var(--text-primary);font-size:13px;">' + escHtml(r.tool_name || '?') + '</span>';
     html += '<span style="background:' + c + '22;color:' + c + ';border:1px solid ' + c + '44;padding:1px 8px;border-radius:99px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;">' + escHtml(r.status) + '</span>';
     if (r.policy_name) {
       html += '<span style="color:var(--text-muted);font-size:11px;">rule: ' + escHtml(r.policy_name) + '</span>';
+    }
+    if (r.session_id) {
+      html += '<span style="background:var(--bg-primary);color:var(--text-secondary);border:1px solid var(--border-secondary);padding:1px 6px;border-radius:4px;font-size:10px;font-family:var(--font-mono,monospace);">sess ' + escHtml(String(r.session_id).slice(0,8)) + '</span>';
+    }
+    if (r.node_id) {
+      html += '<span style="background:var(--bg-primary);color:var(--text-secondary);border:1px solid var(--border-secondary);padding:1px 6px;border-radius:4px;font-size:10px;font-family:var(--font-mono,monospace);">node ' + escHtml(String(r.node_id).slice(0,8)) + '</span>';
     }
     html += '<span style="color:var(--text-faint);font-size:10px;margin-left:auto;">' + escHtml(when) + '</span>';
     html += '</div>';
     if (r.context) {
       html += '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px;">' + escHtml(r.context) + '</div>';
     }
-    html += '<pre style="margin:0;padding:8px 10px;font-size:11px;background:var(--bg-primary);border:1px solid var(--border-secondary);border-radius:6px;overflow:auto;max-height:120px;color:var(--text-secondary);">' + escHtml(argsPreview) + '</pre>';
+    html += '<pre style="margin:0;padding:8px 10px;font-size:11px;background:var(--bg-primary);border:1px solid var(--border-secondary);border-radius:6px;overflow:auto;max-height:200px;color:var(--text-secondary);white-space:pre-wrap;word-break:break-word;">' + escHtml(argsPretty) + '</pre>';
     if (pending) {
-      html += '<div style="display:flex;gap:8px;margin-top:10px;">';
+      html += '<div style="margin-top:10px;">';
+      html += '<input type="text" id="dec-reason-' + escHtml(r.id) + '" placeholder="Reason (optional — recorded in audit log)" style="width:100%;box-sizing:border-box;padding:6px 10px;border:1px solid var(--border-secondary);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);font-size:12px;">';
+      html += '</div>';
+      html += '<div style="display:flex;gap:8px;margin-top:8px;">';
       html += '<button onclick="decideApproval(\'' + escHtml(r.id) + '\',\'approve\')" style="background:#22c55e;color:#062614;border:0;padding:7px 16px;border-radius:6px;font-weight:600;font-size:12px;cursor:pointer;">Approve</button>';
       html += '<button onclick="decideApproval(\'' + escHtml(r.id) + '\',\'deny\')" style="background:#ef4444;color:#fff;border:0;padding:7px 16px;border-radius:6px;font-weight:600;font-size:12px;cursor:pointer;">Deny</button>';
       html += '<span style="color:var(--text-muted);font-size:11px;align-self:center;margin-left:6px;">expires ' + escHtml((r.expires_at||'').slice(11,19)) + '</span>';
       html += '</div>';
     } else if (r.decided_by) {
-      html += '<div style="font-size:11px;color:var(--text-muted);margin-top:6px;">Decided by ' + escHtml(r.decided_by) + ' at ' + escHtml((r.decided_at||'').slice(11,19)) + '</div>';
+      html += '<div style="font-size:11px;color:var(--text-muted);margin-top:6px;">Decided by ' + escHtml(r.decided_by) + ' at ' + escHtml((r.decided_at||'').slice(11,19));
+      if (r.decision_reason) {
+        html += ' — <span style="font-style:italic;">' + escHtml(r.decision_reason) + '</span>';
+      }
+      html += '</div>';
     }
     html += '</div>';
     return html;
@@ -431,9 +488,27 @@
       var pe = document.getElementById('approvals-pending-list');
       if (p.length === 0) {
         pe.innerHTML = '<div style="padding:14px;text-align:center;color:var(--text-muted);font-size:12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;">No pending approvals right now.</div>';
+        // Drop selections for IDs that are no longer pending (decided
+        // elsewhere, expired, etc.) so the bulk header doesn't lie.
+        _approvalsBulkSelected.clear();
       } else {
         pe.innerHTML = p.map(function(r){return _renderRow(r, true);}).join('');
+        // Phase 1.3 (#1343): selection survives across renders. Re-check
+        // boxes for IDs still in the set; prune IDs that aren't on the
+        // page any more (decided/expired elsewhere).
+        var stillThere = new Set();
+        document.querySelectorAll('.approval-bulk-checkbox').forEach(function(cb){
+          var id = cb.dataset.approvalId;
+          if (_approvalsBulkSelected.has(id)) {
+            cb.checked = true;
+            stillThere.add(id);
+          }
+        });
+        _approvalsBulkSelected.forEach(function(id){
+          if (!stillThere.has(id)) _approvalsBulkSelected.delete(id);
+        });
       }
+      _refreshBulkHeader();
 
       // Policies
       renderPresets(policies.policies || []);
@@ -574,19 +649,97 @@
   };
 
   /* ── Decide (approve/deny) ── */
-  window.decideApproval = async function(id, action) {
+  window.decideApproval = async function(id, action, opts) {
+    // Phase 1.2 (#1343): pick up the optional decision-reason input rendered
+    // alongside each pending row. Backend stores it in the existing
+    // ``decision_reason`` column so the audit trail captures WHY, not just
+    // who+when. Empty input → omit field (preserves backward compat).
+    // Phase 1.3: opts.reason / opts.silentRefresh / opts.skipReload supported
+    // for bulk-action callers.
+    opts = opts || {};
+    var reason = opts.reason;
+    if (!reason) {
+      var reasonEl = document.getElementById('dec-reason-' + id);
+      reason = reasonEl && reasonEl.value ? reasonEl.value.trim() : '';
+    }
+    var body = {action: action};
+    if (reason) body.decision_reason = reason;
     try {
       var r = await fetch('/api/cloud/approvals/' + encodeURIComponent(id) + '/decide', {
         method: 'POST', headers: _authHeaders(),
-        body: JSON.stringify({action: action})
+        body: JSON.stringify(body)
       });
       var d = await r.json();
       if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
-      loadApprovalsTab();
+      if (!opts.skipReload) loadApprovalsTab();
+      return {ok: true};
     } catch(e) {
-      alert('Decision failed: ' + e);
+      if (!opts.silentRefresh) alert('Decision failed: ' + e);
+      return {ok: false, error: String(e)};
     }
   };
+
+  /* ── Bulk decide (Phase 1.3 #1343) ──
+   * Tracks selected approval IDs in a Set; bulk-action header shows
+   * Approve/Deny buttons + a shared optional reason input. Sequential
+   * POSTs (not Promise.all) so we don't burst the backend with 50 calls
+   * if a flood lands. Single loadApprovalsTab() refresh at the end.
+   */
+  var _approvalsBulkSelected = new Set();
+
+  function _refreshBulkHeader() {
+    var hdr = document.getElementById('approvals-bulk-header');
+    var cnt = document.getElementById('approvals-bulk-count');
+    if (!hdr || !cnt) return;
+    var n = _approvalsBulkSelected.size;
+    if (n === 0) {
+      hdr.style.display = 'none';
+    } else {
+      hdr.style.display = 'flex';
+      cnt.textContent = n + ' selected';
+    }
+  }
+
+  window.bulkClearSelection = function() {
+    _approvalsBulkSelected.clear();
+    document.querySelectorAll('.approval-bulk-checkbox').forEach(function(cb){ cb.checked = false; });
+    _refreshBulkHeader();
+  };
+
+  window.bulkDecide = async function(action) {
+    var ids = Array.from(_approvalsBulkSelected);
+    if (ids.length === 0) return;
+    var verb = action === 'approve' ? 'Approve' : 'Deny';
+    if (!confirm(verb + ' ' + ids.length + ' selected approval(s)?')) return;
+    var bulkReasonEl = document.getElementById('approvals-bulk-reason');
+    var bulkReason = bulkReasonEl && bulkReasonEl.value ? bulkReasonEl.value.trim() : '';
+    var failed = 0;
+    for (var i = 0; i < ids.length; i++) {
+      var res = await window.decideApproval(ids[i], action, {
+        reason: bulkReason,
+        skipReload: true,
+        silentRefresh: true
+      });
+      if (!res || !res.ok) failed++;
+    }
+    _approvalsBulkSelected.clear();
+    if (bulkReasonEl) bulkReasonEl.value = '';
+    loadApprovalsTab();
+    if (failed > 0) alert(failed + ' of ' + ids.length + ' decisions failed (others succeeded).');
+  };
+
+  // Event delegation: any checkbox change inside the pending list updates
+  // the selection set. Re-renders blow away the DOM, but the Set survives,
+  // so we need to re-sync checkbox checked-state on each render.
+  document.addEventListener('change', function(e) {
+    if (e.target && e.target.classList && e.target.classList.contains('approval-bulk-checkbox')) {
+      var id = e.target.dataset.approvalId;
+      if (!id) return;
+      if (e.target.checked) _approvalsBulkSelected.add(id);
+      else _approvalsBulkSelected.delete(id);
+      _refreshBulkHeader();
+    }
+  });
 
   /* ── Background badge poll ── */
   setInterval(function(){

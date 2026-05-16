@@ -37,12 +37,55 @@ zero behaviour change.
 """
 
 import json
+import os
 import time
 
 from flask import Blueprint, jsonify, request
+from clawmetry.config import is_local_store_read_enabled
 
 bp_budget = Blueprint('budget', __name__)
 bp_alerts = Blueprint('alerts', __name__)
+
+
+# ── Local-store fast path (Phase 3 of epic #1032) ────────────────────────────
+# Opt-in via CLAWMETRY_LOCAL_STORE_READ=1. Mirrors the same pattern used by
+# routes/crons.py and routes/sessions.py: gate the DuckDB read on the env flag,
+# return ``None`` to fall through to the legacy fleet-DB path on any error or
+# empty result. Cloud-authored rules land in this DuckDB table via the
+# heartbeat relay's pending_queries channel; the local evaluator picks them
+# up on its next pass.
+
+
+def _try_local_store_alert_rules():
+    """Return alert rules from the local DuckDB.
+
+    Returns ``None`` to defer to the legacy fleet-DB path if:
+      - the ``local_store`` module isn't importable
+      - the ``alert_rules`` table is empty (fresh install / no cloud sync)
+      - any unexpected error happens (we'd rather degrade than 500)
+
+    Tagged with ``_source: "local_store"`` so callers (browser, integration
+    tests, the cloud relay) can tell which path served them.
+    """
+    # Issue #1256: route through daemon HTTP proxy. Direct get_store()
+    # raises IOException on multi-process installs (DuckDB's file lock is
+    # exclusive across processes; read_only=True doesn't bypass it).
+    try:
+        from routes.local_query import local_store_via_daemon
+        rows = local_store_via_daemon("query_alert_rules", limit=500)
+        if rows is None:
+            # Daemon unreachable → single-process fallback (tests/dev mode).
+            from clawmetry import local_store
+            store = local_store.get_store(read_only=True)
+            rows = store.query_alert_rules(limit=500)
+    except Exception:
+        return None
+    # Issue #1265: an EMPTY result set is a successful local-store hit
+    # (user has no alert rules configured yet). Returning None here makes
+    # the handler fall through to the legacy fleet-DB path, which hangs
+    # ~3 s on this user's box. Return [] tagged with the local_store
+    # source instead — the dashboard JS handles an empty list cleanly.
+    return {"rules": rows or [], "_source": "local_store"}
 
 
 # ── Budget API Routes ───────────────────────────────────────────────────
@@ -121,6 +164,93 @@ def api_budget_resume():
     return jsonify({"ok": True, "paused": False})
 
 
+# ── Per-agent budget overrides (issue #951) ────────────────────────────
+
+
+@bp_budget.route("/api/budget", methods=["GET"])
+def api_budget_root():
+    """Unified GET — global config + per-agent overrides map.
+
+    Issue #951: the existing ``/api/budget/config`` keeps its shape so old
+    clients don't break; this new collapsed endpoint is convenient for the
+    Budget Settings page which renders both panels in one render.
+    """
+    import dashboard as _d
+    cfg = _d._get_budget_config()
+    overrides_list = _d._list_agent_budgets()
+    overrides = {
+        row.get("agent_id"): {
+            "daily_limit_usd": row.get("daily_limit_usd"),
+            "monthly_limit_usd": row.get("monthly_limit_usd"),
+            "updated_at": row.get("updated_at"),
+        }
+        for row in overrides_list
+        if row.get("agent_id")
+    }
+    return jsonify({"config": cfg, "agents": overrides})
+
+
+@bp_budget.route("/api/agents/<agent_id>/budget", methods=["GET"])
+def api_agent_budget_get(agent_id):
+    """Return one agent's effective budget + current MTD/daily spend.
+
+    Always returns 200 with a populated payload — when the agent has no
+    override row we still report the global limits with
+    ``daily_limit_source`` / ``monthly_limit_source`` of ``global``
+    (or ``none`` when no global is set either)."""
+    import dashboard as _d
+    return jsonify(_d._get_agent_budget_status(agent_id))
+
+
+@bp_budget.route("/api/agents/<agent_id>/budget", methods=["PUT"])
+def api_agent_budget_put(agent_id):
+    """Upsert a per-agent budget override row.
+
+    Body: ``{"daily_limit_usd": 5.0, "monthly_limit_usd": 100.0}``.
+    Either field may be omitted (or null) to fall back to global on that
+    side. Non-numeric inputs are rejected."""
+    import dashboard as _d
+    if not agent_id:
+        return jsonify({"ok": False, "error": "agent_id required"}), 400
+    data = request.get_json(silent=True) or {}
+    raw_daily = data.get("daily_limit_usd")
+    raw_monthly = data.get("monthly_limit_usd")
+
+    def _norm(v, name):
+        if v is None or v == "":
+            return None, None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None, f"{name} must be a number"
+        if f < 0:
+            return None, f"{name} must be >= 0"
+        return f, None
+
+    daily, err = _norm(raw_daily, "daily_limit_usd")
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    monthly, err = _norm(raw_monthly, "monthly_limit_usd")
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    ok = _d._set_agent_budget(
+        agent_id, daily_limit_usd=daily, monthly_limit_usd=monthly
+    )
+    if not ok:
+        return jsonify({"ok": False, "error": "local store unavailable"}), 500
+    return jsonify({"ok": True, "budget": _d._get_agent_budget_status(agent_id)})
+
+
+@bp_budget.route("/api/agents/<agent_id>/budget", methods=["DELETE"])
+def api_agent_budget_delete(agent_id):
+    """Remove the per-agent override row — agent falls back to global."""
+    import dashboard as _d
+    if not agent_id:
+        return jsonify({"ok": False, "error": "agent_id required"}), 400
+    deleted = _d._delete_agent_budget(agent_id)
+    return jsonify({"ok": True, "deleted": int(deleted)})
+
+
 @bp_budget.route("/api/budget/test-telegram", methods=["POST"])
 def api_budget_test_telegram():
     """Send a test Telegram notification using saved config."""
@@ -193,6 +323,13 @@ def api_alert_rules():
             db.commit()
             db.close()
         return jsonify({"ok": True, "id": rule_id})
+    # Phase 3 of #1032 — local DuckDB fast path. Opt-in via
+    # CLAWMETRY_LOCAL_STORE_READ=1; falls through to the legacy fleet-DB
+    # _get_alert_rules helper on miss / disabled flag.
+    if is_local_store_read_enabled():
+        fast = _try_local_store_alert_rules()
+        if fast is not None:
+            return jsonify(fast)
     return jsonify({"rules": _d._get_alert_rules()})
 
 
@@ -400,3 +537,81 @@ def api_alert_channels_test():
     if not sent:
         return jsonify({"ok": False, "error": "No configured webhook URL for selected target"}), 400
     return jsonify({"ok": True, "sent": sent})
+
+
+# ── Harness hook (gated) ────────────────────────────────────────────────
+# Used by scripts/accuracy_harness/alerts.py to inject a synthetic cost
+# entry into the in-process metrics_store AND trigger a single eval pass
+# without waiting the natural 60s budget-monitor tick. The dashboard's
+# alert evaluator reads metrics_store["cost"] (NOT DuckDB), which on
+# most installs is only populated by OTLP traffic — so verifying the
+# rule→fire→dispatch pipeline end-to-end requires either real OTLP or
+# this hook. Gated on CLAWMETRY_HARNESS_HOOKS=1 to keep it out of the
+# default surface.
+
+
+@bp_alerts.route("/api/_harness/inject-cost", methods=["POST"])
+def api_harness_inject_cost():
+    """Inject a synthetic cost entry + run one alert-eval pass.
+
+    Body: {"usd": <float>, "model": <str>, "provider": <str>}. Returns
+    the post-injection daily_spent and the alert-history count delta so
+    the harness can assert the rule fired without polling on a 60s loop.
+    """
+    if os.environ.get("CLAWMETRY_HARNESS_HOOKS", "") != "1":
+        return jsonify({"ok": False, "error": "harness hooks disabled "
+                        "(set CLAWMETRY_HARNESS_HOOKS=1 to enable)"}), 403
+    import dashboard as _d
+    data = request.get_json(silent=True) or {}
+    try:
+        usd = float(data.get("usd") or 0)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "usd must be a number"}), 400
+    if usd <= 0:
+        return jsonify({"ok": False, "error": "usd must be > 0"}), 400
+    model = str(data.get("model") or "harness-synthetic")
+    provider = str(data.get("provider") or "harness")
+    history_before = len(_d._get_alert_history(limit=500))
+    _d._add_metric("cost", {
+        "timestamp": time.time(),
+        "usd": usd,
+        "model": model,
+        "provider": provider,
+        "agent": "main",
+        "_harness": True,
+    })
+    # Force one synchronous alert-rule eval pass. The natural loop sleeps
+    # 60s; inlining the rule check avoids that wait. We bypass cooldown
+    # by clearing _budget_alert_cooldowns for any harness-tagged rule
+    # the caller created in this run — caller passes rule_ids to clear.
+    rule_ids_to_uncool = data.get("clear_cooldown_for") or []
+    if isinstance(rule_ids_to_uncool, list):
+        for rid in rule_ids_to_uncool:
+            _d._budget_alert_cooldowns.pop(str(rid), None)
+    status = _d._get_budget_status()
+    now = time.time()
+    rules_fired = []
+    for rule in _d._get_alert_rules():
+        if not rule.get("enabled"):
+            continue
+        if rule["type"] != "threshold":
+            continue
+        if status["daily_spent"] >= rule["threshold"]:
+            channels = json.loads(rule.get("channels", '["banner"]'))
+            cooldown = rule.get("cooldown_min", 30) * 60
+            last_fired = _d._budget_alert_cooldowns.get(rule["id"], 0)
+            if now - last_fired < cooldown:
+                continue
+            msg = (f"Daily spending ${status['daily_spent']:.2f} exceeded "
+                   f"threshold ${rule['threshold']:.2f}")
+            _d._fire_alert(rule_id=rule["id"], alert_type="threshold",
+                           message=msg, channels=channels)
+            rules_fired.append(rule["id"])
+    history_after = len(_d._get_alert_history(limit=500))
+    return jsonify({
+        "ok": True,
+        "daily_spent": status["daily_spent"],
+        "history_before": history_before,
+        "history_after": history_after,
+        "rules_fired": rules_fired,
+    })
