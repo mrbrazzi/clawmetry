@@ -8,7 +8,9 @@
 
 <a href="https://www.producthunt.com/products/clawmetry?embed=true&utm_source=badge-top-post-badge&utm_medium=badge&utm_campaign=badge-clawmetry-for-openclaw" target="_blank"><img src="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=1081207&theme=light&period=daily&t=1771491508782" alt="ClawMetry - #5 Product of the Day on Product Hunt" width="250" height="54" /></a>
 
-**See your agent think.** Real-time observability for [OpenClaw](https://github.com/openclaw/openclaw) AI agents.
+**See your agent think.** Real-time observability for **14 AI agent runtimes**: [OpenClaw](https://github.com/openclaw/openclaw), [NVIDIA NemoClaw](https://github.com/NVIDIA/NemoClaw), Claude Code, OpenAI Codex & 10 more. One dashboard for your whole agent fleet.
+
+> 🌐 **Read this in:** [English](README.md) · [简体中文](docs/i18n/zh-CN/README.md) · [日本語](docs/i18n/ja/README.md) · [한국어](docs/i18n/ko/README.md) · [Español](docs/i18n/es/README.md) · [Português (BR)](docs/i18n/pt-BR/README.md) · [Français](docs/i18n/fr/README.md) · [Deutsch](docs/i18n/de/README.md) · [हिन्दी](docs/i18n/hi/README.md) · [العربية](docs/i18n/ar/README.md) · [Русский](docs/i18n/ru/README.md) · [more →](docs/i18n/)
 
 One command. Zero config. Auto-detects everything.
 
@@ -20,6 +22,14 @@ Opens at **http://localhost:8900** and you're done.
 
 ![Flow Visualization](https://clawmetry.com/screenshots/flow.png)
 
+## Works with 14 agent runtimes
+
+ClawMetry started as observability for OpenClaw, and now meters your **whole agent fleet** in one dashboard, auto-detecting each runtime on your machine:
+
+🦞 **OpenClaw** · 🟩 **NVIDIA NemoClaw** · ◆ **Claude Code** · ⬡ **OpenAI Codex** · **Cursor** · 🪿 **Goose** · ⚡ **Hermes** · **opencode** · ◈ **Qwen Code** · **Aider** · **NanoClaw** · **PicoClaw** · **Pi** · **Deep Agents**
+
+OpenClaw and NemoClaw are free in the open-source app; the other runtimes light up with ClawMetry Cloud or a self-hosted Pro license. Switch runtimes from the header and every tab — cost, tokens, tools, traces — re-scopes to that runtime.
+
 ## What You Get
 
 - **Flow** — Live animated diagram showing messages flowing through channels, brain, tools, and back
@@ -30,6 +40,8 @@ Opens at **http://localhost:8900** and you're done.
 - **Logs** — Color-coded real-time log streaming
 - **Memory** — Browse SOUL.md, MEMORY.md, AGENTS.md, daily notes
 - **Transcripts** — Chat-bubble UI for reading session histories
+- **Alerts** — Budget caps, error-rate triggers, agent-offline detection; routes to Slack, Discord, PagerDuty, Telegram, Email
+- **Approvals** — Gate destructive deletes, force pushes, DB mutations, sudo, package installs, network calls behind one-click sign-off
 
 ## Screenshots
 
@@ -51,6 +63,12 @@ Opens at **http://localhost:8900** and you're done.
 ### 🔐 Security — Posture & audit log
 ![Security tab](https://raw.githubusercontent.com/vivekchand/clawmetry/main/screenshots/security.png)
 
+### 🚨 Alerts — Budget caps, error-rate triggers, webhooks to Slack / Discord / PagerDuty / Email
+![Alerts tab](https://raw.githubusercontent.com/vivekchand/clawmetry/main/screenshots/alerts.png)
+
+### ✋ Approvals — Gate risky tool calls behind manual sign-off; policy-backed protection rules
+![Approvals tab](https://raw.githubusercontent.com/vivekchand/clawmetry/main/screenshots/approvals.png)
+
 ## Install
 
 **One-liner (recommended):**
@@ -69,6 +87,103 @@ clawmetry
 git clone https://github.com/vivekchand/clawmetry.git
 cd clawmetry && pip install flask && python3 dashboard.py
 ```
+
+## v2 Frontend Development
+
+The v2 React app lives in `frontend/` and is served at `/v2` when the Flask
+server is started with v2 enabled.
+
+Use two terminals while developing:
+
+```bash
+# Terminal 1: Flask API/server on :8900
+CLAWMETRY_V2=1 python3 dashboard.py
+```
+
+```bash
+# Terminal 2: Vite dev server on :5173
+cd frontend
+nvm use
+npm ci
+npm run dev
+```
+
+Open `http://localhost:5173/v2/`. Vite proxies `/api` requests to
+`http://localhost:8900`, so the React app can talk to the local Flask server
+without extra CORS setup.
+
+To build the bundle that ships with the Python package:
+
+```bash
+cd frontend
+npm run build
+```
+
+The production bundle is written to `clawmetry/static/v2/dist/`.
+
+## Runtime / Agent Compatibility
+
+ClawMetry observes many AI-agent runtimes, not just OpenClaw. Each non-OpenClaw runtime ships a dedicated reader adapter that translates its native session format into ClawMetry's unified shapes; the daemon ingests them into the same DuckDB store + cloud snapshot, tagged with the runtime, and the Session replay tab shows a **runtime switcher** when more than one is present. See [`docs/compatibility.md`](docs/compatibility.md) for the full matrix + a guide to adding runtimes, and [`docs/RUNTIME_FAMILY.md`](docs/RUNTIME_FAMILY.md) for the OpenClaw-family primer.
+
+| Runtime / Agent | Status | Notes |
+|---|---|---|
+| **OpenClaw** | Native | Reference runtime, auto-detected |
+| **PicoClaw** | Beta adapter | Flat `providers.Message` JSONL (`~/.picoclaw/workspace/sessions`). Transcripts, model, tool calls. |
+| **NanoClaw** | Beta adapter | Per-session SQLite (`data/v2-sessions`). Transcripts + message counts. |
+| **Hermes** | Beta adapter | SQLite `~/.hermes/state.db`. Transcripts, model, tokens/cost. |
+| **Claude Code** | Beta adapter | JSONL `~/.claude/projects/.../<id>.jsonl`. Transcripts, model, tool calls + thinking, token usage. |
+| **Codex** | Beta adapter | Rollout JSONL `~/.codex/sessions/...`. Transcripts, model, tool calls, token usage. |
+| **Cursor** | Beta adapter | SQLite `state.vscdb`. Chat/composer transcripts, model. |
+| **Aider** | Beta adapter | `.aider.chat.history.md` per project. Transcripts, model, token counts. |
+| **Goose** | Beta adapter | SQLite `~/.local/share/goose`. Transcripts, model, tool calls, token totals. |
+| **opencode** | Beta adapter | SQLite `~/.local/share/opencode`. Transcripts, model, tool calls, tokens + cost. |
+| **Qwen Code** | Beta adapter | JSONL `~/.qwen/projects/.../chats`. Transcripts, model, tool calls, token usage. |
+| **Pi** | Beta adapter | JSONL `~/.pi/agent/sessions`. Transcripts, model, tool calls, tokens + cost. |
+| **Deep Agents** | Beta adapter | SQLite `~/.deepagents/.state/sessions.db`. Transcripts, model, tool calls, tokens + cost. |
+
+"Beta adapter" means ClawMetry ships a reader for that runtime's real on-disk format, each built + verified against a real install on a real machine (see `tests/fixtures/runtimes/<rt>/`). Adapters are read-only; each is honest about what its runtime actually stores (e.g. PicoClaw/NanoClaw/Cursor don't write token cost to disk). When several runtimes run on one node, the runtime switcher scopes the sessions view to one for a clean deep-dive.
+
+## Track any SDK agent — out-loop cost attribution
+
+The runtimes above all write sessions to disk. Your own **production agent** — the one you built on the OpenAI Agents SDK, LangChain, the Vercel AI SDK, LlamaIndex, E2B, or a plain `httpx` loop — doesn't. ClawMetry's zero-config interceptor still captures its LLM calls (cost, tokens, latency, errors) by monkey-patching `httpx`/`requests`:
+
+```python
+import clawmetry.track            # activate the interceptor
+clawmetry.track.set_source("support-agent")   # name this product
+
+# ...your agent runs as normal; every LLM call is now tracked + attributed.
+```
+
+`set_source()` (or the `CLAWMETRY_SOURCE=support-agent` env var) tags each call with a **named source**, so every product you run shows up as its own first-class, cost-attributable line in the dashboard's **🔌 Out-loop sources** card on Overview — calls, providers, latency, error rate per agent. No source set? The calls are still tracked; the card just stays hidden.
+
+```bash
+CLAWMETRY_SOURCE=billing-agent python my_agent.py
+```
+
+This is the same data layer the runtime adapters feed (DuckDB → cloud snapshot), so out-loop sources sync to the cloud dashboard the same as everything else, E2E-encrypted.
+
+## OpenTelemetry — vendor-neutral, send your traces anywhere
+
+ClawMetry speaks **OpenTelemetry** in both directions, using the **GenAI semantic conventions**, so your agent traces are never locked into one tool.
+
+**Export** every session — LLM calls, tools, sub-agents, tokens, cost — as OTLP/HTTP GenAI spans to any collector (Datadog, Grafana, Honeycomb, or your own OTel Collector):
+
+```bash
+clawmetry --otel-export http://localhost:4318/v1/traces
+# equivalently:
+CLAWMETRY_OTEL_EXPORT_ENDPOINT=http://localhost:4318/v1/traces clawmetry
+```
+
+Auth headers and poll interval are optional env vars:
+
+```bash
+CLAWMETRY_OTEL_EXPORT_HEADERS='{"X-API-Key":"…"}'   # extra HTTP headers
+CLAWMETRY_OTEL_EXPORT_INTERVAL=60                    # seconds (default 60)
+```
+
+**Ingest** — the built-in OTLP receiver accepts traces and metrics from anything else at `/v1/traces` and `/v1/metrics` (`pip install clawmetry[otel]` for protobuf ingest).
+
+You get the zero-config, local-first ClawMetry dashboard **and** your data in whatever backend your team already runs — no lock-in, no second agent to install.
 
 ## Configuration
 
@@ -127,7 +242,7 @@ docker build -t clawmetry .
 # Run with default settings
 docker run -p 8900:8900 clawmetry
 
-# Or with your OpenClaw workspace mounted
+# Or mount your agent's data dir (shown: OpenClaw's ~/.openclaw)
 docker run -p 8900:8900 \
   -v ~/.openclaw:/root/.openclaw \
   -v /tmp/moltbot:/tmp/moltbot \
@@ -149,13 +264,13 @@ services:
     restart: unless-stopped
 ```
 
-> **Note:** When running in Docker, make sure to mount your OpenClaw workspace and log directories so ClawMetry can auto-detect your setup.
+> **Note:** When running in Docker, mount your agent's data + log directories (e.g. `~/.openclaw`, `~/.claude`, `~/.codex`) so ClawMetry can auto-detect your setup.
 
 ## Requirements
 
 - Python 3.8+
 - Flask (installed automatically via pip)
-- OpenClaw running on the same machine (or mounted volumes for Docker)
+- An AI agent runtime on the same machine: OpenClaw, NVIDIA NemoClaw, Claude Code, Codex, Cursor, Goose, Hermes, opencode, Qwen Code, Aider, NanoClaw, PicoClaw, Pi, or Deep Agents (or mounted volumes for Docker)
 - Linux or macOS
 
 ## NemoClaw / OpenShell Support

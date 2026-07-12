@@ -1,0 +1,450 @@
+"""Tests for the ``/api/entitlement`` endpoint (``routes/entitlement.py``).
+
+Validates the JSON shape, grace/enforced flag round-trip, per-tier runtime
+list, and the ``is_paid`` flag under each representative paid tier — so the
+dashboard's entitlement consumer never receives a surprise null or stale shape.
+
+Complements ``tests/test_routes_runtimes.py`` which covers ``/api/runtimes``.
+"""
+from __future__ import annotations
+
+import importlib
+import json
+
+import pytest
+from flask import Flask
+
+
+@pytest.fixture
+def client(monkeypatch, tmp_path):
+    """Flask test client wired with bp_entitlement and a clean HOME."""
+    monkeypatch.delenv("CLAWMETRY_ENFORCE", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import clawmetry.entitlements as e
+
+    importlib.reload(e)
+    e.invalidate()
+
+    from routes.entitlement import bp_entitlement
+
+    app = Flask(__name__)
+    app.register_blueprint(bp_entitlement)
+    return app.test_client(), tmp_path
+
+
+# ── shape invariants ──────────────────────────────────────────────────────────
+
+
+def test_api_entitlement_shape_grace(client):
+    c, _ = client
+    resp = c.get("/api/entitlement")
+    assert resp.status_code == 200
+    d = resp.get_json()
+    for key in ("tier", "source", "grace", "enforced", "is_paid",
+                "retention_days", "runtimes", "features", "all_runtimes"):
+        assert key in d, key
+    assert isinstance(d["runtimes"], list)
+    assert isinstance(d["features"], list)
+    assert isinstance(d["all_runtimes"], list)
+
+
+@pytest.mark.parametrize(
+    "plan,expected",
+    [
+        ("cloud_starter", 30),
+        ("cloud_pro", 90),
+        ("enterprise", None),
+    ],
+)
+def test_api_entitlement_retention_days_matches_tier(monkeypatch, tmp_path, plan, expected):
+    """``/api/entitlement`` carries the per-tier retention cap so the
+    dashboard can render "we are keeping N days" without re-deriving the
+    table client-side. Enterprise comes back as JSON ``null`` (= unlimited /
+    custom). Pinned alongside the in-process ``to_dict`` test so an accidental
+    desync between the method, the dict, and the HTTP shape fails loudly."""
+    monkeypatch.delenv("CLAWMETRY_ENFORCE", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import clawmetry.entitlements as e
+    importlib.reload(e)
+    e.invalidate()
+
+    cache = tmp_path / ".clawmetry" / "cloud_plan.json"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({"plan": plan, "node_limit": 1, "expiry": None}))
+
+    from routes.entitlement import bp_entitlement
+    app = Flask(__name__)
+    app.register_blueprint(bp_entitlement)
+    d = app.test_client().get("/api/entitlement").get_json()
+
+    assert d["tier"] == plan
+    assert d["retention_days"] == expected
+
+
+def test_api_entitlement_retention_days_oss_default(client):
+    """OSS-free surfaces ``retention_days == 7`` — the same value the
+    never-raise fallback hard-codes, so a resolver failure can't silently
+    flip the surfaced cap."""
+    c, _ = client
+    d = c.get("/api/entitlement").get_json()
+    assert d["retention_days"] == 7
+
+
+def test_api_entitlement_effective_retention_reflects_env_override(monkeypatch, tmp_path):
+    """``CLAWMETRY_RETENTION_DAYS`` shrinks the *effective* retention surfaced
+    on /api/entitlement without touching the tier cap. Pins the HTTP contract
+    the dashboard reads when it renders "we are keeping N days" — the prune
+    loop reads the same value, so this guards them staying in lockstep."""
+    monkeypatch.delenv("CLAWMETRY_ENFORCE", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CLAWMETRY_RETENTION_DAYS", "2")
+    import clawmetry.entitlements as e
+    importlib.reload(e)
+    e.invalidate()
+
+    from routes.entitlement import bp_entitlement
+    app = Flask(__name__)
+    app.register_blueprint(bp_entitlement)
+    d = app.test_client().get("/api/entitlement").get_json()
+
+    assert d["retention_days"] == 7              # tier cap untouched
+    assert d["effective_retention_days"] == 2    # env override shrinks effective
+
+
+def test_api_entitlement_grace_defaults(client):
+    c, _ = client
+    d = c.get("/api/entitlement").get_json()
+    assert d["grace"] is True
+    assert d["enforced"] is False
+    assert d["is_paid"] is False
+    assert d["tier"] == "oss"
+    # OSS tier: runtimes lists the entitled set (FREE_RUNTIMES); all_runtimes
+    # is the full catalog.  In grace mode every runtime is *allowed* (via
+    # allows_runtime), but the runtimes field reflects the tier's grant.
+    import clawmetry.entitlements as e
+    assert set(d["runtimes"]) == set(e.FREE_RUNTIMES)
+    assert set(d["all_runtimes"]) == set(e.ALL_RUNTIMES)
+
+
+def test_api_entitlement_grace_enforced_are_inverse(client):
+    """grace and enforced must always be exact inverses — the frontend uses
+    both and breaking this causes half the UI to show the wrong lock state."""
+    c, _ = client
+    d = c.get("/api/entitlement").get_json()
+    assert d["grace"] == (not d["enforced"])
+
+
+# ── enforce mode ─────────────────────────────────────────────────────────────
+
+
+def test_api_entitlement_enforced_oss_grace_false(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAWMETRY_ENFORCE", "1")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import clawmetry.entitlements as e
+    importlib.reload(e)
+    e.invalidate()
+
+    from routes.entitlement import bp_entitlement
+    app = Flask(__name__)
+    app.register_blueprint(bp_entitlement)
+    d = app.test_client().get("/api/entitlement").get_json()
+
+    assert d["grace"] is False
+    assert d["enforced"] is True
+    assert d["is_paid"] is False
+    # In enforced OSS, only free runtimes are available.
+    assert set(d["runtimes"]) == set(e.FREE_RUNTIMES)
+    assert d["grace"] == (not d["enforced"])
+
+
+# ── paid tiers ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("tier", ["trial", "pro", "cloud_pro"])
+def test_api_entitlement_paid_tier_grants_all_runtimes(monkeypatch, tmp_path, tier):
+    """Subscribers on trial / pro / cloud_pro get is_paid=True and all runtimes
+    in the runtimes list even with enforcement on."""
+    monkeypatch.setenv("CLAWMETRY_ENFORCE", "1")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import clawmetry.entitlements as e
+    importlib.reload(e)
+    e.invalidate()
+
+    cache = tmp_path / ".clawmetry" / "cloud_plan.json"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({"plan": tier, "node_limit": 1, "expiry": None}))
+
+    from routes.entitlement import bp_entitlement
+    app = Flask(__name__)
+    app.register_blueprint(bp_entitlement)
+    d = app.test_client().get("/api/entitlement").get_json()
+
+    assert d["tier"] == tier
+    assert d["is_paid"] is True
+    assert d["grace"] is False
+    assert d["grace"] == (not d["enforced"])
+    # All paid runtimes must be present.
+    for rt in e.PAID_RUNTIMES:
+        assert rt in d["runtimes"], f"{tier}: {rt} missing from runtimes"
+
+
+# ── tier_label on /api/entitlement ──────────────────────────────────────────
+
+
+def test_api_entitlement_carries_tier_label(client):
+    """The payload includes a human-readable label alongside the tier id so
+    the dashboard's tier badge can render without a duplicate JS map."""
+    c, _ = client
+    d = c.get("/api/entitlement").get_json()
+    assert d["tier"] == "oss"
+    assert d["tier_label"] == "OSS"
+
+
+# ── refresh endpoint ──────────────────────────────────────────────────────────
+
+
+def test_api_entitlement_refresh_grace_shape(client):
+    """POST /api/entitlement/refresh returns the same shape as GET when no
+    license/cloud plan is present, and never raises on a clean HOME."""
+    c, _ = client
+    resp = c.post("/api/entitlement/refresh")
+    assert resp.status_code == 200
+    d = resp.get_json()
+    for key in ("tier", "source", "grace", "enforced", "is_paid",
+                "runtimes", "features"):
+        assert key in d, key
+    assert d["tier"] == "oss"
+    assert d["grace"] is True
+    assert d["enforced"] is False
+    assert d["grace"] == (not d["enforced"])
+
+
+def test_api_entitlement_refresh_busts_cache(monkeypatch, tmp_path):
+    """Refresh must pick up a cloud_plan.json that was written *after* the
+    first GET populated the cache, without waiting for the 60 s TTL."""
+    monkeypatch.delenv("CLAWMETRY_ENFORCE", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import clawmetry.entitlements as e
+    importlib.reload(e)
+    e.invalidate()
+
+    from routes.entitlement import bp_entitlement
+    app = Flask(__name__)
+    app.register_blueprint(bp_entitlement)
+    client_ = app.test_client()
+
+    first = client_.get("/api/entitlement").get_json()
+    assert first["tier"] == "oss"
+    assert first["source"] == "oss"
+
+    cache = tmp_path / ".clawmetry" / "cloud_plan.json"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({"plan": "cloud_pro", "node_limit": 5,
+                                 "expiry": None}))
+
+    # GET still returns the cached OSS result -- TTL hasn't elapsed.
+    stale = client_.get("/api/entitlement").get_json()
+    assert stale["tier"] == "oss"
+
+    refreshed = client_.post("/api/entitlement/refresh").get_json()
+    assert refreshed["tier"] == "cloud_pro"
+    assert refreshed["source"] == "cloud"
+    assert refreshed["is_paid"] is True
+
+
+def test_api_entitlement_refresh_idempotent(client):
+    """Repeated refresh calls return identical shapes -- refresh must be safe
+    to spam from a dashboard timer / connect-flow retry loop."""
+    c, _ = client
+    a = c.post("/api/entitlement/refresh").get_json()
+    b = c.post("/api/entitlement/refresh").get_json()
+    assert a == b
+
+
+# ── upgrade-diff endpoint ────────────────────────────────────────────────────
+
+
+def test_api_upgrade_diff_oss_to_cloud_pro(client):
+    c, _ = client
+    resp = c.get("/api/entitlement/upgrade-diff?target=cloud_pro")
+    assert resp.status_code == 200
+    d = resp.get_json()
+    assert d["target"] == "cloud_pro"
+    import clawmetry.entitlements as e
+    assert set(d["added_features"]) == set(e.PAID_FEATURES)
+    assert set(d["added_runtimes"]) == set(e.PAID_RUNTIMES)
+    assert d["added_features"] == sorted(d["added_features"])
+    assert d["added_runtimes"] == sorted(d["added_runtimes"])
+
+
+def test_api_upgrade_diff_unknown_target_is_empty_not_500(client):
+    c, _ = client
+    resp = c.get("/api/entitlement/upgrade-diff?target=nope")
+    assert resp.status_code == 200
+    d = resp.get_json()
+    assert d["target"] == "nope"
+    assert d["added_features"] == []
+    assert d["added_runtimes"] == []
+
+
+def test_api_upgrade_diff_missing_target_is_empty(client):
+    c, _ = client
+    resp = c.get("/api/entitlement/upgrade-diff")
+    assert resp.status_code == 200
+    d = resp.get_json()
+    assert d["added_features"] == []
+    assert d["added_runtimes"] == []
+
+
+def test_api_upgrade_diff_case_insensitive(client):
+    c, _ = client
+    a = c.get("/api/entitlement/upgrade-diff?target=cloud_pro").get_json()
+    b = c.get("/api/entitlement/upgrade-diff?target=CLOUD_PRO").get_json()
+    assert a["added_features"] == b["added_features"]
+    assert a["added_runtimes"] == b["added_runtimes"]
+
+
+@pytest.mark.parametrize("tier,expected_runtime_diff", [
+    ("cloud_starter", "paid"),
+    ("cloud_pro", "paid"),
+    ("enterprise", "paid"),
+])
+def test_api_upgrade_diff_paid_tiers_all_unlock_paid_runtimes(client, tier,
+                                                               expected_runtime_diff):
+    c, _ = client
+    d = c.get(f"/api/entitlement/upgrade-diff?target={tier}").get_json()
+    import clawmetry.entitlements as e
+    assert set(d["added_runtimes"]) == set(e.PAID_RUNTIMES)
+
+
+def test_api_upgrade_diff_starter_subscriber_to_pro(monkeypatch, tmp_path):
+    """A Starter subscriber asking for Pro should only see PRO_ONLY features."""
+    monkeypatch.delenv("CLAWMETRY_ENFORCE", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import clawmetry.entitlements as e
+    importlib.reload(e)
+    e.invalidate()
+
+    cache = tmp_path / ".clawmetry" / "cloud_plan.json"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({"plan": "cloud_starter", "node_limit": 1,
+                                 "expiry": None}))
+
+    from routes.entitlement import bp_entitlement
+    app = Flask(__name__)
+    app.register_blueprint(bp_entitlement)
+    d = app.test_client().get("/api/entitlement/upgrade-diff?target=cloud_pro").get_json()
+
+    assert set(d["added_features"]) == set(e.PRO_ONLY_FEATURES)
+    assert d["added_runtimes"] == []
+
+
+# ── downgrade-diff endpoint ──────────────────────────────────────────────────
+
+
+def _client_for_plan(monkeypatch, tmp_path, plan):
+    """Helper -- build a Flask test client for an install on ``plan``."""
+    monkeypatch.delenv("CLAWMETRY_ENFORCE", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import clawmetry.entitlements as e
+    importlib.reload(e)
+    e.invalidate()
+    cache = tmp_path / ".clawmetry" / "cloud_plan.json"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({"plan": plan, "node_limit": 1, "expiry": None}))
+    from routes.entitlement import bp_entitlement
+    app = Flask(__name__)
+    app.register_blueprint(bp_entitlement)
+    return app.test_client(), e
+
+
+def test_api_downgrade_diff_pro_to_starter(monkeypatch, tmp_path):
+    c, e = _client_for_plan(monkeypatch, tmp_path, "cloud_pro")
+    resp = c.get("/api/entitlement/downgrade-diff?target=cloud_starter")
+    assert resp.status_code == 200
+    d = resp.get_json()
+    assert d["target"] == "cloud_starter"
+    assert set(d["lost_features"]) == set(e.PRO_ONLY_FEATURES)
+    assert d["lost_runtimes"] == []
+    assert d["lost_features"] == sorted(d["lost_features"])
+    assert d["lost_runtimes"] == sorted(d["lost_runtimes"])
+
+
+def test_api_downgrade_diff_pro_to_oss_loses_all_paid(monkeypatch, tmp_path):
+    """Enforce-flip preview: Pro -> OSS removes every paid feature and every
+    paid runtime in one shot. The dashboard renders this as the "you'll lose
+    these when grace ends" panel."""
+    c, e = _client_for_plan(monkeypatch, tmp_path, "cloud_pro")
+    d = c.get("/api/entitlement/downgrade-diff?target=oss").get_json()
+    assert set(d["lost_features"]) == set(e.PAID_FEATURES)
+    assert set(d["lost_runtimes"]) == set(e.PAID_RUNTIMES)
+
+
+def test_api_downgrade_diff_unknown_target_is_empty_not_500(client):
+    c, _ = client
+    resp = c.get("/api/entitlement/downgrade-diff?target=nope")
+    assert resp.status_code == 200
+    d = resp.get_json()
+    assert d["target"] == "nope"
+    assert d["lost_features"] == []
+    assert d["lost_runtimes"] == []
+
+
+def test_api_downgrade_diff_missing_target_is_empty(client):
+    c, _ = client
+    resp = c.get("/api/entitlement/downgrade-diff")
+    assert resp.status_code == 200
+    d = resp.get_json()
+    assert d["lost_features"] == []
+    assert d["lost_runtimes"] == []
+
+
+def test_api_downgrade_diff_case_insensitive(monkeypatch, tmp_path):
+    c, _ = _client_for_plan(monkeypatch, tmp_path, "cloud_pro")
+    a = c.get("/api/entitlement/downgrade-diff?target=cloud_starter").get_json()
+    b = c.get("/api/entitlement/downgrade-diff?target=CLOUD_STARTER").get_json()
+    assert a["lost_features"] == b["lost_features"]
+    assert a["lost_runtimes"] == b["lost_runtimes"]
+
+
+def test_api_downgrade_diff_from_oss_is_empty(client):
+    """An OSS-free install has nothing paid to lose; every target tier returns
+    empty lists."""
+    c, _ = client
+    for target in ("oss", "cloud_free", "cloud_starter", "cloud_pro", "enterprise"):
+        d = c.get(f"/api/entitlement/downgrade-diff?target={target}").get_json()
+        assert d["lost_features"] == [], target
+        assert d["lost_runtimes"] == [], target
+
+
+# ── grace countdown ───────────────────────────────────────────────────────────
+
+
+def test_api_entitlement_enforce_at_keys_unset(client):
+    """Always present on /api/entitlement so frontend can read them without
+    a feature-detect; unset means all three are null."""
+    c, _ = client
+    d = c.get("/api/entitlement").get_json()
+    for key in ("enforce_at", "enforce_at_iso", "days_until_enforce"):
+        assert key in d, key
+        assert d[key] is None
+
+
+def test_api_entitlement_enforce_at_surfaced(monkeypatch, tmp_path):
+    monkeypatch.delenv("CLAWMETRY_ENFORCE", raising=False)
+    monkeypatch.setenv("CLAWMETRY_ENFORCE_AT", "2099-01-01T00:00:00Z")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import clawmetry.entitlements as e
+    importlib.reload(e)
+    e.invalidate()
+
+    from routes.entitlement import bp_entitlement
+    app = Flask(__name__)
+    app.register_blueprint(bp_entitlement)
+    d = app.test_client().get("/api/entitlement").get_json()
+    assert d["enforce_at"] is not None
+    assert d["enforce_at_iso"] == "2099-01-01T00:00:00Z"
+    assert isinstance(d["days_until_enforce"], int)
+    assert d["days_until_enforce"] > 0
+    assert d["grace"] is True
+    assert d["enforced"] is False

@@ -36,6 +36,43 @@ from clawmetry.config import is_local_store_read_enabled
 bp_crons = Blueprint('crons', __name__)
 
 
+# ── v3 cron writes via the openclaw CLI ─────────────────────────────────────
+# OpenClaw v3 removed the ``cron`` tool from the gateway's ``/tools/invoke``
+# surface ("Tool not available: cron"), and ClawMetry's gateway token is
+# ``operator.read`` only — so the legacy ``_gw_invoke("cron", {...})`` path is
+# dead for every mutation (it just 502s). The v3-correct path is the
+# ``openclaw cron`` CLI (talks to the Gateway scheduler with OpenClaw's own
+# creds). ``clawmetry.sync.run_openclaw_cron`` shells to it with an augmented
+# PATH and classifies the gateway's scope-approval rejection. These helpers
+# translate the dashboard's schedule dict into CLI flags and shape a uniform
+# HTTP response (incl. a 409 + actionable message when a device scope upgrade
+# is pending).
+
+def _schedule_to_cron_cli_args(schedule):
+    """Thin wrapper over the canonical translator in clawmetry.sync so the
+    daemon relay action and these HTTP handlers share one implementation."""
+    from clawmetry.sync import cron_schedule_to_cli_args
+    return cron_schedule_to_cli_args(schedule)
+
+
+def _cron_cli_response(res, success_msg):
+    """Shape a ``run_openclaw_cron`` result into a Flask (json, status) tuple.
+
+    - success            -> 200 {ok:true, message, result}
+    - scope upgrade gate  -> 409 {ok:false, error, scope_pending:true} so the
+                             UI can show "approve the device pairing" rather
+                             than a scary 502.
+    - everything else     -> 502 {ok:false, error}
+    """
+    if res.get("ok"):
+        return jsonify({"ok": True, "message": success_msg,
+                        "result": res.get("result")}), 200
+    if res.get("scope_pending"):
+        return jsonify({"ok": False, "scope_pending": True,
+                        "error": res.get("error", "")}), 409
+    return jsonify({"ok": False, "error": res.get("error") or "cron command failed"}), 502
+
+
 # ── Local DuckDB fast path (epic #964 phase 4 — Crons tab) ──────────────────
 #
 # Opt-in via CLAWMETRY_LOCAL_STORE_READ=1. Mirrors the same pattern used by
@@ -121,6 +158,8 @@ def _row_to_cron_job(row):
     for k in (
         "lastDurationMs", "consecutiveFailures", "lastError",
         "runHistory", "lastCostUsd",
+        # on-exit trigger / detached-run metadata (openclaw #92037 / #98755)
+        "watchedCommand", "lastExitCode", "targetSessionId", "detachedAt",
     ):
         if k in extras:
             state_extras[k] = extras[k]
@@ -155,7 +194,8 @@ def _row_to_cron_job(row):
     for k, v in extras.items():
         if k not in {"createdAtMs", "schedule", "lastDurationMs",
                      "consecutiveFailures", "lastError", "runHistory",
-                     "lastCostUsd"}:
+                     "lastCostUsd",
+                     "watchedCommand", "lastExitCode", "targetSessionId", "detachedAt"}:
             job.setdefault(k, v)
     return job
 
@@ -448,19 +488,87 @@ def api_crons():
 
 @bp_crons.route("/api/cron/fix", methods=["POST"])
 def api_cron_fix():
+    """Dispatch the AI agent to fix a failing cron job.
+
+    Used to be a stub ("Fix request submitted" toast, TODO). Now actually
+    fires: shells to `openclaw agent` in a background thread (OpenClaw's own
+    creds — same escape hatch as Self-Evolve's Fix), giving the agent the
+    cron's name, schedule, lastError, and a clear instruction to investigate
+    + fix. The agent's output lands in its own session, visible in the user's
+    Brain feed and Session replay.
+
+    Returns 202 immediately so the dashboard can show "agent working on it"
+    without blocking on a ~30s agent turn.
+    """
     import dashboard as _d
     data = request.get_json(silent=True) or {}
     job_id = data.get("jobId", "")
     if not job_id:
         return jsonify({"error": "Missing jobId"}), 400
-    # Find the job name for context
-    job_name = job_id
-    for j in _d._get_crons():
+    # Locate the job for context — name, schedule, lastError.
+    job = None
+    for j in _d._get_crons() or []:
         if j.get("id") == job_id:
-            job_name = j.get("name", job_id)
+            job = j
             break
-    # TODO: integrate with AI agent messaging system
-    return jsonify({"ok": True, "message": f'Fix request submitted for "{job_name}"'})
+    if not job:
+        return jsonify({"error": "Unknown jobId"}), 404
+    name = job.get("name", job_id)
+    sched = job.get("schedule", {})
+    state = job.get("state", {}) if isinstance(job.get("state"), dict) else {}
+    last_err = (state.get("lastError") or job.get("lastError") or "").strip()
+    consecutive = state.get("consecutiveFailures") or 0
+
+    # Build the agent message.
+    import json as _json
+    msg = (
+        "You are ClawMetry Cron-Fix in REPAIR mode. A scheduled job is "
+        "failing repeatedly. Investigate the failure and apply a concrete "
+        "fix using your tools (edit OpenClaw config, adjust the cron's "
+        "prompt/channel/model/schedule, fix the target's credentials, …).\n\n"
+        "Job: " + name + " (id " + str(job_id) + ")\n"
+        "Schedule: " + _json.dumps(sched) + "\n"
+        "Consecutive failures: " + str(consecutive) + "\n"
+        "Last error: " + (last_err or "(none recorded)") + "\n\n"
+        "Make the concrete change. End with a one-line summary that starts "
+        "with 'DONE:' describing exactly what you changed."
+    )
+
+    # Fire-and-forget dispatch on a daemon thread so the dashboard isn't
+    # blocked on the agent turn. The agent's session shows up live in Brain.
+    import threading, subprocess, os
+    from clawmetry.sync import _resolve_openclaw_bin
+    binp = _resolve_openclaw_bin()
+    if not binp:
+        return jsonify({"ok": False,
+                        "error": "openclaw CLI not found on this machine"}), 502
+
+    def _run():
+        env = dict(os.environ)
+        node_dirs = [
+            os.path.dirname(binp),
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            os.path.expanduser("~/.local/bin"),
+        ]
+        env["PATH"] = os.pathsep.join(node_dirs + [env.get("PATH", "/usr/bin:/bin")])
+        try:
+            # Stable session id so repeated Fix clicks on the same cron land
+            # in one conversation (the agent has context from prior attempts).
+            sid = "clawmetry-cron-fix-" + str(job_id)[:24]
+            subprocess.run(
+                [binp, "agent", "--session-id", sid,
+                 "--message", msg, "--json", "--timeout", "300"],
+                capture_output=True, text=True, timeout=330, env=env,
+            )
+        except Exception:
+            pass  # never raise from worker; user sees outcome in Brain feed
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({
+        "ok": True,
+        "message": 'Fix dispatched. Agent is working on "%s" — '
+                   "watch the Brain feed for progress." % name,
+    }), 202
 
 
 @bp_crons.route("/api/cron/run", methods=["POST"])
@@ -474,10 +582,9 @@ def api_cron_run():
         return jsonify(
             {"error": "Auto-pause active: refusing new session starts", "paused": True}
         ), 429
-    result = _d._gw_invoke("cron", {"action": "run", "jobId": job_id})
-    if result is None:
-        return jsonify({"error": "Gateway unavailable"}), 502
-    return jsonify({"ok": True, "message": "Job triggered", "result": result})
+    from clawmetry.sync import run_openclaw_cron
+    res = run_openclaw_cron("run", [str(job_id)])
+    return _cron_cli_response(res, "Job triggered")
 
 
 @bp_crons.route("/api/cron/toggle", methods=["POST"])
@@ -488,14 +595,10 @@ def api_cron_toggle():
     enabled = data.get("enabled", True)
     if not job_id:
         return jsonify({"error": "Missing jobId"}), 400
-    result = _d._gw_invoke(
-        "cron", {"action": "update", "jobId": job_id, "patch": {"enabled": enabled}}
-    )
-    if result is None:
-        return jsonify({"error": "Gateway unavailable"}), 502
-    return jsonify(
-        {"ok": True, "message": "Job enabled" if enabled else "Job disabled"}
-    )
+    from clawmetry.sync import run_openclaw_cron
+    # v3 CLI has dedicated enable/disable subcommands.
+    res = run_openclaw_cron("enable" if enabled else "disable", [str(job_id)])
+    return _cron_cli_response(res, "Job enabled" if enabled else "Job disabled")
 
 
 @bp_crons.route("/api/cron/delete", methods=["POST"])
@@ -505,10 +608,9 @@ def api_cron_delete():
     job_id = data.get("jobId", "")
     if not job_id:
         return jsonify({"error": "Missing jobId"}), 400
-    result = _d._gw_invoke("cron", {"action": "remove", "jobId": job_id})
-    if result is None:
-        return jsonify({"error": "Gateway unavailable"}), 502
-    return jsonify({"ok": True, "message": "Job deleted"})
+    from clawmetry.sync import run_openclaw_cron
+    res = run_openclaw_cron("rm", [str(job_id)])
+    return _cron_cli_response(res, "Job deleted")
 
 
 @bp_crons.route("/api/cron/update", methods=["POST"])
@@ -521,10 +623,30 @@ def api_cron_update():
         return jsonify({"error": "Missing jobId"}), 400
     if not patch:
         return jsonify({"error": "Missing patch"}), 400
-    result = _d._gw_invoke("cron", {"action": "update", "jobId": job_id, "patch": patch})
-    if result is None:
-        return jsonify({"error": "Gateway unavailable"}), 502
-    return jsonify({"ok": True, "message": "Job updated"})
+    from clawmetry.sync import run_openclaw_cron
+    # Translate the patch dict into `openclaw cron edit <id> [flags]`.
+    args = [str(job_id)]
+    if "name" in patch:
+        args += ["--name", str(patch["name"])]
+    if "description" in patch:
+        args += ["--description", str(patch["description"])]
+    if patch.get("prompt") or patch.get("message"):
+        args += ["--message", str(patch.get("prompt") or patch.get("message"))]
+    if patch.get("model"):
+        args += ["--model", str(patch["model"])]
+    if patch.get("channel"):
+        args += ["--channel", str(patch["channel"])]
+    if "schedule" in patch and isinstance(patch["schedule"], dict):
+        sched_args, sched_err = _schedule_to_cron_cli_args(patch["schedule"])
+        if sched_err:
+            return jsonify({"error": sched_err}), 400
+        args += sched_args
+    if "enabled" in patch:
+        args += ["--enable"] if patch["enabled"] else ["--disable"]
+    if len(args) == 1:
+        return jsonify({"error": "No supported fields in patch"}), 400
+    res = run_openclaw_cron("edit", args)
+    return _cron_cli_response(res, "Job updated")
 
 
 @bp_crons.route("/api/cron/create", methods=["POST"])
@@ -542,22 +664,26 @@ def api_cron_create():
         return jsonify(
             {"error": "Auto-pause active: refusing new session starts", "paused": True}
         ), 429
-    args = {
-        "action": "add",
-        "name": name,
-        "schedule": schedule,
-        "enabled": enabled,
-    }
-    if data.get("prompt"):
-        args["prompt"] = data["prompt"]
+    from clawmetry.sync import run_openclaw_cron
+    sched_args, sched_err = _schedule_to_cron_cli_args(schedule)
+    if sched_err:
+        return jsonify({"error": sched_err}), 400
+    args = ["--name", name] + sched_args
+    # The dashboard's "message"/"prompt" is the agentTurn payload. Default to a
+    # benign prompt so the job is valid even if the user left it blank.
+    msg = (data.get("prompt") or data.get("message") or "").strip()
+    if msg:
+        args += ["--message", msg]
     if data.get("channel"):
-        args["channel"] = data["channel"]
+        args += ["--channel", str(data["channel"])]
     if data.get("model"):
-        args["model"] = data["model"]
-    result = _d._gw_invoke("cron", args)
-    if result is None:
-        return jsonify({"error": "Gateway unavailable"}), 502
-    return jsonify({"ok": True, "message": f'Job "{name}" created', "result": result})
+        args += ["--model", str(data["model"])]
+    if data.get("description"):
+        args += ["--description", str(data["description"])]
+    if not enabled:
+        args += ["--disabled"]
+    res = run_openclaw_cron("add", args)
+    return _cron_cli_response(res, f'Job "{name}" created')
 
 
 @bp_crons.route("/api/cron/<job_id>/runs")
@@ -846,21 +972,20 @@ def api_crons_job_runs(job_id):
 def api_cron_kill(job_id):
     """Kill switch: disable a single cron job by ID.
 
-    Sends update via gateway WebSocket RPC to disable the job immediately.
-    Returns the updated job state or an error.
+    v3: gateway cron tool gone; use the CLI (same path as the rest of cron
+    writes). Returns 409 + scope_pending guidance if the device scope is
+    pending approval.
     """
-    import dashboard as _d
-    result = _d._gw_invoke(
-        "cron", {"action": "update", "jobId": job_id, "patch": {"enabled": False}}
-    )
-    if result is None:
-        return jsonify(
-            {
-                "ok": False,
-                "error": "Gateway unavailable — cannot disable cron remotely. Try restarting the gateway.",
-            }
-        ), 502
-    return jsonify({"ok": True, "jobId": job_id, "enabled": False, "result": result})
+    from clawmetry.sync import run_openclaw_cron
+    res = run_openclaw_cron("disable", [str(job_id)])
+    if res.get("ok"):
+        return jsonify({"ok": True, "jobId": job_id, "enabled": False,
+                        "result": res.get("result")})
+    if res.get("scope_pending"):
+        return jsonify({"ok": False, "scope_pending": True,
+                        "error": res.get("error", "")}), 409
+    return jsonify({"ok": False, "jobId": job_id,
+                    "error": res.get("error") or "cron disable failed"}), 502
 
 
 def _try_local_store_cron_run_log(session_id: str):
@@ -871,8 +996,15 @@ def _try_local_store_cron_run_log(session_id: str):
     with the standard direct-open fallback for single-process boots. Returns
     ``None`` to defer to the JSONL parser when the events table has no
     message rows for this session.
+
+    Issue #1597 class drain: a cron run that delegates work to a Task-tool
+    sub-agent renders as "no messages" in the run-log modal without rollup.
+    UNION sub-agent events so the run log reflects the work actually done.
+    Falls back to parent-only on older daemons.
     """
-    rows = _ls_call("query_events", session_id=session_id, limit=5000)
+    rows = _ls_call("query_events_with_subagents", session_id=session_id, limit=5000)
+    if rows is None:
+        rows = _ls_call("query_events", session_id=session_id, limit=5000)
     if not rows:
         return None
     rows = list(reversed(rows))  # query_events returns DESC
@@ -923,7 +1055,7 @@ def api_cron_run_log():
             for line in f:
                 try:
                     obj = json.loads(line.strip())
-                    if obj.get("type") == "message":
+                    if obj.get("type") == "message":  # v3-shape-gate: allow (reason: JSONL on-disk walker; reads per-line JSON from transcript files)
                         msg = obj.get("message", {})
                         events.append(
                             {
@@ -1091,15 +1223,35 @@ def api_cron_health_summary():
 
 @bp_crons.route("/api/cron/kill-all", methods=["POST"])
 def api_cron_kill_all():
-    """Emergency: disable all enabled cron jobs. Returns count disabled."""
-    import dashboard as _d
-    gw_data = _d._gw_invoke("cron", {"action": "list", "includeDisabled": False}) or {}
-    jobs = gw_data.get("jobs", []) or _d._get_crons()
+    """Emergency: disable all enabled cron jobs. Returns count disabled.
+
+    v3 migration: reads the job list from DuckDB (fast path, always works) +
+    falls back to dashboard._get_crons; per-job disable via the openclaw cron
+    CLI (the legacy `_gw_invoke("cron", ...)` is dead on v3). If the device
+    scope is pending approval, returns 409 with actionable guidance instead
+    of silently 502-ing every job.
+    """
+    # CRITICAL: read the LIVE job list from the gateway via the CLI, not
+    # DuckDB. DuckDB lags the gateway (ingest is periodic) and can carry
+    # stale ids from deleted-but-not-yet-resynced jobs. Using a stale list
+    # risks (a) "unknown cron job id" errors for ids that no longer exist
+    # and (b) silently disabling jobs that have already been deleted.
+    # The CLI's `cron list --all --json` is the gateway's own ground truth.
+    from clawmetry.sync import run_openclaw_cron
+    listed = run_openclaw_cron("list", ["--all"], timeout=20)
+    jobs = []
+    if listed.get("ok"):
+        res = listed.get("result")
+        if isinstance(res, list):
+            jobs = res
+        elif isinstance(res, dict):
+            jobs = res.get("jobs") or res.get("crons") or []
     if not isinstance(jobs, list):
         jobs = []
 
     disabled_count = 0
     errors = []
+    scope_pending_hit = False
     for job in jobs:
         if not isinstance(job, dict):
             continue
@@ -1108,22 +1260,28 @@ def api_cron_kill_all():
         job_id = job.get("id", "")
         if not job_id:
             continue
-        result = _d._gw_invoke(
-            "cron", {"action": "update", "jobId": job_id, "patch": {"enabled": False}}
-        )
-        if result is not None:
+        res = run_openclaw_cron("disable", [str(job_id)])
+        if res.get("ok"):
             disabled_count += 1
         else:
-            errors.append(job_id)
+            if res.get("scope_pending"):
+                scope_pending_hit = True
+            errors.append({"jobId": job_id, "error": res.get("error", "")[:200]})
 
-    return jsonify(
-        {
-            "ok": True,
-            "disabled": disabled_count,
+    if scope_pending_hit and disabled_count == 0:
+        return jsonify({
+            "ok": False, "scope_pending": True, "disabled": 0,
             "errors": errors,
-            "message": f"Emergency stop: {disabled_count} cron job(s) disabled.",
-        }
-    )
+            "error": ("Cron disable needs a one-time gateway approval. "
+                      "Run `openclaw devices list` then `openclaw devices "
+                      "approve <id>`, then retry."),
+        }), 409
+    return jsonify({
+        "ok": True,
+        "disabled": disabled_count,
+        "errors": errors,
+        "message": "Emergency stop: %d cron job(s) disabled." % disabled_count,
+    })
 
 
 def _project_intentions(jobs, days: int, include_disabled: bool, max_events: int):
@@ -1188,10 +1346,16 @@ def _project_intentions(jobs, days: int, include_disabled: bool, max_events: int
             while t <= window_end_ms and len(firings) < 100:
                 firings.append(t)
                 t += every_ms
+        elif sched_kind == "on-exit":
+            # Event-triggered: fires when the watched command exits; no
+            # predictable next-run time. Use nextRunAtMs when the gateway
+            # provides one, otherwise pin to window_end so the job still
+            # appears in the timeline.
+            firings.append(int(next_run_ms) if next_run_ms else window_end_ms)
         elif next_run_ms and now_ms <= next_run_ms <= window_end_ms:
             firings.append(int(next_run_ms))
         for ts in firings:
-            intentions.append({
+            entry = {
                 "jobId":           job_id,
                 "name":            job_name,
                 "scheduledForMs":  ts,
@@ -1200,7 +1364,13 @@ def _project_intentions(jobs, days: int, include_disabled: bool, max_events: int
                 "lastRunAtMs":     last_run_ms,
                 "isRecentlyAdded": is_recently_added,
                 "enabled":         enabled,
-            })
+            }
+            if sched_kind == "on-exit":
+                for k in ("watchedCommand", "lastExitCode", "targetSessionId", "detachedAt"):
+                    v = state.get(k)
+                    if v is not None:
+                        entry[k] = v
+            intentions.append(entry)
             if len(intentions) >= max_events:
                 break
         if len(intentions) >= max_events:

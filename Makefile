@@ -1,9 +1,15 @@
-.PHONY: test test-api test-e2e test-fast test-e2e-duckdb dev lint lint-daemon-allowlist
+.PHONY: test test-api test-e2e test-e2e-duckdb test-fast test-workflow test-moat test-moat-real test-compat moat-check moat-check-drive dev lint lint-daemon-allowlist
 
 dev:
 	OPENCLAW_GATEWAY_TOKEN=dev-token python3 dashboard.py --port 8900
 
-test: test-api test-e2e test-e2e-duckdb
+test: test-api test-e2e test-e2e-duckdb test-workflow test-compat
+
+# Runtime-compat adapters (issue #956): PicoClaw (flat JSONL) + NanoClaw
+# (per-session SQLite). Hermetic, ~1s — no live server, no gateway, no
+# network. Mirror in .github/workflows/ci.yml (moat-tests job).
+test-compat:
+	python3 -m pytest tests/test_picoclaw_adapter.py tests/test_nanoclaw_adapter.py tests/test_runtime_detection_snapshot.py tests/test_family_runtime_ingest.py tests/test_codex_adapter.py tests/test_cursor_adapter.py tests/test_claude_code_adapter.py tests/test_aider_adapter.py tests/test_goose_adapter.py tests/test_opencode_adapter.py tests/test_qwen_code_adapter.py -v
 
 test-fast:
 	CLAWMETRY_URL=http://localhost:8900 CLAWMETRY_TOKEN=dev-token python3 -m pytest tests/test_api.py -v
@@ -17,7 +23,59 @@ test-e2e:
 # Self-contained: drives the daemon ingest helper + relay shapes against an
 # isolated DuckDB file. No live server, no gateway, no network. ~5s.
 test-e2e-duckdb:
-	python3 -m pytest tests/test_e2e_duckdb_relay.py -v
+	python3 -m pytest tests/test_duckdb_relay_integration.py -v
+
+test-workflow:
+	python3 -m pytest tests/test_e2e_nightly_workflow.py -v
+
+# MOAT verifier suite (issue #1491 / PRD #1133 invariant #3). Hermetic —
+# no live server, no gateway, no network. ~10s locally. Mirror the CI
+# job in .github/workflows/ci.yml (moat-tests). If you add a file here,
+# add it there too.
+test-moat:
+	python3 -m pytest \
+	    tests/test_moat_send_message_e2e.py \
+	    tests/test_moat_event_shape_manifest_guard.py \
+	    tests/test_oss_routes_source_canary.py \
+	    tests/test_moat_regression_1129.py \
+	    tests/test_e2e_real_openclaw_pipeline.py \
+	    tests/test_duckdb_fastpath_v3_invariants.py \
+	    tests/test_moat_cloud_roundtrip_e2e.py \
+	    tests/test_channel_event_chokepoint.py \
+	    tests/test_no_direct_get_store_in_routes.py \
+	    tests/test_local_query_api.py \
+	    -q
+
+# MOAT real-data E2E (2026-05-19 mandate). Drives a REAL ``openclaw agent
+# --local`` turn, ingests via the daemon, then asserts every endpoint
+# called out in the user mandate (overview / channels / crons /
+# system-health on top of the sibling test's sessions / transcript /
+# usage / brain-history / flow). Requires the ``openclaw`` binary on
+# PATH (skipped cleanly otherwise). ~45s end-to-end. Memory pin:
+# feedback_synthetic_tests_missed_real_event_shape.md.
+test-moat-real:
+	python3 -m pytest tests/test_moat_real_e2e.py -v
+
+# MOAT keystone bar (docs/MOAT_BAR.md Section 5, AC#1). The 13-endpoint
+# verifier that drives a real openclaw turn (or skips it via --no-drive)
+# and asserts every UI-backing API surface returns non-zero, correctly
+# shaped data. Hard-gate on every PR via the moat-keystone job in
+# .github/workflows/ci.yml. ~2s in --no-drive mode against a warm
+# DuckDB; 30-60s when driving a real openclaw turn.
+#
+# Requires: dashboard listening on 127.0.0.1:8900 AND sync daemon
+# running (writes ~/.clawmetry/local_query.json). Locally:
+#   make dev   # starts dashboard
+#   python3 -m clawmetry.sync   # starts daemon
+#   make moat-check
+moat-check:
+	@python3 scripts/accuracy_harness/keystone_e2e.py --no-drive
+
+# Drive mode (real openclaw agent turn -> +2 events in DuckDB -> 13
+# probes). Costs LLM tokens, so runs nightly on main via
+# .github/workflows/moat-keystone-drive-nightly.yml — never per-PR.
+moat-check-drive:
+	@python3 scripts/accuracy_harness/keystone_e2e.py
 
 lint: lint-py lint-js lint-daemon-allowlist
 

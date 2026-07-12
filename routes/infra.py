@@ -27,16 +27,63 @@ mechanical move — zero behaviour change.
 import json
 import os
 import select
+import sqlite3
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, Response, jsonify, request
-from clawmetry.config import is_local_store_read_enabled
+from clawmetry.config import is_local_store_read_enabled, hide_clawmetry_session
 
 bp_logs = Blueprint('logs', __name__)
 bp_memory = Blueprint('memory', __name__)
 bp_security = Blueprint('security', __name__)
+
+
+def resolve_gateway_log_path():
+    """Resolve the OpenClaw gateway log path robustly across versions.
+
+    OpenClaw historically wrote ``~/.openclaw/logs/gateway.log`` but
+    2026.5.28+ writes ``/tmp/openclaw/openclaw-<YYYY-MM-DD>.log`` instead
+    (the ``~/.openclaw/logs/`` dir now holds only config-audit files).
+    Prefer the legacy path when it exists, else the newest dated log under
+    ``/tmp/openclaw``. Returns ``None`` when neither is present — callers
+    must treat that as "no gateway log" and never crash.
+    """
+    legacy = os.path.join(
+        os.path.expanduser("~"), ".openclaw", "logs", "gateway.log"
+    )
+    # Prefer the legacy path only when it actually holds data. OpenClaw
+    # 2026.5.28 leaves a 0-byte ~/.openclaw/logs/gateway.log behind while
+    # writing the real log to /tmp/openclaw/openclaw-<date>.log; preferring
+    # the empty file unconditionally made the Gateway panel and WebChat
+    # detection read nothing. A non-empty legacy file still wins (older
+    # gateways that genuinely write there).
+    try:
+        if os.path.exists(legacy) and os.path.getsize(legacy) > 0:
+            return legacy
+    except OSError:
+        if os.path.exists(legacy):
+            return legacy
+    # Newest /tmp/openclaw/openclaw-*.log. Use os.listdir (not glob) so we
+    # don't depend on glob's stat behaviour, then pick the most recent by
+    # mtime — falling back to filename order if mtime can't be read.
+    tmp_dir = "/tmp/openclaw"
+    try:
+        names = [
+            n for n in os.listdir(tmp_dir)
+            if n.startswith("openclaw-") and n.endswith(".log")
+        ]
+    except Exception:
+        names = []
+    paths = [os.path.join(tmp_dir, n) for n in names]
+    paths = [p for p in paths if os.path.isfile(p)]
+    if not paths:
+        return None
+    try:
+        return max(paths, key=os.path.getmtime)
+    except Exception:
+        return max(paths)  # filename order: dated names sort chronologically
 bp_config = Blueprint('config', __name__)
 
 
@@ -83,6 +130,346 @@ def api_logs():
     return jsonify({"lines": lines, "date": date_str})
 
 
+# Tool-name → flow-tab short key. OpenClaw emits these tool names verified
+# against production session JSONLs. Mapped to the short key our Flow SVG
+# path ids expect (exec / browser / search / memory / session / cron / tts).
+# Shared between the legacy SSE parser and the DuckDB fast-path helper so
+# both surfaces emit the same `tool` field for the front-end.
+_FLOW_TOOL_MAP = {
+    "exec": "exec", "process": "exec", "read": "exec", "write": "exec",
+    "write_file": "exec", "edit": "exec", "Bash": "exec", "Read": "exec",
+    "Write": "exec", "Edit": "exec",
+    "web_search": "search", "ollama_web_search": "search",
+    "web_fetch": "browser", "ollama_web_fetch": "browser",
+    "browser": "browser", "image": "browser",
+    "memory_search": "memory", "memory_get": "memory",
+    "sessions_spawn": "session",
+    "cron": "cron", "tts": "tts",
+}
+
+# Channel-label hints carried inside `Sender (untrusted metadata)` user blocks.
+_FLOW_CHANNEL_LABELS = {
+    "openclaw-tui":        "tui",
+    "openclaw-control-ui": "webchat",
+    "openclaw-webchat":    "webchat",
+}
+
+
+def _try_local_store_flow_events(limit=200, since=None):
+    """DuckDB fast path for /api/flow-events. Returns a chronologically-
+    ordered list of normalised flow events ({type, channel|tool, ts,
+    session_id}) drawn from the daemon-ingested ``events`` table, OR
+    ``None`` when the local store has no relevant rows (callers fall
+    through to the legacy JSONL/gateway-log tail).
+
+    Shape mirrors what the SSE parser yields (msg_in / msg_out /
+    tool_call / tool_result) so downstream consumers can treat the JSON
+    envelope as a snapshot prefix of the live stream. Tagged
+    ``_source: 'local_store'`` by the caller. Closes the Tier-1 audit
+    candidate for `/api/flow-events` (refs #1565)."""
+    from routes.sessions import _ls_call  # late import to avoid cycle
+    rows = _ls_call("query_events", since=since, limit=limit) or []
+    if not rows:
+        return None
+
+    # The daemon-normalised v3 event types that map to flow lanes. Real
+    # OpenClaw v3 ingest emits these (see
+    # reference_openclaw_v3_event_types.md); we also accept legacy and
+    # tool-call alternates so older sessions still surface. If NONE of
+    # the rows match we return None so the legacy parser still drives
+    # the SSE timeline (pre-v3 / non-OpenClaw agents).
+    _FLOW_TYPES = frozenset({
+        "prompt.submitted", "model.completed", "model.changed",
+        "tool.call", "tool_call", "tool.result", "tool_use_result",
+        "message", "assistant", "user",
+    })
+    matched = [r for r in rows if r.get("event_type") in _FLOW_TYPES]
+    if not matched:
+        return None
+
+    # A provider name (e.g. "claude-cli", "anthropic") is NOT a channel —
+    # it identifies the LLM backend, not where the user's message came in.
+    # Treat these as "no channel hint" so we fall back to the real channel
+    # (the session's inbound) or the neutral local runtime, never a guess.
+    _PROVIDER_NAMES = frozenset({
+        "claude-cli", "claude_code", "anthropic", "openai", "google",
+        "gemini", "ollama", "openrouter", "groq", "deepseek", "mistral",
+        "xai", "cohere", "bedrock", "vertex", "azure",
+    })
+
+    def _extract_channel(payload):
+        """Pull a channel hint from a `data` blob. Looks at top-level
+        ``channel``/``origin`` first, then walks Sender-metadata in
+        prompt text the same way the SSE parser does.
+
+        Deliberately does NOT trust ``provider`` as a channel: the
+        provider is the model backend (claude-cli / anthropic / ...),
+        not the inbound channel. Returns ``None`` when no genuine channel
+        hint is present so the caller can apply the correct fallback."""
+        if not isinstance(payload, dict):
+            return None
+        for key in ("channel", "origin"):
+            v = payload.get(key)
+            if isinstance(v, str) and v:
+                lk = v.lower()
+                if lk in _PROVIDER_NAMES:
+                    continue
+                return _FLOW_CHANNEL_LABELS.get(lk, lk)
+        text = payload.get("finalPromptText") or ""
+        if not isinstance(text, str) or "Sender (untrusted metadata)" not in text:
+            return None
+        try:
+            start = text.index("```json")
+            end = text.index("```", start + 8)
+            meta = json.loads(text[start + 7:end].strip())
+            label = str(meta.get("label") or meta.get("id") or "").lower()
+            if label in _PROVIDER_NAMES:
+                return None
+            return _FLOW_CHANNEL_LABELS.get(label, label) or None
+        except Exception:
+            return None
+
+    # Per-session inbound channel: the reply leg (msg_out) must carry the
+    # SAME channel the user reached us through — never the LLM provider
+    # name. We learn it from the inbound (msg_in) turn and reuse it for the
+    # matching session's outbound; unknown → neutral local runtime.
+    session_channel: dict = {}
+
+    events: list = []
+    for row in matched:
+        et = row.get("event_type") or ""
+        data = row.get("data") if isinstance(row.get("data"), dict) else {}
+        sid = row.get("session_id") or ""
+        ts = row.get("ts") or ""
+
+        if et == "prompt.submitted" or (et in ("message", "user")
+                                         and (data.get("role") == "user")):
+            # Unknown inbound channel → "openclaw" (the local CLI/agent
+            # runtime). NEVER guess "telegram".
+            ch = _extract_channel(data) or "openclaw"
+            if sid:
+                session_channel[sid] = ch
+            events.append({"type": "msg_in", "channel": ch,
+                           "ts": ts, "session_id": sid,
+                           "_source": "local_store"})
+            continue
+
+        if et == "model.completed" or (et in ("message", "assistant")
+                                        and data.get("role") == "assistant"):
+            # Surface tool invocations carried inside the assistant turn
+            # as separate tool_call events so the Flow timeline matches
+            # the SSE shape. Outer assistant reply itself is the
+            # "gateway bubble" — emitted as msg_out so the channel lane
+            # lights up.
+            tool_metas = []
+            inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+            for src in (data.get("toolMetas"), inner.get("toolMetas")):
+                if isinstance(src, list):
+                    tool_metas.extend(src)
+            for tm in tool_metas:
+                if not isinstance(tm, dict):
+                    continue
+                name = tm.get("name") or ""
+                tool_key = _FLOW_TOOL_MAP.get(name, name)
+                events.append({"type": "tool_call", "tool": tool_key,
+                               "ts": ts, "session_id": sid,
+                               "_source": "local_store"})
+            # Reply leg: carry the SAME channel as this session's inbound
+            # turn (the user's real channel), NOT the provider name. Only
+            # if we never saw the inbound do we consult the payload, and
+            # finally fall back to the neutral local runtime.
+            ch = (session_channel.get(sid)
+                  or _extract_channel(data)
+                  or "openclaw")
+            events.append({"type": "msg_out", "channel": ch,
+                           "ts": ts, "session_id": sid,
+                           "_source": "local_store"})
+            continue
+
+        if et in ("tool.call", "tool_call"):
+            name = (data.get("tool") or data.get("tool_name")
+                    or data.get("name") or "")
+            tool_key = _FLOW_TOOL_MAP.get(name, name)
+            events.append({"type": "tool_call", "tool": tool_key,
+                           "ts": ts, "session_id": sid,
+                           "_source": "local_store"})
+            continue
+
+        if et in ("tool.result", "tool_use_result"):
+            name = (data.get("tool") or data.get("tool_name")
+                    or data.get("name") or "")
+            tool_key = _FLOW_TOOL_MAP.get(name, name or "exec")
+            events.append({"type": "tool_result", "tool": tool_key,
+                           "ts": ts, "session_id": sid,
+                           "_source": "local_store"})
+            continue
+
+    # query_events returns DESC; reverse so the caller gets a
+    # chronological snapshot prefix (matches what the SSE stream emits).
+    events.reverse()
+    return events
+
+
+def _try_local_store_cost_optimizer():
+    """DuckDB fast path for /api/cost-optimizer's data-derived fields.
+
+    Tier-1 surface #12 in the 2026-05-17 DuckDB coverage audit
+    (issue #1565). The legacy handler reads ``todayCost`` and
+    ``projectedMonthlyCost`` from ``dashboard._metrics_store`` (an
+    in-memory ring populated by the OTLP/HTTP interceptor) and
+    ``expensiveOps`` from the same ring. On a fresh install or after a
+    process restart the ring is empty — the optimizer renders $0 / no
+    optimisation candidates even when DuckDB holds weeks of real usage
+    rows. This helper closes that gap.
+
+    Returns a dict the route merges into its response (keeps host-state
+    fields — system, localModels, taskRecommendations, ollamaInstalled,
+    llmfitAvailable — on the legacy path; only swaps the data slice).
+    Returns ``None`` when DuckDB has zero cost-bearing rows so the
+    caller can keep the legacy in-memory values.
+
+    Source preference (same call order as ``_try_local_store_usage_forecast``
+    in routes/usage.py — see ``feedback_usage_dedupe_pattern.md``):
+      * ``query_aggregates`` — SQL-deduped daily rollup over the FULL
+        events table; safe for cost (covers tool retries / fallback
+        rows the splits walker drops).
+      * ``query_events`` — recent high-cost individual rows for
+        ``expensiveOps`` (descending by cost). Capped at 200 rows so a
+        many-week DuckDB stays cheap to scan.
+    """
+    from routes.sessions import _ls_call  # late import to avoid cycle
+    from datetime import datetime as _dt, timezone as _tz
+
+    agg_rows = _ls_call("query_aggregates") or []
+    if not agg_rows:
+        # No cost-bearing rows in DuckDB → defer to legacy path so a
+        # fresh install still gets the in-memory ring values (which
+        # may have been populated by the live interceptor before the
+        # daemon flushed anything to disk).
+        return None
+
+    today = _dt.now(_tz.utc).date().isoformat()
+    month_prefix = today[:7]  # "YYYY-MM"
+    today_cost = 0.0
+    month_cost = 0.0
+    days_seen: set[str] = set()
+    for r in agg_rows:
+        day = (r.get("day") or "")
+        if not day:
+            continue
+        c = float(r.get("cost_usd") or 0.0)
+        if day == today:
+            today_cost += c
+        if day.startswith(month_prefix):
+            month_cost += c
+            days_seen.add(day)
+
+    # Daily-average projection over the days we actually observed this
+    # month, scaled to a 30-day month so the figure matches the legacy
+    # _get_cost_summary formula (which projects month/days * 30).
+    days_in_window = max(1, len(days_seen))
+    projected = (month_cost / days_in_window) * 30.0 if month_cost > 0 else 0.0
+
+    # expensiveOps: top recent rows by cost_usd. Walk the same row shape
+    # _get_expensive_operations builds (model + cost + tokens + timeAgo).
+    expensive_ops: list[dict] = []
+    try:
+        evs = _ls_call("query_events", limit=200) or []
+    except Exception:
+        evs = []
+    candidates = []
+    for ev in evs:
+        cost = float(ev.get("cost_usd") or 0.0)
+        if cost <= 0.01:
+            continue
+        model = (ev.get("model") or "").strip() or "unknown"
+        tokens = int(ev.get("token_count") or 0)
+        ts = ev.get("ts") or ""
+        time_ago = ""
+        if ts:
+            try:
+                time_ago = _dt.fromisoformat(
+                    ts.replace("Z", "+00:00")
+                ).strftime("%H:%M")
+            except Exception:
+                time_ago = ""
+        candidates.append({
+            "model": model,
+            "cost": cost,
+            "tokens": f"{tokens:,}" if tokens > 0 else "unknown",
+            "timeAgo": time_ago,
+            "canOptimize": False,
+        })
+    expensive_ops = sorted(
+        candidates, key=lambda x: x["cost"], reverse=True
+    )[:10]
+
+    return {
+        "todayCost": round(today_cost, 4),
+        "projectedMonthlyCost": round(projected, 4),
+        "expensiveOps": expensive_ops,
+        "_source": "local_store",
+    }
+
+
+def _try_local_store_cost_optimization():
+    """DuckDB fast path for /api/cost-optimization's data slice.
+
+    Sibling of ``_try_local_store_cost_optimizer`` (which serves
+    /api/cost-optimizer). Both endpoints suffer the same in-memory-ring
+    silent-zero hazard: ``dashboard._get_cost_summary`` and
+    ``_get_expensive_operations`` both read ``metrics_store`` which
+    resets on every dashboard restart, so the panel renders $0 even
+    when DuckDB holds weeks of usage rows. This route returns a
+    different envelope shape (``costs`` dict with today/week/month/
+    projected) so we extend the sibling's projection with week+month
+    rollups derived from the same ``query_aggregates`` rows.
+
+    Returns ``{"costs": {today, week, month, projected}, "expensiveOps":
+    [...], "_source": "local_store"}`` when DuckDB has rows; ``None``
+    otherwise (no canary on empty store — caller defers to the legacy
+    in-memory path, matching the pattern pinned by
+    ``test_cost_optimizer_local_store_v3``).
+    """
+    from routes.sessions import _ls_call  # late import to avoid cycle
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+    # Sibling handles today + projected + expensiveOps from the same
+    # query_aggregates + query_events rows; reuse it so the two
+    # endpoints can't drift.
+    sibling = _try_local_store_cost_optimizer()
+    if sibling is None:
+        return None
+
+    # Compute the week + month rollups the sibling doesn't surface.
+    agg_rows = _ls_call("query_aggregates") or []
+    now = _dt.now(_tz.utc)
+    week_start = (now - _td(days=7)).date().isoformat()
+    month_start = (now - _td(days=30)).date().isoformat()
+    week_cost = 0.0
+    month_cost = 0.0
+    for r in agg_rows:
+        day = (r.get("day") or "")
+        if not day:
+            continue
+        c = float(r.get("cost_usd") or 0.0)
+        if day >= week_start:
+            week_cost += c
+        if day >= month_start:
+            month_cost += c
+
+    return {
+        "costs": {
+            "today":     sibling["todayCost"],
+            "week":      round(week_cost, 4),
+            "month":     round(month_cost, 4),
+            "projected": sibling["projectedMonthlyCost"],
+        },
+        "expensiveOps": sibling["expensiveOps"],
+        "_source": "local_store",
+    }
+
+
 @bp_logs.route("/api/flow-events")
 @bp_logs.route("/api/flow")
 def api_flow_events():
@@ -94,7 +481,25 @@ def api_flow_events():
     # E2E health checks and non-SSE clients get a lightweight JSON response
     accept = request.headers.get("Accept", "")
     if request.method == "HEAD" or "text/event-stream" not in accept:
-        return jsonify({"ok": True, "type": "flow-events", "streaming": True})
+        # Always include `events` (default empty list) so the JSON envelope
+        # shape is stable for non-SSE callers — including the keystone E2E
+        # verifier. Without this, an empty/disabled local store would emit
+        # `{ok, streaming, type}` and the verifier's shape probe would fail
+        # on the missing `.events` key (refs #1763).
+        envelope = {"ok": True, "type": "flow-events", "streaming": True, "events": []}
+        # DuckDB fast path (refs #1565). Hydrate the JSON envelope with a
+        # snapshot of recent flow events so callers that can't (or don't
+        # want to) hold an SSE connection still see real data. SSE is the
+        # only path that yields LIVE updates; this path is the snapshot.
+        if is_local_store_read_enabled():
+            try:
+                snap = _try_local_store_flow_events(limit=200)
+            except Exception:
+                snap = None
+            if snap is not None:
+                envelope["events"] = snap
+                envelope["_source"] = "local_store"
+        return jsonify(envelope)
     import glob as _glob
 
     def _find_active_jsonl():
@@ -108,7 +513,7 @@ def api_flow_events():
         ]
         return max(files, key=os.path.getmtime) if files else None
 
-    gw_log = os.path.join(os.path.expanduser("~"), ".openclaw", "logs", "gateway.log")
+    gw_log = resolve_gateway_log_path()
 
     # OpenClaw emits tool names verified in production session JSONLs.
     # Map → the short tool-key our Flow SVG path ids expect:
@@ -153,8 +558,8 @@ def api_flow_events():
         """Parse `Sender (untrusted metadata)` JSON block from user message text.
 
         Returns channel key ("tui" / "webchat" / "telegram" / ...) or None.
-        Telegram/Signal/WhatsApp don't set a special label, so fall through to
-        "telegram" as the legacy default (matches pre-fix behaviour).
+        When no genuine channel label is present the caller falls back to
+        "openclaw" (the local CLI/agent runtime) — never a guessed channel.
         """
         if not isinstance(text, str) or "Sender (untrusted metadata)" not in text:
             return None
@@ -221,7 +626,9 @@ def api_flow_events():
                 first = content[0]
                 if isinstance(first, dict):
                     text = first.get("text") or ""
-            ch = _extract_channel(text) or "telegram"
+            # Unknown inbound channel → "openclaw" (local CLI/agent
+            # runtime). NEVER guess "telegram".
+            ch = _extract_channel(text) or "openclaw"
             return {"type": "msg_in", "channel": ch}
         return None
 
@@ -234,7 +641,7 @@ def api_flow_events():
         started = time.time()
 
         # Seek to end of existing files — only emit NEW events
-        if os.path.exists(gw_log):
+        if gw_log and os.path.exists(gw_log):
             with open(gw_log, "rb") as f:
                 f.seek(0, 2)
                 gw_pos = f.tell()
@@ -253,7 +660,7 @@ def api_flow_events():
                 events = []
 
                 # Tail gateway.log
-                if os.path.exists(gw_log):
+                if gw_log and os.path.exists(gw_log):
                     try:
                         with open(gw_log, "rb") as f:
                             f.seek(gw_pos)
@@ -328,9 +735,15 @@ def api_flow_runs():
       ``since``  — ISO timestamp lower-bound on event ts
       ``until``  — ISO timestamp upper-bound
 
-    Returns ``{runs: [...], _source: "local_store"|"empty"}``. Never raises
-    — on any store failure we return an empty list with the legacy tag so
-    the Flow tab degrades gracefully.
+    Returns ``{runs: [...], _source: "local_store"|"empty",
+    capped_at_24h: bool}``. Never raises — on any store failure we return
+    an empty list with the legacy tag so the Flow tab degrades gracefully.
+
+    Retention gating (issue #1173): OSS / Cloud-Free users are capped to
+    the last 24 hours of ``started_at``. Cloud-Pro users (validated by
+    ``dashboard._is_pro_user``) get unlimited history. When the cap is
+    enforced we set ``capped_at_24h=true`` so the UI can surface the
+    Cloud-Pro upgrade CTA.
     """
     try:
         limit_raw = int(request.args.get("limit", 30))
@@ -341,21 +754,124 @@ def api_flow_runs():
     until = request.args.get("until") or None
     agent_id = request.args.get("agent_id") or None
 
-    runs: list = []
+    # OSS retention cap (issue #1173). Pro users bypass the cap entirely;
+    # everyone else gets clamped to last 24h of started_at.
+    capped_at_24h = False
+    try:
+        import dashboard as _d
+        is_pro = bool(_d._is_pro_user())
+    except Exception:
+        is_pro = False
+    if not is_pro:
+        cap_iso = (
+            datetime.now(timezone.utc) - timedelta(hours=24)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # If caller asked for a window older than the cap (or no `since`
+        # at all), clamp to the cap and flag the response so the UI can
+        # render the upgrade CTA.
+        if not since or since < cap_iso:
+            since = cap_iso
+            capped_at_24h = True
+
+    # MOAT Tier-1 sweep (refs #1565): route through the daemon HTTP proxy
+    # first. The previous direct ``local_store.get_store(read_only=True)``
+    # open silently failed on multi-process installs (DuckDB exclusive lock
+    # blocks even RO opens — see memory
+    # ``reference_duckdb_process_lock.md``), so every standard launchd /
+    # systemd user saw an empty Past-flow-runs list. The daemon owns the
+    # writer connection and serves reads via HTTP from the same process.
+    runs: list | None = None
     source = "empty"
     try:
-        from clawmetry import local_store
-        store = local_store.get_store(read_only=True)
-        runs = store.query_flow_runs(
+        from routes.local_query import local_store_via_daemon
+        runs = local_store_via_daemon(
+            "query_flow_runs",
             agent_id=agent_id, since=since, until=until, limit=limit,
-        ) or []
-        if runs:
-            source = "local_store"
+        )
     except Exception:
-        runs = []
-        source = "empty"
+        runs = None
+    if runs is None:
+        # Single-process fallback (tests / dev mode with no sync daemon).
+        # NB: this path WILL fail on a multi-process install because of the
+        # DuckDB process lock — but in that scenario the daemon proxy above
+        # should always succeed. Logging here surfaces drift if it doesn't.
+        try:
+            from clawmetry import local_store
+            store = local_store.get_store(read_only=True)
+            runs = store.query_flow_runs(
+                agent_id=agent_id, since=since, until=until, limit=limit,
+            ) or []
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "api_flow_runs: daemon proxy AND direct DuckDB open both "
+                "failed — returning empty list (%s)", exc,
+            )
+            runs = []
+    if runs:
+        source = "local_store"
 
-    return jsonify({"runs": runs, "count": len(runs), "_source": source})
+    return jsonify({
+        "runs": runs,
+        "count": len(runs),
+        "_source": source,
+        "capped_at_24h": capped_at_24h,
+    })
+
+
+@bp_logs.route("/api/flow/lanes")
+def api_flow_lanes():
+    """Active session lanes for the Flow tab (issue #721).
+
+    Returns sessions updated within the last 30 minutes, annotated with
+    channel type, event count, and active/failed status, so the Flow tab
+    can render per-session channel lanes alongside the topology SVG.
+
+    Response shape::
+
+        {"lanes": [{"session_id", "session_short", "channel",
+                    "event_count", "started_at", "updated_at",
+                    "status": "active"|"failed"}, ...],
+         "_source": "local_store"|"empty"}
+    """
+    active_since = (
+        datetime.now(timezone.utc) - timedelta(minutes=30)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    runs = None
+    try:
+        from routes.local_query import local_store_via_daemon
+        runs = local_store_via_daemon(
+            "query_flow_runs", since=active_since, limit=50,
+        )
+    except Exception:
+        runs = None
+
+    if runs is None:
+        try:
+            from clawmetry import local_store as _ls
+            store = _ls.get_store(read_only=True)
+            runs = store.query_flow_runs(since=active_since, limit=50)
+        except Exception:
+            runs = []
+
+    lanes = [
+        {
+            "session_id":    r.get("session_id") or "",
+            "session_short": (r.get("session_id") or "")[:8],
+            "channel":       r.get("channel") or "cli",
+            "event_count":   int(r.get("event_count") or 0),
+            "started_at":    r.get("started_at") or "",
+            "updated_at":    r.get("updated_at") or "",
+            "status":        "failed" if r.get("has_error") else "active",
+        }
+        for r in (runs or [])
+    ]
+
+    return jsonify({
+        "lanes":   lanes,
+        "_source": "local_store" if runs else "empty",
+    })
 
 
 @bp_logs.route("/api/logs-stream")
@@ -637,7 +1153,12 @@ def api_memory_files():
         fast = _try_local_store_memory_files()
         if fast is not None:
             return jsonify({"files": fast, "_source": "local_store"})
-    return jsonify(_d._get_memory_files())
+    # Wrap the workspace-scan fallback in the same `{files: [...]}` envelope
+    # the fast path returns, so the on-the-wire shape is stable regardless
+    # of whether the local store is enabled. The bare-list fallback used to
+    # break the keystone E2E verifier's shape probe (refs #1763) and any
+    # caller that already correctly handled the local_store shape.
+    return jsonify({"files": _d._get_memory_files()})
 
 
 @bp_memory.route("/api/file", methods=["GET"])
@@ -712,6 +1233,261 @@ def api_memory_analytics():
     return jsonify(_build_memory_analytics(files, bloat_warn_kb, bloat_crit_kb))
 
 
+# ── Memory RAG / SQLite inspector (issue #610) ─────────────────────────────
+
+
+def _open_rag_db():
+    """Open ~/.openclaw/memory/main.sqlite read-only.
+
+    Returns a sqlite3.Connection, or None when the file is absent, the
+    memory dir is unknown, or any other error prevents opening (we prefer a
+    graceful empty response over a 500).
+    """
+    import dashboard as _d
+    mem_dir = getattr(_d, "MEMORY_DIR", None) or ""
+    if not mem_dir:
+        return None
+    db_path = os.path.join(mem_dir, "main.sqlite")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        uri = f"file:{db_path}?mode=ro"
+        return sqlite3.connect(uri, uri=True, timeout=2.0)
+    except Exception:
+        return None
+
+
+@bp_memory.route("/api/memory-rag")
+def api_memory_rag():
+    """Return RAG document-store stats and file list from main.sqlite.
+
+    Response shape:
+      {"available": bool, "stats": {...}, "files": [...]}
+    When main.sqlite does not exist, returns {"available": false, ...} with
+    HTTP 200 so the frontend can render a "not yet indexed" state without
+    treating it as an error.
+    """
+    conn = _open_rag_db()
+    if conn is None:
+        return jsonify({"available": False, "stats": {}, "files": []})
+
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        try:
+            file_rows = cur.execute(
+                "SELECT f.path, f.size, f.mtime, COUNT(c.id) AS chunk_count "
+                "FROM files f LEFT JOIN chunks c ON c.file_id = f.id "
+                "GROUP BY f.id ORDER BY f.size DESC"
+            ).fetchall()
+            files = [
+                {
+                    "path": r["path"],
+                    "size": r["size"] or 0,
+                    "mtime": r["mtime"] or 0,
+                    "chunkCount": r["chunk_count"] or 0,
+                }
+                for r in file_rows
+            ]
+        except Exception:
+            files = []
+
+        stats: dict = {}
+        try:
+            agg = cur.execute(
+                "SELECT COUNT(*) AS file_count, "
+                "       COALESCE(SUM(size), 0) AS total_bytes, "
+                "       MAX(mtime) AS last_indexed "
+                "FROM files"
+            ).fetchone()
+            stats = {
+                "fileCount": agg["file_count"] or 0,
+                "totalBytes": agg["total_bytes"] or 0,
+                "lastIndexed": agg["last_indexed"],
+            }
+        except Exception:
+            pass
+
+        try:
+            chunk_row = cur.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()
+            stats["chunkCount"] = chunk_row["n"] or 0
+        except Exception:
+            pass
+
+        return jsonify({"available": True, "stats": stats, "files": files})
+    except Exception as exc:
+        return jsonify({"available": False, "error": str(exc), "stats": {}, "files": []})
+    finally:
+        conn.close()
+
+
+@bp_memory.route("/api/memory-rag/search")
+def api_memory_rag_search():
+    """FTS5 full-text search over RAG chunks.
+
+    Query params:
+      q      — search terms (required)
+      limit  — max results (default 20, max 100)
+
+    Result shape:
+      {"available": bool, "query": str, "total": int, "results": [
+        {"path": str, "snippet": str, "rank": float}, ...
+      ]}
+    """
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"available": True, "query": "", "total": 0, "results": []})
+
+    try:
+        limit = min(int(request.args.get("limit", 20)), 100)
+    except ValueError:
+        limit = 20
+
+    conn = _open_rag_db()
+    if conn is None:
+        return jsonify({"available": False, "query": q, "total": 0, "results": []})
+
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        try:
+            rows = cur.execute(
+                "SELECT f.path, "
+                "       snippet(chunks_fts, 0, '<mark>', '</mark>', '...', 16) AS snippet, "
+                "       rank "
+                "FROM chunks_fts "
+                "JOIN chunks c  ON c.id  = chunks_fts.rowid "
+                "JOIN files  f  ON f.id  = c.file_id "
+                "WHERE chunks_fts MATCH ? "
+                "ORDER BY rank "
+                "LIMIT ?",
+                (q, limit),
+            ).fetchall()
+            results = [
+                {"path": r["path"], "snippet": r["snippet"], "rank": r["rank"]}
+                for r in rows
+            ]
+        except Exception as exc:
+            return jsonify({
+                "available": True, "query": q, "total": 0,
+                "results": [], "error": str(exc),
+            })
+        return jsonify({"available": True, "query": q, "total": len(results), "results": results})
+    finally:
+        conn.close()
+
+
+# ── Memory access history (issue #1896) ────────────────────────────────────
+# OpenClaw reads memory via the MCP tools mcp__openclaw__memory_get /
+# memory_search. Each call shows up as a `tool_use` block in the assistant
+# turn that triggered it, carrying the search query (or fetched key) plus the
+# session id + timestamp. We surface those as an access timeline so users can
+# see when a memory was accessed and click through to the conversation that
+# triggered it (verified against real events 2026-05-22).
+_MEMORY_TOOL_PREFIX = "mcp__openclaw__memory_"
+
+
+def _walk_tool_uses(node):
+    """Yield every dict in ``node`` whose type is 'tool_use' (depth-first).
+    Handles the nested message/content shapes OpenClaw v3 + claude-cli use."""
+    if isinstance(node, dict):
+        if node.get("type") == "tool_use" and node.get("name"):
+            yield node
+        for v in node.values():
+            yield from _walk_tool_uses(v)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk_tool_uses(item)
+
+
+def _extract_memory_accesses(rows, limit=200):
+    """Pull memory tool calls out of raw events into access records.
+
+    Returns a recent-first list of
+    ``{op, target, session_id, ts, tool_use_id}``. ``op`` is "search"/"get",
+    ``target`` is the search query or fetched key. Never raises.
+    """
+    accesses = []
+    for ev in rows or []:
+        # Hide ClawMetry's own helper sessions (clawmetry-selfevolve /
+        # clawmetry-mem-probe …) — their memory reads are plumbing, not the
+        # user's activity. Override: CLAWMETRY_SHOW_INTERNAL_SESSIONS=1.
+        if hide_clawmetry_session(ev.get("session_id")):
+            continue
+        data = ev.get("data")
+        if not isinstance(data, dict):
+            continue
+        try:
+            tool_uses = list(_walk_tool_uses(data))
+        except Exception:
+            tool_uses = []
+        for tu in tool_uses:
+            name = tu.get("name") or ""
+            if not name.startswith(_MEMORY_TOOL_PREFIX):
+                continue
+            op = name[len(_MEMORY_TOOL_PREFIX):] or "access"  # "search" / "get"
+            inp = tu.get("input") if isinstance(tu.get("input"), dict) else {}
+            target = (
+                inp.get("query") or inp.get("key") or inp.get("id")
+                or inp.get("name") or inp.get("path") or ""
+            )
+            if not target and inp:
+                try:
+                    target = json.dumps(inp)[:200]
+                except Exception:
+                    target = ""
+            accesses.append({
+                "op": op,
+                "target": str(target)[:300],
+                "session_id": ev.get("session_id") or "",
+                "ts": ev.get("ts"),
+                "tool_use_id": tu.get("id") or "",
+            })
+    # Recent-first. ``ts`` is an ISO-8601 string for v3 events; sort as string
+    # which is chronologically correct for that format, defensive for others.
+    accesses.sort(key=lambda a: str(a.get("ts") or ""), reverse=True)
+    return accesses[:limit]
+
+
+@bp_memory.route("/api/memory-access")
+def api_memory_access():
+    """Timeline of memory tool accesses (memory_get / memory_search).
+
+    DuckDB-first: reads already-ingested events via the daemon proxy and
+    extracts memory tool calls. Returns HTTP 200 with ``available: false``
+    when the store can't be read so the UI degrades gracefully.
+
+    Query params:
+      limit — max records (default 200, max 1000)
+    """
+    try:
+        limit = min(int(request.args.get("limit", 200)), 1000)
+    except (ValueError, TypeError):
+        limit = 200
+
+    rows = None
+    try:
+        from routes.local_query import local_store_via_daemon
+        rows = local_store_via_daemon("query_events", limit=12000)
+    except Exception:
+        rows = None
+    if rows is None and is_local_store_read_enabled():
+        # Single-process fallback (tests/dev with no sync daemon), mirroring
+        # routes.sessions._try_local_store_transcript.
+        try:
+            from clawmetry import local_store
+            store = local_store.get_store(read_only=True)
+            rows = store.query_events(limit=12000)
+        except Exception:
+            rows = None
+    if rows is None:
+        return jsonify({"available": False, "accesses": [], "total": 0})
+
+    accesses = _extract_memory_accesses(rows, limit=limit)
+    return jsonify({"available": True, "accesses": accesses, "total": len(accesses)})
+
+
 # ── Security ───────────────────────────────────────────────────────────────
 
 
@@ -739,6 +1515,31 @@ def api_security_threats():
                 message=f"🛡️ Security: {t['severity'].upper()} - {t['description']}\n{t['detail'][:200]}",
                 channels=["banner", "telegram"],
             )
+
+    # Persist to DuckDB so /api/security-threats has a history to serve.
+    if threats:
+        try:
+            from routes.local_query import local_store_via_daemon
+            from clawmetry import local_store as _ls_mod
+            for t in threats:
+                ts_key = (t.get("time") or "").replace(":", "").replace("-", "")[:15]
+                src_key = (t.get("source") or "").replace("/", "_")[:32]
+                ev_id = f"sec_{t.get('rule_id', 'x')}_{src_key}_{ts_key}"
+                ev = {
+                    "id": ev_id,
+                    "ts": t.get("time") or "",
+                    "type": t.get("event_type"),
+                    "severity": t.get("severity"),
+                    "session_id": t.get("source"),
+                    "rule_id": t.get("rule_id"),
+                    "description": t.get("description"),
+                    "snippet": t.get("detail", "")[:200],
+                }
+                result = local_store_via_daemon("ingest_security_event", event=ev)
+                if result is None:
+                    _ls_mod.get_store().ingest_security_event(ev)
+        except Exception:
+            pass
 
     return jsonify(
         {"threats": threats, "counts": counts, "scanned_events": len(events)}
@@ -776,6 +1577,178 @@ def api_security_posture():
         return jsonify({"error": str(e), "score": "U", "checks": []}), 500
 
 
+@bp_security.route("/api/security/policy-events")
+def api_security_policy_events():
+    """Scan agent event content for PII, prompt-injection, and credential-leak patterns.
+
+    Optional query param: session_id — narrows scan to one session.
+    Returns {hits, counts{PII,INJECT,LEAK,total}, scanned_events}.
+    """
+    import dashboard as _d
+    session_id = (request.args.get("session_id") or "").strip()
+    events = []
+    try:
+        if session_id:
+            from routes.brain import _fetch_session_chain
+            events = _fetch_session_chain(session_id, limit=500)
+        else:
+            from routes.brain import api_brain_history
+            brain_resp = api_brain_history()
+            brain_data = brain_resp.get_json()
+            events = brain_data.get("events", [])
+    except Exception:
+        events = []
+    hits, counts = _d._scan_content_for_policy_events(events)
+    return jsonify({"hits": hits[:200], "counts": counts, "scanned_events": len(events)})
+
+
+# ── Tamper-evident integrity + Enterprise audit feed ───────────────────────
+#
+# Two node-wide governance surfaces for the Security tab:
+#   /api/security/integrity  — the SHA-256 hash-chain verify result
+#                              (reuses local_store.verify_integrity; we do
+#                              NOT re-implement the chain walk).
+#   /api/security/audit      — recent Enterprise audit-log rows (mirrors
+#                              /api/audit-log so the Security tab has a
+#                              recent-activity feed now that producers write).
+
+
+def _integrity_status() -> dict:
+    """Walk the tamper-evident hash chain via the existing verifier and return
+    a plain-language status dict ``{ok, status, chain_length, pre_chain,
+    first_break, error}``.
+
+    Reuses ``local_store.verify_integrity`` — never re-implements the chain.
+    Routes through the daemon HTTP proxy first (the daemon owns the DuckDB
+    writer lock; ``verify_integrity`` internally takes ``_fetch``'s write lock,
+    so a direct open from the dashboard process would contend / deadlock), with
+    a single-process direct-read fallback for tests/dev. Never raises."""
+    raw = None
+    try:
+        from routes.local_query import local_store_via_daemon
+        raw = local_store_via_daemon("verify_integrity")
+    except Exception:
+        raw = None
+    if raw is None:
+        # Single-process fallback (tests / dev with no daemon). read_only is
+        # fine: verify_integrity only reads, and _fetch serialises internally.
+        try:
+            from clawmetry import local_store
+            store = local_store.get_store(read_only=True)
+            raw = store.verify_integrity()
+        except Exception:
+            raw = None
+    if not isinstance(raw, dict):
+        return {
+            "ok": None,
+            "status": "unknown",
+            "chain_length": 0,
+            "pre_chain": 0,
+            "first_break": None,
+            "error": "verifier unavailable",
+        }
+    status = raw.get("status") or "unknown"
+    return {
+        # ``ok`` is True only when the chain verified, False when broken,
+        # None when there's nothing stamped yet (empty / unknown).
+        "ok": True if status == "valid" else (False if status == "invalid" else None),
+        "status": status,
+        "chain_length": int(raw.get("checked") or 0),
+        "pre_chain": int(raw.get("pre_chain") or 0),
+        "first_break": raw.get("broken_at"),
+        "error": raw.get("error"),
+    }
+
+
+@bp_security.route("/api/security/integrity")
+def api_security_integrity():
+    """Tamper-evident hash-chain verify result for the Security tab.
+
+    Returns ``{ok, status, chain_length, pre_chain, first_break, error}``.
+    This is a node-wide / Free (always-on) integrity check — the same chain
+    the ``clawmetry verify-integrity`` CLI walks. Never 500s."""
+    try:
+        return jsonify(_integrity_status())
+    except Exception as e:  # never break the tab over a verify
+        return jsonify({
+            "ok": None, "status": "unknown", "chain_length": 0,
+            "pre_chain": 0, "first_break": None, "error": str(e),
+        })
+
+
+@bp_security.route("/api/security/audit")
+def api_security_audit():
+    """Recent Enterprise audit-log activity for the Security tab.
+
+    Thin mirror of ``/api/audit-log`` (entitlement-gated there) scoped to a
+    small recent window for the tab's recent-activity feed. Never raises —
+    an empty list paints an honest "nothing recorded yet" state."""
+    try:
+        from clawmetry import audit as _audit
+        try:
+            limit = max(1, min(int(request.args.get("limit", 25) or 25), 200))
+        except Exception:
+            limit = 25
+        entries = _audit.read_audit_log(limit=limit)
+        return jsonify({
+            "entries": entries,
+            "event_types": _audit.event_types(),
+            "count": len(entries),
+        })
+    except Exception:
+        return jsonify({"entries": [], "event_types": [], "count": 0})
+
+
+_LEAK_PATTERN_LABELS = {
+    "POL-LEAK-001": "aws",
+    "POL-LEAK-002": "anthropic",
+    "POL-LEAK-003": "openai",
+    "POL-LEAK-004": "github",
+    "POL-LEAK-005": "generic",
+}
+
+
+@bp_security.route("/api/security/credential-scan")
+def api_security_credential_scan():
+    """Scan recent session events for raw API keys (OpenAI, Anthropic, AWS, GitHub, generic).
+
+    Returns {leaks, count} where each leak has {type, file, line, pattern, redacted}.
+    Never returns the raw matched value. Reads from DuckDB via brain history —
+    works in both local and cloud deployments.
+    """
+    import dashboard as _d
+    from routes.brain import api_brain_history
+    try:
+        brain_resp = api_brain_history()
+        brain_data = brain_resp.get_json()
+        events = brain_data.get("events", [])
+    except Exception:
+        events = []
+
+    leaks = []
+    for idx, ev in enumerate(events):
+        detail = ev.get("detail") or ""
+        if len(detail) < 8:
+            continue
+        for sig in _d._POLICY_SIGNATURES:
+            if sig.get("type") != "LEAK":
+                continue
+            m = sig["_compiled"].search(detail)
+            if m:
+                raw = m.group(0)
+                redacted = (raw[:3] + "..." + raw[-4:]) if len(raw) > 8 else "***"
+                leaks.append({
+                    "type":     "api_key_leak",
+                    "file":     ev.get("source", ""),
+                    "line":     idx,
+                    "pattern":  _LEAK_PATTERN_LABELS.get(sig["id"], "unknown"),
+                    "redacted": redacted,
+                })
+                break  # one match per event
+
+    return jsonify({"leaks": leaks[:200], "count": len(leaks)})
+
+
 # ── Config / Cost optimization ─────────────────────────────────────────────
 
 
@@ -810,6 +1783,20 @@ def api_cost_optimizer():
         costs = _d._get_cost_summary()
         expensive_ops = _d._get_expensive_operations()
         ollama_installed = _d._detect_ollama()
+        # DuckDB fast path (refs #1565). The legacy ``_get_cost_summary``
+        # + ``_get_expensive_operations`` helpers read from the in-memory
+        # ``metrics_store`` ring (populated by the HTTP interceptor);
+        # that ring resets on process restart so the optimizer renders
+        # $0 / no candidates even when DuckDB holds weeks of real usage
+        # rows. When the local store has data, swap in its values for
+        # the data-derived slice (todayCost / projectedMonthlyCost /
+        # expensiveOps) and tag _source so the audit canary fires.
+        ls_slice = None
+        if is_local_store_read_enabled():
+            try:
+                ls_slice = _try_local_store_cost_optimizer()
+            except Exception:
+                ls_slice = None
 
         # Run llmfit
         llmfit_raw = {}
@@ -954,19 +1941,27 @@ def api_cost_optimizer():
         today = costs.get("today", 0) or 0
         projected = costs.get("projected", 0) or (today * 30)
 
-        return jsonify(
-            {
-                "system": system_out,
-                "localModels": local_models,
-                "taskRecommendations": task_recs[:6],
-                "todayCost": today,
-                "projectedMonthlyCost": projected,
-                "potentialSavings": "60-80% with local models for crons/heartbeats",
-                "expensiveOps": expensive_ops,
-                "ollamaInstalled": ollama_installed,
-                "llmfitAvailable": bool(llmfit_raw),
-            }
-        )
+        payload = {
+            "system": system_out,
+            "localModels": local_models,
+            "taskRecommendations": task_recs[:6],
+            "todayCost": today,
+            "projectedMonthlyCost": projected,
+            "potentialSavings": "60-80% with local models for crons/heartbeats",
+            "expensiveOps": expensive_ops,
+            "ollamaInstalled": ollama_installed,
+            "llmfitAvailable": bool(llmfit_raw),
+        }
+        if ls_slice is not None:
+            payload["todayCost"] = ls_slice["todayCost"]
+            payload["projectedMonthlyCost"] = ls_slice["projectedMonthlyCost"]
+            # Only override expensiveOps when DuckDB actually surfaced
+            # candidates — keep the in-memory list if the local store is
+            # populated but no row crossed the $0.01 threshold.
+            if ls_slice.get("expensiveOps"):
+                payload["expensiveOps"] = ls_slice["expensiveOps"]
+            payload["_source"] = "local_store"
+        return jsonify(payload)
     except Exception as e:
         # Hard fallback path: even llmfit + everything else broke. Use real
         # host detection so we never lie about the user's machine.
@@ -987,7 +1982,17 @@ def api_cost_optimizer():
 
 @bp_config.route("/api/cost-optimization")
 def api_cost_optimization():
-    """Cost optimization analysis and local model fallback recommendations."""
+    """Cost optimization analysis and local model fallback recommendations.
+
+    Tier-1 DuckDB fast path (refs #1565): the legacy ``_get_cost_summary``
+    / ``_get_expensive_operations`` helpers read ``dashboard._metrics_store``
+    (an in-memory ring populated by the HTTP interceptor) which resets on
+    every dashboard restart — the panel renders $0 with no candidates even
+    when DuckDB holds weeks of real usage rows. When the local store has
+    data, swap in its values for the data-derived slice (costs +
+    expensiveOps). Falls back to the legacy in-memory ring on empty store
+    or when ``CLAWMETRY_LOCAL_STORE_READ`` is off.
+    """
     import dashboard as _d
     try:
         # Get cost metrics
@@ -1002,6 +2007,30 @@ def api_cost_optimization():
         # Get recent expensive operations
         expensive_ops = _d._get_expensive_operations()
 
+        # DuckDB fast path — swap in DuckDB-derived values for the data
+        # slice when the local store has rows. Keeps host-state slices
+        # (localModels / llmfit / ollamaInstalled / savingsOpportunities)
+        # on the legacy path; only swaps the data-derived fields.
+        source_local = False
+        if is_local_store_read_enabled():
+            try:
+                ls_slice = _try_local_store_cost_optimization()
+            except Exception:
+                ls_slice = None
+            if ls_slice is not None:
+                costs = ls_slice["costs"]
+                # Only override expensiveOps when DuckDB actually surfaced
+                # candidates — mirrors the sibling cost-optimizer behavior
+                # so a populated store with no $0.01+ rows keeps the ring.
+                if ls_slice.get("expensiveOps"):
+                    expensive_ops = ls_slice["expensiveOps"]
+                # Recompute recommendations against the DuckDB costs so the
+                # banner copy matches the displayed numbers.
+                recommendations = _d._generate_cost_recommendations(
+                    costs, local_models_ollama
+                )
+                source_local = True
+
         # Get llmfit local model recommendations
         llmfit_data = _d._get_llmfit_recommendations()
 
@@ -1011,18 +2040,19 @@ def api_cost_optimization():
         # Build savings opportunities
         savings = _d._generate_savings_opportunities()
 
-        return jsonify(
-            {
-                "costs": costs,
-                "localModels": local_models_ollama,
-                "recommendations": recommendations,
-                "expensiveOps": expensive_ops,
-                "llmfit": llmfit_data,
-                "ollamaInstalled": ollama_installed,
-                "llmfitAvailable": llmfit_data.get("available", False),
-                "savingsOpportunities": savings,
-            }
-        )
+        payload = {
+            "costs": costs,
+            "localModels": local_models_ollama,
+            "recommendations": recommendations,
+            "expensiveOps": expensive_ops,
+            "llmfit": llmfit_data,
+            "ollamaInstalled": ollama_installed,
+            "llmfitAvailable": llmfit_data.get("available", False),
+            "savingsOpportunities": savings,
+        }
+        if source_local:
+            payload["_source"] = "local_store"
+        return jsonify(payload)
     except Exception as e:
         return jsonify(
             {
@@ -1046,22 +2076,159 @@ def api_cost_optimization():
         )
 
 
+# Tool keys that the legacy log-scanner tracked as "command" patterns. We
+# preserve the exact shape here so the unchanged ``_generate_automation_suggestions``
+# transformer (in ``dashboard.py``) still emits the same suggestion rows
+# for cron / skill candidates (curl, git, npm, systemctl, grep, find, ls).
+# Real OpenClaw v3 tool names are mapped onto these legacy buckets so the
+# fast path produces equivalent recommendations without re-walking
+# moltbot-*.log files that don't exist on most installs.
+_AUTOMATION_TOOL_TO_LEGACY = {
+    # Bash/exec family → "curl"/"git"/"npm"/"systemctl" classification is
+    # delegated to the suggestion transformer via raw tool name. For tools
+    # without a legacy bucket we still surface the pattern but the
+    # transformer skips the cron/skill upsell — fine, the universal
+    # suggestions still land.
+    "Bash": "bash",
+    "exec": "bash",
+    "process": "bash",
+    "Read": "read",
+    "read": "read",
+    "Write": "write",
+    "write": "write",
+    "write_file": "write",
+    "Edit": "edit",
+    "edit": "edit",
+    "Grep": "grep",
+    "grep": "grep",
+    "Glob": "find",
+    "find": "find",
+    "web_search": "curl",       # external HTTP → same bucket as curl
+    "ollama_web_search": "curl",
+    "web_fetch": "curl",
+    "ollama_web_fetch": "curl",
+}
+
+
+def _try_local_store_automation_analysis():
+    """Tier-1 DuckDB fast path for /api/automation-analysis (refs #1565).
+
+    Replaces the legacy ``dashboard._analyze_work_patterns`` scanner,
+    which reads ``~/.openclaw/logs/moltbot-YYYY-MM-DD.log`` files and
+    journalctl output to count tool/command frequency. On modern OpenClaw
+    installs those log files don't exist (the agent runtime now writes
+    structured JSONL events into the session transcripts, ingested into
+    DuckDB by the sync daemon) — so the legacy path silently returns an
+    empty pattern list on every fresh install, which then makes the
+    suggestion transformer emit ONLY universal fallback rows (no
+    tool-driven cron / skill candidates). Same silent-zero hazard as the
+    cost-optimizer in-memory ring (see PR #1576).
+
+    This helper queries the daemon-normalised ``events`` table for the
+    last 7 days of tool invocations, buckets them by tool name, and
+    builds the same ``{title, description, frequency, confidence,
+    priority, type, target}`` rows the legacy scanner produced. The
+    downstream transformer (``_generate_automation_suggestions``) is
+    pure-Python and unchanged — same suggestion shape, same dedupe, same
+    8-row cap.
+
+    Returns ``None`` when:
+      * the daemon proxy is unreachable AND direct DuckDB open fails
+      * the events table has no tool-call rows in the 7d window
+        (caller falls back to the legacy log scanner so journalctl users
+        keep working)
+    """
+    from routes.sessions import _ls_call  # late import: avoid cycle
+    since_iso = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    rows = _ls_call(
+        "query_tool_call_invocations", since=since_iso, limit=50_000
+    ) or []
+    if not rows:
+        return None
+
+    # Bucket invocations by legacy tool key. We accept both the v3 native
+    # name (e.g. "Bash") and the legacy log-scanner key (e.g. "bash") so
+    # the suggestion transformer's hard-coded match list keeps working.
+    freq: dict = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        raw = (r.get("name") or "").strip()
+        if not raw:
+            continue
+        key = _AUTOMATION_TOOL_TO_LEGACY.get(raw, raw.lower())
+        freq[key] = freq.get(key, 0) + 1
+
+    if not freq:
+        return None
+
+    patterns: list = []
+    for cmd, count in freq.items():
+        # Same threshold as the legacy scanner — 5+ uses/week. Keeps the
+        # noise floor identical so callers don't see a flood of new low-
+        # confidence rows just because DuckDB has every event.
+        if count < 5:
+            continue
+        confidence = min(90, count * 10)
+        priority = "high" if count >= 15 else "medium" if count >= 10 else "low"
+        patterns.append({
+            "title": f'Frequent "{cmd}" command usage',
+            "description": (
+                f'Command "{cmd}" has been used {count} times in the past '
+                f'week. This might be a candidate for automation.'
+            ),
+            "frequency": f"{count} times/week",
+            "confidence": confidence,
+            "priority": priority,
+            "type": "command",
+            "target": cmd,
+            "_source": "local_store",
+        })
+
+    if not patterns:
+        return None
+    patterns.sort(
+        key=lambda x: (
+            x["priority"] == "high",
+            x["priority"] == "medium",
+            x["confidence"],
+        ),
+        reverse=True,
+    )
+    return patterns
+
+
 @bp_config.route("/api/automation-analysis")
 def api_automation_analysis():
     """Automation pattern analysis and suggestions for new cron jobs or skills."""
     import dashboard as _d
     try:
-        # Analyze recent patterns
-        patterns = _d._analyze_work_patterns()
+        patterns = None
+        source = None
+        if is_local_store_read_enabled():
+            try:
+                patterns = _try_local_store_automation_analysis()
+            except Exception:
+                patterns = None
+            if patterns is not None:
+                source = "local_store"
+        if patterns is None:
+            # Legacy log-scanner fallback (journalctl + moltbot-*.log).
+            patterns = _d._analyze_work_patterns()
 
-        # Generate automation suggestions
+        # Pure-Python transformer — unchanged shape. Works on both the
+        # DuckDB rows and the legacy log-scanner rows since they share
+        # the same {type, target, ...} schema.
         suggestions = _d._generate_automation_suggestions(patterns)
 
-        return jsonify({
+        body = {
             'patterns': patterns,
             'suggestions': suggestions,
-            'lastAnalysis': datetime.now(timezone.utc).isoformat()
-        })
+            'lastAnalysis': datetime.now(timezone.utc).isoformat(),
+        }
+        if source:
+            body['_source'] = source
+        return jsonify(body)
     except Exception as e:
         return jsonify({
             'patterns': [],
@@ -1071,7 +2238,7 @@ def api_automation_analysis():
         })
 
 
-def _try_local_store_session_history_tokens():
+def _try_local_store_session_history_tokens(exclude_clawmetry: bool = True):
     """Tier-1 DuckDB fast path for /api/context-anatomy session-history bucket.
 
     Replaces a 5-file × N-line JSONL scan (the single hottest blocking
@@ -1081,11 +2248,20 @@ def _try_local_store_session_history_tokens():
     behaviour exactly. Returns ``None`` to defer to the JSONL scanner if:
       * the daemon proxy isn't reachable AND direct open fails
       * the events table has no message events with non-zero usage yet
+
+    Args:
+        exclude_clawmetry: filter out ClawMetry-internal plumbing
+            sessions (clawmetry-selfevolve, clawmetry-fix, …). Default
+            True so the value drives a user-facing "context window
+            usage" gauge — see ``query_context_window_peek``.
     """
+    kwargs = {"scan_sessions": 5}
+    if not exclude_clawmetry:
+        kwargs["exclude_clawmetry"] = False
     result = None
     try:
         from routes.local_query import local_store_via_daemon
-        result = local_store_via_daemon("query_context_window_peek", scan_sessions=5)
+        result = local_store_via_daemon("query_context_window_peek", **kwargs)
     except Exception:
         result = None
     if result is None:
@@ -1094,7 +2270,7 @@ def _try_local_store_session_history_tokens():
         try:
             from clawmetry import local_store
             store = local_store.get_store(read_only=True)
-            result = store.query_context_window_peek(scan_sessions=5)
+            result = store.query_context_window_peek(**kwargs)
         except Exception:
             return None
     if not isinstance(result, dict):

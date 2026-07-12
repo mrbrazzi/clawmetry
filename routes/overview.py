@@ -683,12 +683,16 @@ def api_channels():
     # where the user is using the OpenClaw control UI but hasn't configured
     # webchat as a formal channel.
     try:
-        gw_log_paths = [
-            os.path.expanduser("~/.openclaw/logs/gateway.log"),
-            os.path.expanduser("~/.openclaw-dev/logs/gateway.log"),
-        ]
-        gw_log = next((p for p in gw_log_paths if os.path.isfile(p)), None)
-        if gw_log:
+        # Resolve the live gateway log across versions. OpenClaw 2026.5.28+
+        # writes /tmp/openclaw/openclaw-<date>.log (the legacy
+        # ~/.openclaw/logs/gateway.log is now an empty stub), so a hardcoded
+        # legacy path detected webchat nowhere. The "webchat connected"
+        # substring is present inside the new structured-JSON line's
+        # `message` field and the line also carries `"time":"<today>T..."`,
+        # so the plain substring test still works on the raw JSON line.
+        from routes.infra import resolve_gateway_log_path  # late import
+        gw_log = resolve_gateway_log_path()
+        if gw_log and os.path.isfile(gw_log):
             today = datetime.now().strftime("%Y-%m-%d")
             with open(gw_log) as _wf:
                 for line in _wf:
@@ -700,6 +704,152 @@ def api_channels():
         pass
 
     return jsonify({"channels": configured})
+
+
+# ── Gateway-tap opt-in comms (issue #1233) ─────────────────────────────────
+#
+# PR #1228 flipped the live WS gateway tap (clawmetry/gateway_tap.py) from
+# default-ON to default-OFF for the OpenClaw scope-grant transition. Users
+# who previously relied on the tap for inbound channel-message bodies
+# (Telegram, Signal, WhatsApp, Discord, ...) now silently see no new rows.
+#
+# We detect the gap from DuckDB: 1+ channel_messages in the prior 7d window
+# AND zero in the last 24h AND the tap env var is not enabled. If all three
+# hold, /api/overview piggybacks a one-line ``_comms.show_gateway_tap_banner``
+# flag so the dashboard frontend can render a dismissible "Channel watch is
+# now opt-in — enable in Settings, or upgrade to Pro for defaults" banner.
+#
+# Cached for 5 min so the dashboard's hot 10s refresh doesn't re-query the
+# store for slow-moving state. Always degrades to ``show=False`` on error
+# (no banner is the safe default — never block the dashboard render).
+_GATEWAY_TAP_COMMS_CACHE = {"ts": 0.0, "value": None}
+_GATEWAY_TAP_COMMS_TTL = 300.0  # 5 min
+
+
+def _compute_gateway_tap_comms() -> dict:
+    """Return ``{"show_gateway_tap_banner": bool, "show_pro_cta": bool}``.
+
+    Heuristic for ``show_gateway_tap_banner``:
+      * The ``CLAWMETRY_ENABLE_WS_TAP`` env var is NOT set (i.e. user is on
+        the post-#1228 default-OFF path).
+      * The DuckDB ``channel_messages`` table has >=1 row in the
+        ``[now-7d, now-24h]`` window (proves the user previously got tap
+        data — they're impacted, not a fresh install).
+      * The DuckDB ``channel_messages`` table has 0 rows in the last 24h
+        (proves the gap is currently active — not a stale historical row).
+
+    ``show_pro_cta`` adds a "Pro defaults this on" hint when the user is not
+    already on Pro. Both flags default to ``False`` on any failure.
+    """
+    now = time.time()
+    cached = _GATEWAY_TAP_COMMS_CACHE.get("value")
+    if cached is not None and (now - _GATEWAY_TAP_COMMS_CACHE["ts"]) < _GATEWAY_TAP_COMMS_TTL:
+        return cached
+
+    out = {"show_gateway_tap_banner": False, "show_pro_cta": False}
+    try:
+        # Tap already opted-in? Nothing to nag about.
+        if os.environ.get("CLAWMETRY_ENABLE_WS_TAP", "").strip() in ("1", "true", "yes"):
+            _GATEWAY_TAP_COMMS_CACHE.update(ts=now, value=out)
+            return out
+
+        # Prior-7d activity (any inbound or outbound channel row).
+        seven_d_iso = datetime.fromtimestamp(now - 7 * 86400, tz=timezone.utc).isoformat()
+        prior = _ls_call("query_channel_messages", since=seven_d_iso, limit=1)
+        if not prior:
+            _GATEWAY_TAP_COMMS_CACHE.update(ts=now, value=out)
+            return out
+
+        # Last-24h activity. If we see ANY row, the tap isn't the gap.
+        one_d_iso = datetime.fromtimestamp(now - 86400, tz=timezone.utc).isoformat()
+        recent = _ls_call("query_channel_messages", since=one_d_iso, limit=1)
+        if recent:
+            _GATEWAY_TAP_COMMS_CACHE.update(ts=now, value=out)
+            return out
+
+        out["show_gateway_tap_banner"] = True
+
+        # Pro CTA — same pattern as routes/alerts.py.
+        try:
+            import dashboard as _d
+            is_pro = bool(_d._is_pro_user())
+        except Exception:
+            is_pro = False
+        out["show_pro_cta"] = not is_pro
+    except Exception:
+        # Never let comms compute break the overview render.
+        out = {"show_gateway_tap_banner": False, "show_pro_cta": False}
+
+    _GATEWAY_TAP_COMMS_CACHE.update(ts=now, value=out)
+    return out
+
+
+# ── LLM Context Inspector parity helpers (issue: OSS↔cloud mismatch) ──────
+# The Context tab on OSS and on app.clawmetry.com used to disagree because
+# they computed Context Window Usage and Skills from different sources
+# (OSS hit /api/overview.mainTokens + /api/skills; cloud read the snapshot's
+# top-level mainTokens and had no /api/skills route → 410 Gone).
+# These two helpers compute the new shared fields (currentContextTokens,
+# skillHeaderTokens) that both /api/overview and the daemon snapshot now
+# expose so the Context tab reads one value on both sides.
+
+def _try_local_store_context_peek():
+    """Full context-window peek for the user's most-recent assistant turn.
+
+    Returns ``{"input_tokens": int, "context_window": int}`` (other keys
+    from ``query_context_window_peek`` may be present). ``exclude_clawmetry``
+    is pinned True so the gauge tracks the user's agent, not ClawMetry's own
+    plumbing. ``context_window`` is sized from the turn's model + observed
+    size so a 1M-context session (≈323K live) reads against a 1M window
+    instead of the old hardcoded 200K (which showed ">100%"). Returns an
+    empty dict on any miss so callers fall back to defaults.
+    """
+    try:
+        from routes.local_query import local_store_via_daemon
+        peek = local_store_via_daemon(
+            "query_context_window_peek", scan_sessions=5, exclude_clawmetry=True,
+        )
+    except Exception:
+        peek = None
+    if peek is None:
+        try:
+            from clawmetry import local_store
+            peek = local_store.get_store(read_only=True).query_context_window_peek(
+                scan_sessions=5, exclude_clawmetry=True,
+            )
+        except Exception:
+            return {}
+    return peek if isinstance(peek, dict) else {}
+
+
+def _try_local_store_current_context_tokens():
+    """Live prompt size (int) for the user's most-recent assistant turn.
+
+    Thin wrapper over :func:`_try_local_store_context_peek` kept for
+    backwards compatibility. Returns 0 on any miss — the frontend then
+    falls back to mainTokens.
+    """
+    try:
+        return int((_try_local_store_context_peek() or {}).get("input_tokens") or 0)
+    except Exception:
+        return 0
+
+
+def _compute_skill_header_tokens():
+    """Sum of header tokens for all installed skills.
+
+    Reuses ``routes.skills.compute_skills_payload`` (the same source
+    /api/skills serves) so OSS and the daemon snapshot agree on the
+    number rendered by the LLM Context Inspector's ``## Skills`` bar.
+    Returns 0 if the helper raises — we never fail the overview render
+    on a missing skill catalogue.
+    """
+    try:
+        from routes.skills import compute_skills_payload
+        payload = compute_skills_payload() or {}
+        return int((payload.get("summary") or {}).get("total_header_tokens") or 0)
+    except Exception:
+        return 0
 
 
 def _try_local_store_overview():
@@ -760,11 +910,25 @@ def _try_local_store_overview():
             "model": meta.get("model"),
         })
 
-    # Pick the most recent non-subagent session as the "main" session.
+    # Pick the user's main session — first non-subagent, non-ClawMetry-
+    # internal session in the most-recently-active-first order from
+    # query_sessions_table (`ORDER BY last_active_at DESC`).
+    #
+    # Without the ClawMetry filter OSS surfaced clawmetry-selfevolve /
+    # clawmetry-fix plumbing sessions as "main" — e.g. it reported the
+    # 204K cumulative tokens of a SelfEvolve run as the user's main
+    # session while the cloud snapshot (which already filters them at
+    # clawmetry/sync.py:9167) reported the real ~38K. Bug surfaced
+    # 2026-05-23.
+    from clawmetry.config import hide_clawmetry_session
     def _is_subagent(s):
         sid = (s.get("session_id") or "").lower()
         return "subagent" in sid or "sub-agent" in sid
-    main = next((s for s in sessions if not _is_subagent(s)), sessions[0])
+    def _is_user_main(s):
+        sid = s.get("session_id") or ""
+        return not _is_subagent(s) and not hide_clawmetry_session(sid)
+    user_sessions = [s for s in sessions if _is_user_main(s)]
+    main = user_sessions[0] if user_sessions else sessions[0]
 
     # Active = status=='active' (DuckDB persists status as a free-form string;
     # 'active' is what sync.py writes for in-progress sessions).
@@ -892,15 +1056,40 @@ def _try_local_store_overview():
     except Exception:
         infra["storage"] = "Disk"
 
+    # OSS/cloud parity: user-visible session count excludes sub-agents and
+    # ClawMetry-internal plumbing sessions so the OSS Overview matches the
+    # cloud snapshot's `sessionCount` (clawmetry/sync.py builds the same way).
+    user_session_count = len(user_sessions) if user_sessions else len(sessions)
+
+    # `currentContextTokens` is the right "Context Window Usage" gauge —
+    # the most recent assistant turn's live prompt size (input + cache),
+    # filtered to exclude clawmetry-* plumbing sessions. `contextWindow`
+    # is sized from THAT turn's model + observed size so the gauge stays
+    # coherent: a 1M-context session (≈323K live) reads against a 1M
+    # window instead of the old hardcoded 200K (which showed ">100%").
+    # Falls back to 0 / 200K so the frontend can degrade to mainTokens
+    # for daemons without these fields.
+    _ctx_peek = _try_local_store_context_peek()
+    current_context_tokens = int(_ctx_peek.get("input_tokens") or 0)
+    context_window = int(_ctx_peek.get("context_window") or 0) or 200000
+
+    # `skillHeaderTokens` lets the LLM Context Inspector render the
+    # "## Skills" bar from the snapshot/overview without a separate
+    # /api/skills fetch (which is 410 Gone in cloud mode). Same source
+    # of truth on OSS and cloud.
+    skill_header_tokens = _compute_skill_header_tokens()
+
     return {
         "model": model_name,
         "provider": _d._infer_provider_from_model(model_name),
-        "sessionCount": len(sessions),
-        "sessions": len(sessions),  # alias for E2E compatibility
+        "sessionCount": user_session_count,
+        "sessions": user_session_count,  # alias for E2E compatibility
         "activeSessions": active_count,
         "mainSessionUpdated": main.get("last_active_at") or main.get("started_at"),
         "mainTokens": main.get("total_tokens", 0),
-        "contextWindow": 200000,
+        "currentContextTokens": current_context_tokens or 0,
+        "skillHeaderTokens": skill_header_tokens or 0,
+        "contextWindow": context_window,
         "cronCount": len(crons),
         "cronEnabled": enabled,
         "cronDisabled": disabled,
@@ -912,6 +1101,8 @@ def _try_local_store_overview():
         "client_health": _detect_anthropic_oauth(),
         # Issue #688: north-star metric. Always present, even on empty data.
         "autonomy": _autonomy_for_overview(),
+        # Issue #1233: opt-in nudge for users impacted by PR #1228 default-OFF flip.
+        "_comms": _compute_gateway_tap_comms(),
         "_source": "local_store",
     }
 
@@ -1066,6 +1257,8 @@ def api_overview():
             "client_health": _detect_anthropic_oauth(),
             # Issue #688: north-star autonomy metric (always present).
             "autonomy": _autonomy_for_overview(),
+            # Issue #1233: opt-in nudge for users impacted by PR #1228 default-OFF flip.
+            "_comms": _compute_gateway_tap_comms(),
         }
     )
 
@@ -1281,6 +1474,110 @@ def _try_local_store_prompt_errors(since_iso):
     return {"errors": errors, "count": len(errors), "_source": "local_store"}
 
 
+# ── Health timeline (#2196 item #4) ──────────────────────────────────────────
+# 30s cache: a dashboard widget polls this; recomputing it iterates events
+# across ~60 sessions, which is cheap but not free.
+
+_HEALTH_TIMELINE_CACHE_TTL = 30.0
+_health_timeline_cache: dict = {"ts": 0.0, "value": None}
+_health_timeline_cache_lock = threading.Lock()
+
+
+@bp_overview.route("/api/health-timeline")
+def api_health_timeline():
+    """Per-runtime sparkline of recent sessions, severity by health (#2196 item #4).
+
+    Each "dot" summarises one session: severity is ``red`` for any real
+    error (post #2202 benign-error filtering), ``yellow`` for any waste flag
+    (#2215), ``green`` otherwise. Runtimes come from the session-id prefix
+    (cf. ``waste_flags.runtime_from_session_id``). Same shape as the cloud
+    snapshot's ``healthTimeline`` slice.
+
+    Query params:
+
+    - ``session_limit`` (default 60, clamped 1-200) — newest sessions to scan
+    - ``events_per_session`` (default 500, clamped 1-500)
+    - ``dots_per_runtime``  (default 30, clamped 1-200)
+    """
+    try:
+        from clawmetry import waste_flags as _wf
+        from routes.local_query import local_store_via_daemon
+    except Exception as exc:
+        return jsonify({"runtimes": [], "error": f"unavailable: {exc}"}), 503
+
+    session_limit = max(1, min(int(request.args.get("session_limit") or 60), 200))
+    events_per_session = max(1, min(int(request.args.get("events_per_session") or 500), 500))
+    dots_per_runtime = max(1, min(int(request.args.get("dots_per_runtime") or 30), 200))
+
+    cache_key = (session_limit, events_per_session, dots_per_runtime)
+    with _health_timeline_cache_lock:
+        cached = _health_timeline_cache.get("value")
+        cached_key = _health_timeline_cache.get("key")
+        if (
+            cached is not None
+            and cached_key == cache_key
+            and (_time.time() - _health_timeline_cache["ts"]) < _HEALTH_TIMELINE_CACHE_TTL
+        ):
+            return jsonify(cached)
+
+    try:
+        sessions = local_store_via_daemon("query_sessions", limit=session_limit) or []
+    except Exception as exc:
+        return jsonify({"runtimes": [], "error": f"sessions unavailable: {exc}"}), 503
+
+    buckets: dict = {}
+    for s in sessions:
+        sid = s.get("session_id")
+        if not sid:
+            continue
+        try:
+            events = local_store_via_daemon(
+                "query_events", session_id=sid, limit=events_per_session,
+            ) or []
+        except Exception:
+            continue
+        try:
+            signals = _wf.compute_signals_from_events(events)
+            flags = _wf.compute_flags(signals)
+            error_count = sum(1 for e in events if _wf.event_is_real_error(e))
+        except Exception:
+            continue
+        try:
+            cost = float(s.get("cost_usd") or 0.0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        runtime = _wf.runtime_from_session_id(sid)
+        buckets.setdefault(runtime, []).append({
+            "session_id": str(sid),
+            "started_at": s.get("started_at"),
+            "updated_at": s.get("updated_at"),
+            "severity": _wf.severity_from_counts(error_count, len(flags)),
+            "error_count": error_count,
+            "flag_count": len(flags),
+            "flag_types": [f.get("type") for f in flags],
+            "cost_usd": cost,
+        })
+
+    runtimes_out = []
+    for runtime, dots in buckets.items():
+        dots.sort(key=lambda d: (d.get("started_at") or ""), reverse=True)
+        runtimes_out.append({"runtime": runtime, "dots": dots[:dots_per_runtime]})
+    runtimes_out.sort(
+        key=lambda r: (
+            (r["dots"][0].get("started_at") if r["dots"] else "") or "",
+            r["runtime"],
+        ),
+        reverse=True,
+    )
+
+    payload = {"runtimes": runtimes_out, "generated_at": _time.time()}
+    with _health_timeline_cache_lock:
+        _health_timeline_cache["ts"] = _time.time()
+        _health_timeline_cache["key"] = cache_key
+        _health_timeline_cache["value"] = payload
+    return jsonify(payload)
+
+
 @bp_overview.route("/api/prompt-errors")
 def api_prompt_errors():
     """Return recent openclaw:prompt-error events from session JSONL files.
@@ -1373,6 +1670,40 @@ def api_prompt_errors():
     return jsonify({"errors": errors, "count": len(errors)})
 
 
+@bp_overview.route("/api/activity-heatmap")
+def api_activity_heatmap():
+    """30-day session activity heatmap data (#875)."""
+    from datetime import datetime, timedelta
+
+    now = datetime.now()
+    cutoff = (now - timedelta(days=29)).strftime("%Y-%m-%d") + "T00:00:00"
+    rows = _ls_call("query_sessions", since=cutoff, limit=10000) or []
+
+    day_sessions: dict = {}
+    day_tokens: dict = {}
+    day_cost: dict = {}
+    for row in rows:
+        started = (row.get("started_at") or "")[:10]
+        if not started:
+            continue
+        day_sessions[started] = day_sessions.get(started, 0) + 1
+        day_tokens[started] = day_tokens.get(started, 0) + int(row.get("token_count") or 0)
+        day_cost[started] = day_cost.get(started, 0) + float(row.get("cost_usd") or 0)
+
+    days = []
+    for i in range(29, -1, -1):
+        d = now - timedelta(days=i)
+        ds = d.strftime("%Y-%m-%d")
+        days.append({
+            "date": ds,
+            "label": d.strftime("%b ") + str(d.day),
+            "sessions": day_sessions.get(ds, 0),
+            "tokens": day_tokens.get(ds, 0),
+            "cost": round(day_cost.get(ds, 0), 4),
+        })
+    return jsonify({"days": days})
+
+
 @bp_overview.route("/api/cloud-cta/status")
 def cloud_cta_status():
     import dashboard as _d
@@ -1429,6 +1760,44 @@ def cloud_proxy(cloud_path):
                 {"Content-Type": e.headers.get("Content-Type", "application/json")})
     except Exception as e:
         return jsonify({"error": "proxy_failed", "detail": str(e)[:200]}), 502
+
+
+@bp_overview.route("/api/cloud-cta/oauth-start", methods=["POST"])
+def cloud_cta_oauth_start():
+    """One-click cloud sign-up + node connect via GitHub/Google OAuth.
+
+    Starts a loopback browser-bridge and returns the cloud OAuth start URL for
+    the dashboard to open in a new tab. The cm_ key the cloud mints rides back
+    over 127.0.0.1 only; the bridge thread then registers this node and starts
+    the sync daemon. The dashboard polls /api/cloud-cta/oauth-status.
+    """
+    import dashboard as _d
+
+    data = request.get_json(silent=True) or {}
+    provider = (data.get("provider") or "").strip().lower()
+    if provider not in ("github", "google"):
+        return jsonify({"ok": False, "error": "Unsupported provider"}), 400
+    url = _d._start_oauth_bridge(provider)
+    if not url:
+        err = (_d._OAUTH_BRIDGE or {}).get("error") or "Could not start sign-in"
+        return jsonify({"ok": False, "error": err}), 500
+    return jsonify({"ok": True, "url": url})
+
+
+@bp_overview.route("/api/cloud-cta/oauth-status")
+def cloud_cta_oauth_status():
+    import dashboard as _d
+
+    st = dict(_d._OAUTH_BRIDGE or {})
+    return jsonify(
+        {
+            "status": st.get("status", "idle"),
+            "provider": st.get("provider", ""),
+            "node_id": st.get("node_id", ""),
+            "enc_key": st.get("enc_key", ""),
+            "error": st.get("error", ""),
+        }
+    )
 
 
 @bp_overview.route("/api/cloud-cta/send-otp", methods=["POST"])
@@ -1493,3 +1862,62 @@ def cloud_cta_verify_otp():
         except Exception:
             _eb = {}
         return jsonify({"ok": False, "error": _eb.get("error", "Invalid code")}), 502
+
+
+def _compute_device_summary() -> dict:
+    """Build the compact /api/device/summary payload for embedded displays.
+
+    Pulls session count + current model from query_sessions_table and
+    today's token/cost totals from query_aggregates. Both store methods
+    are already registered in the daemon proxy dispatch table so this
+    works in both single-process (dev) and split-process (daemon) modes.
+    """
+    now = time.time()
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    sess_rows = _ls_call("query_sessions_table", limit=200) or []
+    sessions_out = []
+    for r in sess_rows:
+        meta = r.get("metadata") or {}
+        sessions_out.append({
+            "status": (r.get("status") or "").lower(),
+            "model": meta.get("model"),
+        })
+    active = sum(1 for s in sessions_out if s["status"] == "active")
+    model = next((s["model"] for s in sessions_out if s.get("model")), "unknown")
+
+    agg_rows = _ls_call("query_aggregates", since=today + "T00:00:00") or []
+    tokens_today = int(sum(r.get("token_count", 0) or 0 for r in agg_rows))
+    cost_today = round(float(sum(r.get("cost_usd", 0.0) or 0.0 for r in agg_rows)), 6)
+
+    return {
+        "model": model,
+        "sessions": len(sessions_out),
+        "active_sessions": active,
+        "tokens_today": tokens_today,
+        "cost_today_usd": cost_today,
+        "ts": int(now),
+    }
+
+
+@bp_overview.route("/api/device/summary")
+def api_device_summary():
+    """Compact stats endpoint for embedded displays (e.g. ESP32-S3).
+
+    Returns a minimal JSON payload — model, session counts, today's token and
+    cost totals — suitable for low-bandwidth polling by hardware dashboards.
+    All fields degrade gracefully to zero/unknown when DuckDB is unavailable.
+
+    Added for issue #3244 (ESP32-S3 / Clawdmeter-style integration).
+    """
+    try:
+        return jsonify(_compute_device_summary())
+    except Exception:
+        return jsonify({
+            "model": "unknown",
+            "sessions": 0,
+            "active_sessions": 0,
+            "tokens_today": 0,
+            "cost_today_usd": 0.0,
+            "ts": int(time.time()),
+        })

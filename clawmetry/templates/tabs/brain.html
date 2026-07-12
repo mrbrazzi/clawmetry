@@ -1,12 +1,22 @@
 <div class="page" id="page-brain">
   <div style="padding:12px 0 8px 0;">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
-      <span style="font-size:14px;font-weight:700;color:var(--text-primary);">🧠 Brain -- Unified Activity Stream</span>
+      <span style="font-size:14px;font-weight:700;color:var(--text-primary);">🧠 <span data-i18n="brain.title">Brain · Unified Activity Stream</span>
+        <!-- Loop-signals badge (#1364): hidden until /api/loop-signals returns >0. JS: app.js loadLoopSignals() (called from loadBrainPage). Revived from the dead DASHBOARD_HTML block (UI-coverage audit 2026-06-06). -->
+        <button id="brain-loops-badge" type="button" onclick="toggleLoopSignalsList()" style="display:none;margin-left:8px;background:rgba(239,68,68,0.15);color:#ef4444;border:1px solid rgba(239,68,68,0.4);border-radius:10px;padding:2px 9px;font-size:11px;font-weight:700;cursor:pointer;font-family:inherit;" title="LoopDetector signals from the ClawMetry proxy"><span id="brain-loops-badge-count">0</span> loops</button></span>
       <div style="
         display:flex;
         align-items:center;
         gap:8px;
-        "><span id="brain-live-indicator"></span><button id="brain-plumbing-btn" class="refresh-btn" onclick="toggleBrainPlumbing()" title="Show internal queue/dequeue events (hidden by default — they're plumbing, not content)" style="font-weight:500;"><span id="brain-plumbing-state">○</span> Show plumbing <span id="brain-plumbing-count" style="opacity:0.7;font-size:11px;"></span></button><button id="brain-focus-btn" class="refresh-btn" onclick="toggleBrainFocus()" title="Focus mode: hide everything except the event stream">⛶ Focus</button><button class="refresh-btn" onclick="loadBrainPage()">↻ Refresh</button></div>
+        "><span id="brain-live-indicator"></span><button id="brain-plumbing-btn" class="refresh-btn" onclick="toggleBrainPlumbing()" data-i18n-title="brain.plumbing_tooltip" title="Show internal queue/dequeue events (hidden by default, they're plumbing, not content)" style="font-weight:500;"><span id="brain-plumbing-state">○</span> <span data-i18n="brain.show_plumbing">Show plumbing</span> <span id="brain-plumbing-count" style="opacity:0.7;font-size:11px;"></span></button><button id="brain-focus-btn" class="refresh-btn" onclick="toggleBrainFocus()" data-i18n-title="brain.focus_tooltip" title="Focus mode: hide everything except the event stream">⛶ Focus</button><button class="refresh-btn" onclick="loadBrainPage()">↻ <span data-i18n="common.refresh">Refresh</span></button></div>
+    </div>
+    <!-- Loop-signals table (#1364): collapsed until the badge is clicked. JS: app.js loadLoopSignals() fills #brain-loops-table; toggleLoopSignalsList() shows it. Revived from the dead DASHBOARD_HTML block. -->
+    <div id="brain-loops-panel" style="display:none;background:var(--bg-secondary);border:1px solid rgba(239,68,68,0.4);border-radius:8px;padding:10px 14px;margin-bottom:12px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <span style="font-size:11px;font-weight:600;color:#ef4444;text-transform:uppercase;letter-spacing:1px;">Loops detected (proxy)</span>
+        <span style="font-size:10px;color:var(--text-muted);">From the ClawMetry proxy LoopDetector (last 60 min)</span>
+      </div>
+      <div id="brain-loops-table" style="font-size:11px;font-family:'JetBrains Mono','SF Mono',monospace;color:var(--text-secondary);"></div>
     </div>
     <style>
       /* Focus mode: hide chrome, expand event stream to viewport */
@@ -48,40 +58,41 @@
       display:none;
       ">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
-        <span style="font-size:14px;font-weight:700;color:#c4b5fd;">✨ Advisor</span>
-        <span style="font-size:11px;color:var(--text-muted);">ask anything about this agent's activity</span>
+        <span style="font-size:14px;font-weight:700;color:#c4b5fd;">✨ <span data-i18n="brain.advisor">Advisor</span></span>
+        <span style="font-size:11px;color:var(--text-muted);" data-i18n="brain.advisor_hint">ask anything about this agent's activity</span>
       </div>
       <div style="display:flex;gap:8px;">
         <input id="advisor-q" type="text"
+          data-i18n-placeholder="brain.advisor_placeholder"
           placeholder="e.g. why did my last run cost so much?"
           onkeydown="if(event.key==='Enter')advisorAsk()"
           style="flex:1;padding:10px 12px;background:var(--bg-primary);border:1px solid var(--border);
                  border-radius:8px;color:var(--text-primary);font-size:13px;outline:none;" />
         <button onclick="advisorAsk()"
           style="padding:10px 18px;background:#a855f7;color:#fff;border:none;border-radius:8px;
-                 font-size:13px;font-weight:600;cursor:pointer;box-shadow:0 2px 8px rgba(168,85,247,0.3);">Ask</button>
+                 font-size:13px;font-weight:600;cursor:pointer;box-shadow:0 2px 8px rgba(168,85,247,0.3);" data-i18n="brain.ask">Ask</button>
       </div>
       <div id="advisor-suggestions" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;">
         <button class="advisor-sugg" onclick="advisorPrefill('Why did my last run cost so much?')"
           style="font-size:11px;padding:4px 10px;border-radius:12px;background:rgba(168,85,247,0.1);
-                 border:1px solid rgba(168,85,247,0.2);color:#c4b5fd;cursor:pointer;">
+                 border:1px solid rgba(168,85,247,0.2);color:#c4b5fd;cursor:pointer;" data-i18n="brain.sugg_cost">
           Why did my last run cost so much?</button>
         <button class="advisor-sugg" onclick="advisorPrefill('Which tool is failing most often?')"
           style="font-size:11px;padding:4px 10px;border-radius:12px;background:rgba(168,85,247,0.1);
-                 border:1px solid rgba(168,85,247,0.2);color:#c4b5fd;cursor:pointer;">
+                 border:1px solid rgba(168,85,247,0.2);color:#c4b5fd;cursor:pointer;" data-i18n="brain.sugg_tool">
           Which tool is failing most often?</button>
         <button class="advisor-sugg" onclick="advisorPrefill('Is my agent looping?')"
           style="font-size:11px;padding:4px 10px;border-radius:12px;background:rgba(168,85,247,0.1);
-                 border:1px solid rgba(168,85,247,0.2);color:#c4b5fd;cursor:pointer;">
+                 border:1px solid rgba(168,85,247,0.2);color:#c4b5fd;cursor:pointer;" data-i18n="brain.sugg_loop">
           Is my agent looping?</button>
       </div>
       <!-- Contextual link to the standalone Self-Evolve page. Hidden until
            the probe confirms auth, so users without Anthropic creds don't
            see a dead-end link. -->
       <div id="advisor-selfevolve-hint" style="display:none;margin-top:8px;font-size:11px;color:var(--text-muted);">
-        Want a structured review with severity-ranked findings instead?
+        <span data-i18n="brain.selfevolve_hint">Want a structured review with severity-ranked findings instead?</span>
         <a href="#selfevolve" onclick="switchTab('selfevolve');return false;"
-           style="color:#60a5fa;text-decoration:none;font-weight:600;cursor:pointer;">
+           style="color:#60a5fa;text-decoration:none;font-weight:600;cursor:pointer;" data-i18n="brain.run_selfevolve">
           Run Self-Evolve →
         </a>
       </div>
@@ -103,7 +114,7 @@
       </div>
     </div>
 
-    <!-- Activity density chart -->
+    <!-- Activity density chart + time range picker -->
     <div class="brain-density-wrap" style="
       background:var(--bg-secondary);
       border:1px solid var(--border);
@@ -111,15 +122,70 @@
       padding:10px 14px;
       margin-bottom:12px;
       ">
-      <div style="
-        font-size:11px;
-        color:var(--text-muted);
-        margin-bottom:6px;
-        ">Activity density -- last 60 min (30s buckets)</div>
-      <canvas id="brain-density-chart" height="60" style="width:100%;display:block;"></canvas>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
+        <div id="brain-density-label" style="
+          font-size:11px;
+          color:var(--text-muted);
+          " data-i18n="brain.activity_density">Activity density · last 60 min (30s buckets)</div>
+        <!-- Date-time range picker: investigate any window ("what happened
+             at 3AM?"). Live = streaming default; presets freeze a window
+             ending now; Custom takes an explicit from/to. Handlers in
+             app.js (setBrainTimeRange / applyBrainCustomRange). -->
+        <div id="brain-range-bar" style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;" data-i18n-title="brain.range_tooltip" title="Show activity from a specific time window">
+          <button class="brain-range-btn time-btn active" data-range="live" onclick="setBrainTimeRange('live',this)" data-i18n="brain.range_live">● Live</button>
+          <button class="brain-range-btn time-btn" data-range="3600" onclick="setBrainTimeRange(3600,this)">1h</button>
+          <button class="brain-range-btn time-btn" data-range="21600" onclick="setBrainTimeRange(21600,this)">6h</button>
+          <button class="brain-range-btn time-btn" data-range="86400" onclick="setBrainTimeRange(86400,this)">24h</button>
+          <button class="brain-range-btn time-btn" data-range="custom" id="brain-range-custom-btn" onclick="toggleBrainCustomRange(this)" data-i18n="brain.range_custom">Custom…</button>
+        </div>
+      </div>
+      <div id="brain-custom-range" style="display:none;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:8px;font-size:11px;color:var(--text-muted);">
+        <span data-i18n="brain.range_from">From</span>
+        <input type="datetime-local" class="brain-dtl" id="brain-range-from" step="60" onclick="_brainOpenPicker(this)" style="padding:4px 6px;background:var(--bg-primary);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-size:11px;font-family:inherit;">
+        <span data-i18n="brain.range_to">to</span>
+        <input type="datetime-local" class="brain-dtl" id="brain-range-to" step="60" onclick="_brainOpenPicker(this)" style="padding:4px 6px;background:var(--bg-primary);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-size:11px;font-family:inherit;">
+        <button class="refresh-btn" onclick="applyBrainCustomRange()" style="font-weight:600;" data-i18n="brain.range_apply">Show this window</button>
+      </div>
+      <div id="brain-history-banner" style="display:none;align-items:center;gap:8px;flex-wrap:wrap;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.35);border-radius:6px;padding:6px 10px;margin-bottom:8px;font-size:12px;color:#f59e0b;">
+        <span>🕰 <span data-i18n="brain.viewing_history">Viewing history</span> · <span id="brain-history-banner-text" style="font-weight:600;"></span></span>
+        <span id="brain-history-banner-status" style="color:var(--text-muted);font-size:11px;"></span>
+        <button class="refresh-btn" onclick="setBrainTimeRange('live')" style="margin-left:auto;font-weight:600;" data-i18n="brain.back_to_live">● Back to live</button>
+      </div>
+      <canvas id="brain-density-chart" height="100" style="width:100%;display:block;"></canvas>
     </div>
-    <div class="brain-view-toggle">
-      
+    <!-- Sessions-at-risk card (issue #2008): surfaces the existing
+         /api/outcomes/impact endpoint in a visible UI summary. Hidden when
+         all impact counts are zero; rendered by loadBrainAtRisk() in app.js. -->
+    <div id="brain-at-risk-card" style="display:none;
+      background:var(--bg-secondary);
+      border:1px solid #f59e0b;
+      border-radius:8px;
+      padding:10px 14px;
+      margin-bottom:12px;">
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">
+        <span style="font-size:13px;font-weight:700;color:#f59e0b;">⚠ <span data-i18n="brain.at_risk_title">Sessions at risk</span></span>
+        <span id="brain-at-risk-window" style="font-size:11px;color:var(--text-muted);"></span>
+      </div>
+      <div id="brain-at-risk-chips" style="display:flex;flex-wrap:wrap;gap:6px;"></div>
+    </div>
+    <!-- Forward-progress card (issue #1707): per-session token-to-delta ratio
+         badges. Hidden when all sessions are green (healthy). Populated by
+         loadBrainProgress() in app.js. -->
+    <div id="brain-progress-card" style="display:none;
+      background:var(--bg-secondary);
+      border:1px solid #6366f1;
+      border-radius:8px;
+      padding:10px 14px;
+      margin-bottom:12px;">
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">
+        <span style="font-size:13px;font-weight:700;color:#818cf8;">🔄 <span data-i18n="brain.progress_title">Unproductive burn detected</span></span>
+        <span id="brain-progress-window" style="font-size:11px;color:var(--text-muted);"></span>
+      </div>
+      <div id="brain-progress-chips" style="display:flex;flex-wrap:wrap;gap:6px;"></div>
+    </div>
+    <div class="brain-view-toggle" data-i18n-title="brain.view_toggle_tooltip" title="Switch between list view and neural-network view">
+      <button class="brain-view-btn active" data-view="list" onclick="setBrainViewMode('list', this)" data-i18n="brain.view_list">List</button>
+      <button class="brain-view-btn" data-view="graph" onclick="setBrainViewMode('graph', this)" data-i18n-title="brain.view_graph_tooltip" title="Neural-network visualization of agent activity (closes #53)" data-i18n="brain.view_graph">Graph</button>
     </div>
     <!-- Source filter chips -->
     <div id="brain-filter-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px;">
@@ -132,7 +198,7 @@
         font-size:11px;
         cursor:pointer;
         font-weight:600;
-        ">All</button>
+        " data-i18n="brain.filter_all">All</button>
     </div>
     <!-- Type filter chips (separate container to prevent duplication) -->
     <div id="brain-type-chips" style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:6px;"></div>
@@ -146,7 +212,7 @@
       padding:10px 14px;
       ">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-        <span style="font-size:11px;color:var(--text-muted);">Live event stream (newest first)</span>
+        <span style="font-size:11px;color:var(--text-muted);" data-i18n="brain.live_event_stream">Live event stream (newest first)</span>
         <span id="brain-new-pill" style="
           display:none;
           background:#a855f7;
@@ -156,10 +222,10 @@
           font-size:10px;
           font-weight:700;
           cursor:pointer;
-          " onclick="scrollBrainToTop()">↑ new events</span>
+          " onclick="scrollBrainToTop()">↑ <span data-i18n="brain.new_events">new events</span></span>
       </div>
       <div id="brain-stream" style="max-height:calc(100vh - 320px);overflow-y:auto;">
-        <div style="color:var(--text-muted);padding:20px;font-size:13px;">Loading recent activity…</div>
+        <div style="color:var(--text-muted);padding:20px;font-size:13px;" data-i18n="brain.loading_activity">Loading recent activity…</div>
       </div>
     </div>
     <div id="brain-graph-wrap" class="brain-graph-container" style="display:none;">

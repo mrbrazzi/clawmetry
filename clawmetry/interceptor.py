@@ -25,7 +25,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 import re
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -38,13 +38,32 @@ _LLM_URL_PATTERNS = [
     "openrouter.ai",
 ]
 
+# Hosts to exclude from external-API capture (noise / internal traffic).
+# User can extend via CLAWMETRY_INTERCEPT_HOSTS_EXCLUDE=host1,host2 (substring).
+_EXCLUDED_HOST_DEFAULTS = frozenset([
+    "localhost",
+    "127.0.0.1",
+    "0.0.0.0",
+    "169.254.",        # link-local / AWS metadata
+    "::1",
+    # LLM providers already tracked as llm_call
+    "api.anthropic.com",
+    "api.openai.com",
+    "generativelanguage.googleapis.com",
+    "openrouter.ai",
+    # ClawMetry infra — don't capture our own sync calls
+    "ingest.clawmetry.com",
+    "app.clawmetry.com",
+])
 
-# Output file — in OpenClaw dir so ClawMetry sync picks it up
+
+# Output file — in ClawMetry's OWN data dir (~/.clawmetry), never inside the
+# agent's ~/.openclaw workspace. ClawMetry is read-only w.r.t. the agent: it
+# must not create or modify files under the agent's dir. The sync daemon tails
+# this path (and the legacy ~/.openclaw location for older installs).
 def _get_output_file() -> Path:
-    openclaw_dir = os.environ.get(
-        "CLAWMETRY_OPENCLAW_DIR", str(Path.home() / ".openclaw")
-    )
-    return Path(openclaw_dir) / "clawmetry-intercepted.jsonl"
+    cm_home = os.environ.get("CLAWMETRY_HOME", str(Path.home() / ".clawmetry"))
+    return Path(cm_home) / "intercepted.jsonl"
 
 
 # Write lock for thread-safe JSONL appends
@@ -57,11 +76,19 @@ _patched_requests = False
 
 # ── Pricing table (per 1M tokens, USD) ────────────────────────────────────────
 
-_PRICING: Dict[str, Dict[str, float]] = {
+_PRICING: dict[str, dict[str, float]] = {
     # Anthropic
     "claude-opus-4": {"input": 15.0, "output": 75.0},
+    # Opus 4.5+ is a new, cheaper generation ($5/$25 vs $15/$75) — verified
+    # against LiteLLM/ccusage 2026-06-08. Longest-match (below) picks these over
+    # the bare "claude-opus-4" key. opus-4/4-1 stay $15/$75.
+    "claude-opus-4-5": {"input": 5.0, "output": 25.0},
+    "claude-opus-4-6": {"input": 5.0, "output": 25.0},
+    "claude-opus-4-7": {"input": 5.0, "output": 25.0},
+    "claude-opus-4-8": {"input": 5.0, "output": 25.0},
     "claude-sonnet-4": {"input": 3.0, "output": 15.0},
-    "claude-haiku-4": {"input": 0.8, "output": 4.0},
+    "claude-haiku-4": {"input": 1.0, "output": 5.0},
+    "claude-haiku-4-5": {"input": 1.0, "output": 5.0},
     "claude-3-5-sonnet": {"input": 3.0, "output": 15.0},
     "claude-3-5-haiku": {"input": 0.8, "output": 4.0},
     "claude-3-opus": {"input": 15.0, "output": 75.0},
@@ -86,19 +113,46 @@ _PRICING: Dict[str, Dict[str, float]] = {
 
 def _estimate_cost(
     model: str, input_tokens: int, output_tokens: int
-) -> Optional[float]:
+) -> float | None:
     """Estimate cost in USD for given model and token counts."""
     if not model or (input_tokens == 0 and output_tokens == 0):
         return None
-    # Find best match (model names can have version suffixes like -20240229)
+    # Find the MOST SPECIFIC match (model names have version suffixes like
+    # -20240229). First-substring would let "gpt-4o" swallow "gpt-4o-mini" (a
+    # 16x over-charge) or "o1" swallow "o1-mini" — so pick the longest matching
+    # key, which is the more specific model.
     model_lower = model.lower()
+    best_key = None
+    best_prices = None
     for key, prices in _PRICING.items():
-        if key in model_lower:
-            cost = (
-                input_tokens * prices["input"] + output_tokens * prices["output"]
-            ) / 1_000_000
-            return round(cost, 8)
-    return None
+        idx = model_lower.find(key)
+        if idx == -1:
+            continue
+        # Reject a match immediately followed by a digit or "." — that's a
+        # different version (e.g. "gpt-4" must NOT price "gpt-4.1"/"gpt-4.5";
+        # let those fall through to the canonical table instead of classic
+        # gpt-4's $30/$60). "-"/letter suffixes (gpt-4-turbo, claude-opus-4-8)
+        # are still valid matches.
+        after = model_lower[idx + len(key): idx + len(key) + 1]
+        if after.isdigit() or after == ".":
+            continue
+        if best_key is None or len(key) > len(best_key):
+            best_key, best_prices = key, prices
+    if best_prices is not None:
+        cost = (
+            input_tokens * best_prices["input"] + output_tokens * best_prices["output"]
+        ) / 1_000_000
+        return round(cost, 8)
+    # Fall back to the canonical multi-provider table so a real out-loop call is
+    # never silently $0 just because this small table predates the model
+    # (gpt-4.1/5, o3/o4, gemini-2.5, grok, …). providers_pricing infers the
+    # provider from the model and returns a conservative non-zero estimate.
+    try:
+        from clawmetry.providers_pricing import estimate_event_cost_usd as _pp_cost
+        c = _pp_cost(model, input_tokens, output_tokens)
+        return round(c, 8) if c and c > 0 else None
+    except Exception:
+        return None
 
 
 # ── URL detection ──────────────────────────────────────────────────────────────
@@ -110,6 +164,47 @@ def _is_llm_url(url: str) -> bool:
         return False
     url_lower = url.lower()
     return any(pattern in url_lower for pattern in _LLM_URL_PATTERNS)
+
+
+def _is_excluded_host(url: str) -> bool:
+    """Return True if the URL should be silently skipped for external-call capture."""
+    if not url:
+        return True
+    url_lower = url.lower()
+    if any(h in url_lower for h in _EXCLUDED_HOST_DEFAULTS):
+        return True
+    extra = os.environ.get("CLAWMETRY_INTERCEPT_HOSTS_EXCLUDE", "").strip()
+    if extra:
+        for part in extra.split(","):
+            part = part.strip().lower()
+            if part and part in url_lower:
+                return True
+    return False
+
+
+def _build_external_event(
+    url: str, method: str, status_code: int, latency_ms: float, library: str
+) -> dict[str, Any]:
+    """Build an external_api_call event dict."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc or url.split("/")[2]
+    except Exception:
+        host = ""
+    ev: dict[str, Any] = {
+        "type": "external_api_call",
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "url": url,
+        "host": host,
+        "method": (method or "").upper(),
+        "status_code": status_code,
+        "latency_ms": round(latency_ms, 1),
+        "library": library,
+    }
+    src = _get_source()
+    if src:
+        ev["source"] = src
+    return ev
 
 
 def _detect_provider(url: str) -> str:
@@ -129,7 +224,7 @@ def _detect_provider(url: str) -> str:
 # ── Request/Response parsing ───────────────────────────────────────────────────
 
 
-def _extract_model_from_body(body_bytes: bytes, url: str) -> Optional[str]:
+def _extract_model_from_body(body_bytes: bytes, url: str) -> str | None:
     """Try to extract model name from request body JSON."""
     if not body_bytes:
         return None
@@ -149,9 +244,9 @@ def _extract_model_from_body(body_bytes: bytes, url: str) -> Optional[str]:
     return None
 
 
-def _extract_tokens_from_response(body_bytes: bytes, provider: str) -> Dict[str, int]:
+def _extract_tokens_from_response(body_bytes: bytes, provider: str) -> dict[str, int]:
     """Extract input/output token counts from response body."""
-    result = {"input_tokens": 0, "output_tokens": 0}
+    result = {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0}
     if not body_bytes:
         return result
     try:
@@ -161,6 +256,12 @@ def _extract_tokens_from_response(body_bytes: bytes, provider: str) -> Dict[str,
             usage = body.get("usage", {})
             result["input_tokens"] = usage.get("input_tokens", 0)
             result["output_tokens"] = usage.get("output_tokens", 0)
+            result["reasoning_tokens"] = int(
+                usage.get("thinking_tokens")
+                or usage.get("reasoning_tokens")
+                or usage.get("thinking_input_tokens")
+                or 0
+            )
 
         elif provider in ("openai", "openrouter"):
             usage = body.get("usage", {})
@@ -178,7 +279,7 @@ def _extract_tokens_from_response(body_bytes: bytes, provider: str) -> Dict[str,
     return result
 
 
-def _extract_model_from_response(body_bytes: bytes, provider: str) -> Optional[str]:
+def _extract_model_from_response(body_bytes: bytes, provider: str) -> str | None:
     """Some providers echo the model in the response."""
     if not body_bytes:
         return None
@@ -195,7 +296,7 @@ def _extract_model_from_response(body_bytes: bytes, provider: str) -> Optional[s
 # ── JSONL writer ───────────────────────────────────────────────────────────────
 
 
-def _write_event(event: Dict[str, Any]) -> None:
+def _write_event(event: dict[str, Any]) -> None:
     """Thread-safely append an event to the JSONL output file."""
     try:
         out_file = _get_output_file()
@@ -211,16 +312,17 @@ def _write_event(event: Dict[str, Any]) -> None:
 def _build_event(
     provider: str,
     url: str,
-    model: Optional[str],
+    model: str | None,
     input_tokens: int,
     output_tokens: int,
     latency_ms: float,
     status_code: int,
     library: str,
-) -> Dict[str, Any]:
+    reasoning_tokens: int = 0,
+) -> dict[str, Any]:
     """Build the event dict to write to JSONL."""
     cost = _estimate_cost(model or "", input_tokens, output_tokens)
-    event: Dict[str, Any] = {
+    event: dict[str, Any] = {
         "type": "llm_call",
         "ts": datetime.now(timezone.utc).isoformat(),
         "provider": provider,
@@ -236,7 +338,33 @@ def _build_event(
         event["model"] = model
     if cost is not None:
         event["cost_usd"] = cost
+    if reasoning_tokens:
+        event["reasoning_tokens"] = reasoning_tokens
+    src = _get_source()
+    if src:
+        event["source"] = src
     return event
+
+
+# ── Named source (out-loop / production agents) ────────────────────────────────
+# A production agent built on an SDK (OpenAI Agents, LangChain, Vercel AI SDK,
+# E2B, …) is auto-tracked by `import clawmetry.track`. Tagging it with a name
+# makes it a first-class *source* in the dashboard (e.g. "support-agent",
+# "investment-agent") instead of an anonymous script, so you can attribute cost
+# per product. Set via CLAWMETRY_SOURCE=<name> or clawmetry.track.set_source().
+_source: str = ""
+
+
+def set_source(name: str) -> None:
+    """Tag every subsequently-intercepted LLM call with a named source."""
+    global _source
+    _source = (str(name or "").strip())[:120]
+
+
+def _get_source() -> str:
+    if _source:
+        return _source
+    return (os.environ.get("CLAWMETRY_SOURCE", "") or "").strip()[:120]
 
 
 # ── httpx patching ─────────────────────────────────────────────────────────────
@@ -257,6 +385,16 @@ def _patch_httpx() -> bool:
         ) -> httpx.Response:
             url = str(request.url)
             if not _is_llm_url(url):
+                if not _is_excluded_host(url):
+                    t0 = time.monotonic()
+                    response = _original_send(self, request, **kwargs)
+                    _write_event(_build_external_event(
+                        url, str(getattr(request, "method", "")),
+                        response.status_code,
+                        (time.monotonic() - t0) * 1000,
+                        "httpx",
+                    ))
+                    return response
                 return _original_send(self, request, **kwargs)
 
             provider = _detect_provider(url)
@@ -274,12 +412,14 @@ def _patch_httpx() -> bool:
             response = _original_send(self, request, **kwargs)
             latency_ms = (time.monotonic() - t0) * 1000
 
-            # Read response body (handle streaming responses properly)
+            # Only capture the body for NON-streaming calls. For a stream=True
+            # request, reading the body here would consume the caller's stream
+            # before it can iterate (turning token-by-token streaming into a
+            # blocking wait, or raising StreamConsumed). Never touch a stream.
             resp_body = b""
             try:
-                if hasattr(response, "stream") and response.stream:
-                    response.read()
-                resp_body = response.content
+                if not kwargs.get("stream", False):
+                    resp_body = response.content
             except Exception:
                 pass
 
@@ -293,6 +433,7 @@ def _patch_httpx() -> bool:
                 model=final_model,
                 input_tokens=tokens["input_tokens"],
                 output_tokens=tokens["output_tokens"],
+                reasoning_tokens=tokens["reasoning_tokens"],
                 latency_ms=latency_ms,
                 status_code=response.status_code,
                 library="httpx",
@@ -311,6 +452,16 @@ def _patch_httpx() -> bool:
             ) -> httpx.Response:
                 url = str(request.url)
                 if not _is_llm_url(url):
+                    if not _is_excluded_host(url):
+                        t0 = time.monotonic()
+                        response = await _original_async_send(self, request, **kwargs)
+                        _write_event(_build_external_event(
+                            url, str(getattr(request, "method", "")),
+                            response.status_code,
+                            (time.monotonic() - t0) * 1000,
+                            "httpx.async",
+                        ))
+                        return response
                     return await _original_async_send(self, request, **kwargs)
 
                 provider = _detect_provider(url)
@@ -326,11 +477,12 @@ def _patch_httpx() -> bool:
                 response = await _original_async_send(self, request, **kwargs)
                 latency_ms = (time.monotonic() - t0) * 1000
 
+                # Non-streaming only: never consume the caller's stream (see
+                # the sync path for the full rationale).
                 resp_body = b""
                 try:
-                    if hasattr(response, "stream") and response.stream:
-                        await response.read()
-                    resp_body = response.content
+                    if not kwargs.get("stream", False):
+                        resp_body = response.content
                 except Exception:
                     pass
 
@@ -344,6 +496,7 @@ def _patch_httpx() -> bool:
                     model=final_model,
                     input_tokens=tokens["input_tokens"],
                     output_tokens=tokens["output_tokens"],
+                    reasoning_tokens=tokens["reasoning_tokens"],
                     latency_ms=latency_ms,
                     status_code=response.status_code,
                     library="httpx.async",
@@ -383,6 +536,16 @@ def _patch_requests() -> bool:
         ) -> requests.Response:
             url = str(request.url or "")
             if not _is_llm_url(url):
+                if not _is_excluded_host(url):
+                    t0 = time.monotonic()
+                    response = _original_session_send(self, request, **kwargs)
+                    _write_event(_build_external_event(
+                        url, str(getattr(request, "method", "")),
+                        response.status_code,
+                        (time.monotonic() - t0) * 1000,
+                        "requests",
+                    ))
+                    return response
                 return _original_session_send(self, request, **kwargs)
 
             provider = _detect_provider(url)
@@ -404,9 +567,12 @@ def _patch_requests() -> bool:
             response = _original_session_send(self, request, **kwargs)
             latency_ms = (time.monotonic() - t0) * 1000
 
+            # requests' .content consumes a stream=True response, so only read
+            # it for non-streaming calls (never break the caller's stream).
             resp_body = b""
             try:
-                resp_body = response.content
+                if not kwargs.get("stream", False):
+                    resp_body = response.content
             except Exception:
                 pass
 
@@ -420,6 +586,7 @@ def _patch_requests() -> bool:
                 model=final_model,
                 input_tokens=tokens["input_tokens"],
                 output_tokens=tokens["output_tokens"],
+                reasoning_tokens=tokens["reasoning_tokens"],
                 latency_ms=latency_ms,
                 status_code=response.status_code,
                 library="requests",
@@ -439,7 +606,7 @@ def _patch_requests() -> bool:
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 
-def activate() -> Dict[str, bool]:
+def activate() -> dict[str, bool]:
     """
     Explicitly activate the interceptor.
 

@@ -16,8 +16,11 @@ Pure mechanical move — zero behaviour change from the previous in-file
 definitions.
 """
 
+import collections
 import json
 import os
+import re
+import re as _re
 import sys
 import time
 from datetime import datetime
@@ -25,7 +28,8 @@ from datetime import datetime
 import csv
 from datetime import timezone
 from flask import Blueprint, jsonify, request, Response
-from clawmetry.config import is_local_store_read_enabled
+from clawmetry.config import is_local_store_read_enabled, hide_clawmetry_session
+from routes._dedupe import build_sibling_bucket_max, is_sibling_dup
 
 bp_sessions = Blueprint('sessions', __name__)
 
@@ -36,6 +40,12 @@ _SUBAGENTS_SCAN_TAIL_BYTES = int(os.environ.get("CLAWMETRY_SUBAGENTS_SCAN_TAIL_B
 
 # Channels that don't identify a user-initiated session (generic/internal)
 _GENERIC_CHANNELS = frozenset({"unknown", "direct", "", "main", "internal"})
+
+# Per-agent pause tracking — in-memory only, resets on dashboard restart.
+# Actual pause/resume/stop is delegated to the gateway RPC; this set is the
+# dashboard's local view of which agent keys have been soft-paused.
+_paused_agents: set = set()
+_agent_control_audit: collections.deque = collections.deque(maxlen=200)
 
 
 def _ls_call(method_name, **kwargs):
@@ -80,6 +90,8 @@ def _infer_session_type(session):
         return "heartbeat"
     if kind == "subagent" or "subagent" in name:
         return "sub-agent"
+    if kind in ("attached", "external"):
+        return "attached"
     if channel and channel not in _GENERIC_CHANNELS:
         return "user"
     return "main"
@@ -187,6 +199,87 @@ def _decorate_with_channel_context(sessions):
     return sessions
 
 
+def _decorate_with_authority_counts(sessions):
+    """Stamp ``unauthorized_call_count`` onto each session row from the
+    authority_violations table.  Always a no-op when the proxy is disabled
+    or the table is empty — stamps 0 in that case rather than omitting the key.
+    """
+    if not sessions:
+        return sessions
+    ids = [s.get("session_id") or s.get("sessionId") for s in sessions]
+    counts = {}
+    try:
+        from routes.local_query import local_store_via_daemon
+        result = local_store_via_daemon("query_session_authority_counts",
+                                        session_ids=ids)
+        if isinstance(result, dict):
+            counts = result
+    except Exception:
+        pass
+    if not counts:
+        try:
+            from clawmetry import local_store
+            store = local_store.get_store(read_only=True)
+            counts = store.query_session_authority_counts(ids) or {}
+        except Exception:
+            counts = {}
+    for s in sessions:
+        sid = s.get("session_id") or s.get("sessionId")
+        s["unauthorized_call_count"] = counts.get(sid, 0)
+    return sessions
+
+
+def _session_last_active_epoch(s: dict):
+    """Extract a unix-second timestamp for a session row, tolerant of the
+    many shapes the gateway / local-store / JSONL paths produce.
+
+    Returns ``None`` when no usable timestamp is present (in which case
+    the row stays visible — we never drop on missing data, only on data
+    that *proves* the session is older than the cap).
+    """
+    # epoch-millis fields (gateway, unregistered-JSONL backfill)
+    for k in ("updatedAt", "lastActivityAt", "last_active_at_ms"):
+        v = s.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            return float(v) / 1000.0 if v > 1e12 else float(v)
+    # ISO-8601 fields (local-store path)
+    for k in ("last_active_at", "updated_at", "started_at"):
+        v = s.get(k)
+        if isinstance(v, str) and v:
+            try:
+                iso = v.replace("Z", "+00:00")
+                return datetime.fromisoformat(iso).timestamp()
+            except (ValueError, TypeError):
+                continue
+    return None
+
+
+def _apply_24h_retention_cap(sessions: list) -> bool:
+    """Drop sessions older than 24h for OSS / Cloud-Free callers (issue #1448).
+
+    Cloud-Pro users (validated by ``dashboard._is_pro_user``) bypass the cap.
+    Mutates ``sessions`` in place. Returns ``True`` when the cap kicked in
+    (i.e. caller was non-Pro) so the UI can render the upgrade CTA.
+
+    Mirrors the gating pattern introduced for /api/flow/runs in PR #1445.
+    """
+    try:
+        import dashboard as _d
+        is_pro = bool(_d._is_pro_user())
+    except Exception:
+        is_pro = False
+    if is_pro:
+        return False
+    cap_floor = time.time() - 24 * 3600
+    kept = []
+    for s in sessions:
+        ts = _session_last_active_epoch(s)
+        if ts is None or ts >= cap_floor:
+            kept.append(s)
+    sessions[:] = kept
+    return True
+
+
 @bp_sessions.route("/api/sessions")
 def api_sessions():
     import dashboard as _d
@@ -199,6 +292,17 @@ def api_sessions():
         fast = _try_local_store_sessions()
         if fast is not None:
             _merge_unregistered_jsonls(fast["sessions"])
+            capped = _apply_24h_retention_cap(fast["sessions"])
+            fast["capped_at_24h"] = capped
+            # Issue #1773: honest envelope marker. The fast path tags itself
+            # local_store, but _merge_unregistered_jsonls may have appended
+            # filesystem_unregistered rows. Recompute from the row markers so
+            # operators see the actual data path (vs. a misleading
+            # "local_store" envelope that hides an ingest outage).
+            fast["_source"] = _derive_envelope_source(
+                fast["sessions"], fallback="local_store"
+            )
+            fast["sessions"] = _filter_internal_sessions(fast["sessions"])
             return jsonify(fast)
     gw_data = _d._gw_invoke("sessions_list", {"limit": 20, "messageLimit": 0})
     if gw_data and "sessions" in gw_data:
@@ -212,6 +316,7 @@ def api_sessions():
     # subject without waiting for the full session-table cutover.
     if is_local_store_read_enabled():
         _decorate_with_channel_context(sessions)
+        _decorate_with_authority_counts(sessions)
     for s in sessions:
         if "session_type" not in s:
             s["session_type"] = _infer_session_type(s)
@@ -221,7 +326,60 @@ def api_sessions():
     # registrar runs). Without this merge those sessions stay invisible until
     # the registrar catches up — see MOAT_E2E_REPORT_2026-05-13 root-cause #3.
     _merge_unregistered_jsonls(sessions)
-    return jsonify({"sessions": sessions})
+    sessions = _filter_internal_sessions(sessions)
+    capped = _apply_24h_retention_cap(sessions)
+    return jsonify({"sessions": sessions, "capped_at_24h": capped})
+
+
+def _filter_internal_sessions(rows: list) -> list:
+    """Drop ClawMetry's own helper sessions (clawmetry-fix / -selfevolve /
+    -mem-probe …) from a session-row list so our plumbing doesn't mix with the
+    user's agent activity. Honors CLAWMETRY_SHOW_INTERNAL_SESSIONS=1."""
+    out = []
+    for s in rows or []:
+        if not isinstance(s, dict):
+            out.append(s)
+            continue
+        sid = (
+            s.get("sessionId") or s.get("id") or s.get("session_id") or s.get("key")
+        )
+        if hide_clawmetry_session(sid):
+            continue
+        out.append(s)
+    return out
+
+
+def _derive_envelope_source(rows: list, fallback: str = "local_store") -> str:
+    """Compute an honest envelope ``_source`` from per-row markers.
+
+    Issue #1773: ``/api/sessions`` (and any other route that unions multiple
+    backends) used to hard-code ``_source: "local_store"`` at the envelope
+    while individual rows might carry a different per-row marker
+    (e.g. ``filesystem_unregistered`` from the JSONL fallback). That misled
+    operators into thinking DuckDB was the source of truth when an ingest
+    outage had silently demoted the response to a filesystem scan.
+
+    Returns:
+      - ``fallback`` when ``rows`` is empty (nothing to derive from).
+      - The single source string when every row agrees.
+      - ``"mixed:a,b,..."`` (sources sorted alphabetically) when rows disagree.
+
+    Rows without a ``_source`` key are treated as ``fallback`` so we don't
+    over-claim purity for rows that simply forgot to tag themselves.
+    """
+    if not rows:
+        return fallback
+    sources = set()
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        src = r.get("_source") or fallback
+        sources.add(src)
+    if not sources:
+        return fallback
+    if len(sources) == 1:
+        return next(iter(sources))
+    return "mixed:" + ",".join(sorted(sources))
 
 
 def _merge_unregistered_jsonls(sessions: list) -> None:
@@ -298,10 +456,14 @@ def _fetch_sessions_table_rows(limit: int = 200):
     except Exception:
         pass
     # 2. Single-process fallback: open the DuckDB ourselves. Only works
-    #    when no other process holds the writer lock.
+    #    when no other process holds the writer lock. Issue #1240: open
+    #    read-only so we don't pay DuckDB's ~2.5s writer-lock-retry budget
+    #    when the daemon does own the writer lock (the daemon proxy attempt
+    #    above will have already failed in that case, so we get here, and
+    #    the RO open shares the writer's connection cleanly).
     try:
         from clawmetry import local_store
-        return local_store.get_store().query_sessions_table(limit=limit)
+        return local_store.get_store(read_only=True).query_sessions_table(limit=limit)
     except Exception:
         return None
 
@@ -333,15 +495,18 @@ def _try_local_store_sessions():
             "total_tokens":   int(r.get("total_tokens") or 0),
             "total_cost":     float(r.get("cost_usd") or 0.0),
             "message_count":  int(r.get("message_count") or 0),
+            "model":          meta.get("recent_model") or meta.get("model") or "",
             "channel":        meta.get("channel", ""),
             "chat_type":      meta.get("chat_type", ""),
             "subject":        title or meta.get("subject", ""),
             "session_type":   meta.get("session_type", "main"),
+            "runtime":        meta.get("runtime", ""),
             "_source":        "local_store",
         })
     # Decorate with channel context from the typed openclaw_channels table.
     # No-op when the table is empty; overrides only blank fields when present.
     _decorate_with_channel_context(out)
+    _decorate_with_authority_counts(out)
     return {"sessions": out, "_source": "local_store"}
 
 
@@ -458,6 +623,7 @@ def _try_local_store_sessions_by_type(type_filter: str = ""):
     # channel=telegram (typed table) classifies as "user" even if the metadata
     # blob never carried a channel field.
     _decorate_with_channel_context(sessions)
+    _decorate_with_authority_counts(sessions)
     for s in sessions:
         # Honour explicit metadata.session_type when present; otherwise
         # classify with the same _infer_session_type() the legacy path uses.
@@ -647,8 +813,21 @@ def _try_local_store_session_tools(sid: str, args_chars: int, result_chars: int,
     the same timeline shape the JSONL parser returns.
 
     Issue #1088 phase 3. Returns ``None`` to defer to the JSONL parser
-    when the events table has no message rows for this session."""
-    rows = _ls_call("query_events", session_id=sid, limit=10000)
+    when the events table has no message rows for this session.
+
+    Issue #1597: ALSO unions in events from any sub-agent session whose
+    ``subagents.parent_session_id`` matches ``sid`` — without this a
+    parent that delegated tool calls to a child rendered ``tool_calls=0``.
+    Sub-agent events are tagged with ``data._via_subagent_id`` upstream
+    so the resulting ``tools[]`` rows carry the same marker for the UI.
+    """
+    rows = _ls_call("query_events_with_subagents", session_id=sid, limit=10000)
+    # Pre-1597 daemons (older wheel running, fresh dashboard) won't have the
+    # helper allowlisted yet — fall back to the parent-only query so the
+    # endpoint still works during a staged rollout. The rollup will simply
+    # under-report sub-agent activity until the daemon is restarted.
+    if rows is None:
+        rows = _ls_call("query_events", session_id=sid, limit=10000)
     if not rows:
         return None
     rows = list(reversed(rows))  # query_events returns DESC
@@ -672,18 +851,168 @@ def _try_local_store_session_tools(sid: str, args_chars: int, result_chars: int,
             s = str(val)
         return s if len(s) <= limit else s[:limit] + "…"
 
+    # v3 turn / lifecycle event types — presence of ANY of these in DuckDB
+    # for the session means the daemon HAS ingested it. We must therefore
+    # serve from the fast path even when there are zero tool calls, so the
+    # legacy JSONL fallback is reserved for genuinely missing-from-DuckDB
+    # sessions. See reference_openclaw_v3_event_types.md.
+    _V3_TURN_TYPES = frozenset({
+        "session.started", "prompt.submitted", "model.completed",
+        "model.changed", "tool.call", "tool.result", "tool_use",
+        "tool_use_result", "custom",
+    })
+
     calls: dict = {}
     result_by_id: dict = {}
     turn_index = 0
-    saw_message = False
+    saw_any = False
+    earliest_ts_ms = 0
     for ev in rows:
-        if ev.get("event_type") != "message":
-            continue
-        saw_message = True
+        et = ev.get("event_type")
         data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        # Issue #1597: events sourced from a child sub-agent session are
+        # tagged by ``LocalStore.query_events_with_subagents`` so the
+        # rollup can attribute them in the UI ("via sub-agent X").
+        via_subagent_id = data.get("_via_subagent_id") if isinstance(data, dict) else None
+        ev_ts_ms = _parse_ts(
+            (data.get("timestamp") if isinstance(data, dict) else None)
+            or ev.get("ts")
+        )
+        if ev_ts_ms and (earliest_ts_ms == 0 or ev_ts_ms < earliest_ts_ms):
+            earliest_ts_ms = ev_ts_ms
+
+        # Any recognised v3 lifecycle / turn event proves the daemon has
+        # ingested this session. Mark saw_any so we return a populated
+        # (possibly tool-empty) structure instead of falling back to JSONL.
+        if et in _V3_TURN_TYPES:
+            saw_any = True
+
+        # v3 standalone tool_call row: self-contained call+result pair.
+        # Accepts the legacy ``tool_call`` name AND the daemon-normalised
+        # ``tool.call`` dot.separated name. Synthesize a tcid from the
+        # event id so the pairing logic below treats it as an
+        # immediately-resolved call.
+        if et in ("tool_call", "tool.call"):
+            turn_index += 1
+            tcid = ev.get("id") or f"tc-{ev_ts_ms}-{len(calls)}"
+            tool_name = ""
+            args_val = None
+            result_val = None
+            is_error = False
+            if isinstance(data, dict):
+                tool_name = (data.get("tool") or data.get("tool_name")
+                             or data.get("name") or "")
+                args_val = (data.get("args") if data.get("args") is not None
+                            else data.get("arguments") if data.get("arguments") is not None
+                            else data.get("input"))
+                result_val = data.get("result")
+                is_error = bool(data.get("is_error") or data.get("isError")
+                                or data.get("error"))
+            calls[tcid] = {
+                "tool_call_id":     tcid,
+                "tool_name":        tool_name,
+                "arguments":        _truncate(args_val, args_chars),
+                "start_ms":         ev_ts_ms,
+                "turn_index":       turn_index,
+                "model":            ev.get("model") or "",
+                "provider":         (data.get("provider") if isinstance(data, dict) else "") or "",
+                "message_cost_usd": float(ev.get("cost_usd") or 0.0),
+                "via_subagent_id":  via_subagent_id or "",
+            }
+            if result_val is not None or is_error:
+                try:
+                    rs = len(json.dumps(result_val, separators=(",", ":")))
+                except Exception:
+                    rs = len(str(result_val or ""))
+                result_by_id[tcid] = {
+                    "end_ms":         ev_ts_ms,
+                    "is_error":       is_error,
+                    "result_size":    rs,
+                    "result_preview": _truncate(result_val, result_chars),
+                }
+            continue
+
+        # v3 tool result event: pairs with a prior tool_use block by id.
+        # Daemon-normalised name is ``tool.result``; ``tool_use_result``
+        # is the raw v3 source type (rarely makes it through, but accept
+        # both for safety).
+        if et in ("tool.result", "tool_use_result"):
+            tcid = (data.get("tool_use_id") or data.get("toolUseId")
+                    or data.get("id") or "")
+            if tcid:
+                result_val = (data.get("output") if data.get("output") is not None
+                              else data.get("result"))
+                is_error = bool(data.get("is_error") or data.get("isError"))
+                try:
+                    rs = len(json.dumps(result_val, separators=(",", ":")))
+                except Exception:
+                    rs = len(str(result_val or ""))
+                result_by_id[tcid] = {
+                    "end_ms":         ev_ts_ms,
+                    "is_error":       is_error,
+                    "result_size":    rs,
+                    "result_preview": _truncate(result_val, result_chars),
+                }
+            continue
+
+        # v3 assistant turn (``model.completed``): tool invocations live as
+        # Anthropic-style ``tool_use`` blocks inside ``data.toolMetas`` (the
+        # ingest in clawmetry/sync.py::_v3_extract_tool_metas projects them
+        # to ``{id, name, input}``) and/or inside ``data.data.toolMetas``
+        # / ``data.message.content[]`` for raw envelopes. Walk all known
+        # locations so we don't miss any.
+        if et == "model.completed":
+            turn_index += 1
+            msg_model = (ev.get("model")
+                         or (data.get("modelId") if isinstance(data, dict) else "")
+                         or "")
+            msg_provider = (data.get("provider") if isinstance(data, dict) else "") or ""
+            msg_cost = float(ev.get("cost_usd") or 0.0)
+            tool_metas: list = []
+            inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+            for src in (data.get("toolMetas"), inner.get("toolMetas")):
+                if isinstance(src, list):
+                    tool_metas.extend(src)
+            # Also walk message.content[] for raw Anthropic-shape tool_use.
+            for envelope in (data.get("message"), inner.get("message")):
+                if isinstance(envelope, dict):
+                    content = envelope.get("content")
+                    if isinstance(content, list):
+                        for blk in content:
+                            if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                                tool_metas.append({
+                                    "id":    blk.get("id"),
+                                    "name":  blk.get("name") or "tool",
+                                    "input": blk.get("input") or {},
+                                })
+            seen_ids: set = set()
+            for meta in tool_metas:
+                if not isinstance(meta, dict):
+                    continue
+                tcid = meta.get("id") or ""
+                if not tcid or tcid in seen_ids:
+                    continue
+                seen_ids.add(tcid)
+                calls[tcid] = {
+                    "tool_call_id":     tcid,
+                    "tool_name":        meta.get("name", "") or "",
+                    "arguments":        _truncate(meta.get("input"), args_chars),
+                    "start_ms":         ev_ts_ms,
+                    "turn_index":       turn_index,
+                    "model":            msg_model,
+                    "provider":         msg_provider,
+                    "message_cost_usd": msg_cost,
+                    "via_subagent_id":  via_subagent_id or "",
+                }
+            continue
+
+        # Legacy: nested toolCall / toolResult inside ``message`` event rows
+        # (pre-v3 OpenClaw envelopes — kept for backward compatibility).
+        if et != "message":
+            continue
+        saw_any = True
         msg = data.get("message") if isinstance(data.get("message"), dict) else {}
         role = msg.get("role", "")
-        ev_ts_ms = _parse_ts(data.get("timestamp") or ev.get("ts"))
         if role == "assistant":
             turn_index += 1
             content = msg.get("content") or []
@@ -709,6 +1038,7 @@ def _try_local_store_session_tools(sid: str, args_chars: int, result_chars: int,
                     "model":            msg_model,
                     "provider":         msg_provider,
                     "message_cost_usd": msg_cost,
+                    "via_subagent_id":  via_subagent_id or "",
                 }
         elif role == "toolResult":
             tcid = msg.get("toolCallId", "")
@@ -721,7 +1051,7 @@ def _try_local_store_session_tools(sid: str, args_chars: int, result_chars: int,
                 "result_size":    len(json.dumps(details)) if details is not None else 0,
                 "result_preview": _truncate(details, result_chars),
             }
-    if not saw_message:
+    if not saw_any:
         return None
 
     tools: list = []
@@ -764,6 +1094,11 @@ def _try_local_store_session_tools(sid: str, args_chars: int, result_chars: int,
     ]
     first_start = min((r["start_ms"] for r in tools if r.get("start_ms")), default=0)
     last_end = max((r.get("end_ms", 0) for r in tools), default=0)
+    # Tool-empty v3 sessions still need a sensible timeline anchor so the
+    # UI can render a "session ran, no tools" state — fall back to the
+    # earliest lifecycle event (typically session.started).
+    if not first_start and earliest_ts_ms:
+        first_start = earliest_ts_ms
     return {
         "session_id": sid,
         "tools": tools,
@@ -957,12 +1292,32 @@ def _try_local_store_cost_split(wanted_sid: str, limit: int):
     walker returns.
 
     Issue #1088 phase 3. Returns ``None`` when the events table has no
-    message rows so the route falls through to the JSONL walker."""
-    rows = _ls_call(
-        "query_cost_split",
-        session_id=wanted_sid or None,
-        limit=limit,
-    )
+    message rows so the route falls through to the JSONL walker.
+
+    Issue #1597 class drain: when scoped to a single session
+    (``wanted_sid``), uses the sub-agent-rollup variant so a parent that
+    delegated cost to a Task-tool child still attributes that cost back.
+    Top-N mode (no ``wanted_sid``) keeps the flat per-session listing —
+    rollup is only meaningful when the caller has a target parent.
+    """
+    if wanted_sid:
+        rows = _ls_call(
+            "query_cost_split_with_subagents",
+            session_id=wanted_sid,
+            limit=limit,
+        )
+        if rows is None:
+            rows = _ls_call(
+                "query_cost_split",
+                session_id=wanted_sid,
+                limit=limit,
+            )
+    else:
+        rows = _ls_call(
+            "query_cost_split",
+            session_id=None,
+            limit=limit,
+        )
     if not rows:
         return None
     # Compute totals (mirrors the legacy path's aggregation).
@@ -1147,13 +1502,168 @@ def api_cost_split():
     return jsonify({"sessions": top, "totals": totals})
 
 
+def _try_local_store_task_runs(*, limit, status_filter, parent_filter,
+                               requester_filter):
+    """Fast path for /api/task-runs. Reads the pre-aggregated ``subagents``
+    DuckDB table — the same source PR #1569 wired into
+    ``_try_local_store_subagents``. OpenClaw's ``~/.openclaw/tasks/runs.sqlite``
+    and the subagents snapshot the sync daemon write-throughs from each
+    system-snapshot pass (see ``clawmetry/sync.py`` ``ingest_subagent`` call
+    site) carry the same lifecycle rows — the ``subagents`` table schema
+    comment in ``clawmetry/local_store.py`` calls this out explicitly
+    ("Shared by OpenClaw subagents + Claude Code Task tool.").
+
+    Audit hint for #1565 was "derive from query_events task lifecycle
+    types" — verified 2026-05-17 against ``sync.py::_parse_v3_event``:
+    no ``task.started`` / ``task.completed`` event types exist in v3
+    ingest. The canonical DuckDB source for task lifecycle IS the
+    ``subagents`` table; the audit hint was directionally correct
+    (DuckDB, not sqlite/JSONL) but pointed at the wrong table.
+
+    Returns ``None`` when the table is empty so the legacy
+    ``~/.openclaw/tasks/runs.sqlite`` fallback fires for installs whose
+    daemon hasn't snapshotted yet. Field shape matches the legacy
+    handler's output exactly so the Subagents modal (``app.js``
+    ``renderModalSubagents``) — which keys on ``task_id``,
+    ``parent_task_id``, ``child_session_key``, ``status``,
+    ``duration_ms``, ``label``, ``task``, ``terminal_outcome`` —
+    keeps working bit-for-bit.
+    """
+    rows = _ls_call("query_subagents", limit=max(limit, 500))
+    if not rows:
+        return None
+
+    # Snapshot status (from gateway subagents list) uses a different
+    # vocabulary than runs.sqlite. The UI keys on the runs.sqlite shape
+    # (`running` / `succeeded` / `failed` / `pending`) for colour pills
+    # and the "Failed" stat chip — normalise so the modal renders
+    # consistently across data sources.
+    _status_map = {
+        "active":    "running",
+        "running":   "running",
+        "idle":      "running",
+        "completed": "succeeded",
+        "succeeded": "succeeded",
+        "done":      "succeeded",
+        "failed":    "failed",
+        "error":     "failed",
+        "pending":   "pending",
+        "stale":     "pending",
+    }
+
+    tasks: list = []
+    counts: dict = {}
+    for r in rows:
+        sid = r.get("subagent_id") or ""
+        if not sid:
+            continue
+        extra = r.get("data") if isinstance(r.get("data"), dict) else {}
+
+        # Derive the runs.sqlite field names from subagents columns + data blob.
+        # ``subagent_id`` IS the task_id (one row per task spawn). The
+        # ``child_session_key`` is OpenClaw's canonical key shape; the
+        # parent (``requester_session_key``) is the session that issued
+        # the spawn. ``parent_task_id`` is only set for nested spawns and
+        # may not exist in the snapshot — fall back to extra dict.
+        parent_sid = r.get("parent_session_id") or extra.get("spawnedBy") or ""
+        child_key = extra.get("key") or f"agent:main:subagent:{sid}"
+        requester_key = (extra.get("requester_session_key")
+                         or (f"agent:main:{parent_sid}" if parent_sid else ""))
+
+        # Apply caller filters BEFORE building the row so the response
+        # honours ``status=`` / ``parent_task_id=`` / ``requester_session_key=``
+        # exactly like the legacy sqlite WHERE clause.
+        raw_status = (r.get("status") or "").strip().lower()
+        mapped_status = _status_map.get(raw_status, raw_status or "unknown")
+        if status_filter and mapped_status != status_filter and raw_status != status_filter:
+            continue
+        if parent_filter and (extra.get("parent_task_id") or "") != parent_filter:
+            continue
+        if requester_filter and requester_key != requester_filter:
+            continue
+
+        # started/ended come from the snapshot's ms timestamps (data blob)
+        # when available; spawned_at/ended_at strings are best-effort
+        # ISO fallbacks. duration_ms mirrors the legacy formula.
+        started_ms = int(extra.get("started_at_ms")
+                         or extra.get("updated_at_ms") or 0)
+        ended_ms = int(extra.get("ended_at_ms") or 0)
+        if not started_ms and r.get("spawned_at"):
+            try:
+                started_ms = int(datetime.fromisoformat(
+                    str(r["spawned_at"]).replace("Z", "+00:00")
+                ).timestamp() * 1000)
+            except Exception:
+                started_ms = 0
+        if not ended_ms and r.get("ended_at"):
+            try:
+                ended_ms = int(datetime.fromisoformat(
+                    str(r["ended_at"]).replace("Z", "+00:00")
+                ).timestamp() * 1000)
+            except Exception:
+                ended_ms = 0
+        duration_ms = max(0, ended_ms - started_ms) if started_ms and ended_ms else 0
+
+        task_d = {
+            "task_id":              sid,
+            "parent_task_id":       extra.get("parent_task_id") or "",
+            "child_session_key":    child_key,
+            "requester_session_key": requester_key,
+            "agent_id":             extra.get("agent_id") or "main",
+            "run_id":               extra.get("runId") or extra.get("run_id") or "",
+            "label":                extra.get("label") or extra.get("displayName") or "",
+            "task":                 r.get("task") or "",
+            "status":               mapped_status,
+            "delivery_status":      extra.get("delivery_status") or "",
+            "task_kind":            extra.get("task_kind") or "subagent",
+            "parent_flow_id":       extra.get("parent_flow_id") or "",
+            "created_at":           started_ms,
+            "started_at":           started_ms,
+            "ended_at":             ended_ms,
+            "last_event_at":        int(extra.get("updated_at_ms") or 0),
+            "error":                extra.get("error") or "",
+            "progress_summary":     extra.get("progress_summary") or "",
+            "terminal_summary":     extra.get("terminal_summary")
+                                    or extra.get("completionResult") or "",
+            "terminal_outcome":     extra.get("terminal_outcome")
+                                    or extra.get("completionStatus") or "",
+            "duration_ms":          duration_ms,
+        }
+        tasks.append(task_d)
+        counts[mapped_status] = counts.get(mapped_status, 0) + 1
+        if len(tasks) >= limit:
+            break
+
+    # Sort newest-first by started_at then created_at, matching the
+    # legacy ``ORDER BY COALESCE(started_at, created_at, 0) DESC`` clause.
+    tasks.sort(key=lambda t: t.get("started_at") or t.get("created_at") or 0,
+               reverse=True)
+
+    total = len(tasks)
+    failed = counts.get("failed", 0)
+    err_rate = round(failed / total * 100, 1) if total else 0
+    return {
+        "tasks":   tasks,
+        "counts":  counts,
+        "stats": {
+            "total":          total,
+            "succeeded":      counts.get("succeeded", 0),
+            "failed":         failed,
+            "running":        counts.get("running", 0),
+            "error_rate_pct": err_rate,
+        },
+        "_source": "local_store",
+    }
+
+
 @bp_sessions.route("/api/task-runs")
 def api_task_runs():
-    """Read ~/.openclaw/tasks/runs.sqlite — the canonical subagent/task registry."""
+    """Subagent / task registry. Prefers the DuckDB ``subagents`` table
+    fast path (populated by the sync daemon's snapshot pass); falls
+    back to OpenClaw's ``~/.openclaw/tasks/runs.sqlite`` for installs
+    whose daemon hasn't run yet.
+    """
     import sqlite3
-    p = os.path.expanduser("~/.openclaw/tasks/runs.sqlite")
-    if not os.path.isfile(p):
-        return jsonify({"tasks": [], "counts": {}, "note": "runs.sqlite not found"})
     try:
         limit = max(1, min(int(request.args.get("limit", "500")), 5000))
     except ValueError:
@@ -1161,6 +1671,22 @@ def api_task_runs():
     status_filter = (request.args.get("status", "") or "").strip()
     parent_filter = (request.args.get("parent_task_id", "") or "").strip()
     requester_filter = (request.args.get("requester_session_key", "") or "").strip()
+
+    # DuckDB fast path — skips the sqlite open entirely when the daemon
+    # has snapshotted at least one subagent row.
+    if is_local_store_read_enabled():
+        fast = _try_local_store_task_runs(
+            limit=limit,
+            status_filter=status_filter,
+            parent_filter=parent_filter,
+            requester_filter=requester_filter,
+        )
+        if fast is not None:
+            return jsonify(fast)
+
+    p = os.path.expanduser("~/.openclaw/tasks/runs.sqlite")
+    if not os.path.isfile(p):
+        return jsonify({"tasks": [], "counts": {}, "note": "runs.sqlite not found"})
     where = []
     args = []
     if status_filter:
@@ -1414,12 +1940,163 @@ def _scan_spawn_events_from_jsonl(sessions_dir, max_files=None, tail_bytes=None)
     return subs
 
 
+def _try_local_store_subagents(_rows=None):
+    """Fast path for /api/subagents. Reads the pre-aggregated ``subagents``
+    table that the sync daemon write-throughs from each system-snapshot
+    pass (see ``clawmetry/sync.py`` ``ingest_subagent`` call site). Each
+    row carries the same fields the JSONL-walking legacy path derives, so
+    we can serve the dashboard's Subagent Tracker tab without re-scanning
+    every session JSONL on every request.
+
+    ``_rows`` lets a caller pass ``query_subagents`` rows it already has
+    (e.g. the sync daemon building the snapshot on its OWN store handle,
+    where the cross-process ``_ls_call`` proxy is the wrong tool). When
+    omitted we fetch via the daemon proxy as usual.
+
+    Returns ``None`` when the table is empty so the legacy gateway-RPC +
+    JSONL fallback fires for older OpenClaw versions / installs whose
+    daemon hasn't snapshotted yet. Returns a populated shell (subagents=[],
+    counts zero'd) when the daemon HAS run but no subagents have been
+    spawned — keeps the route off the 100-file JSONL walker for the
+    common empty case.
+    """
+    rows = _rows if _rows is not None else _ls_call("query_subagents", limit=500)
+    # Distinguish "store missing entirely" (rows is None) from "store is
+    # there but no subagent rows yet" (rows == []). Both return None so
+    # the legacy gateway-RPC + JSONL fallback fires — older OpenClaw
+    # installs whose daemon hasn't snapshotted to the table yet still
+    # surface their subagents via the JSONL spawn scan.
+    if not rows:
+        return None
+
+    now_ms = time.time() * 1000
+    subagents: list = []
+    counts = {"total": 0, "active": 0, "idle": 0, "stale": 0, "failed": 0}
+
+    def _parse_ts_ms(ts):
+        if not ts:
+            return 0
+        if isinstance(ts, (int, float)):
+            return int(ts)
+        try:
+            return int(datetime.fromisoformat(
+                str(ts).replace("Z", "+00:00")
+            ).timestamp() * 1000)
+        except Exception:
+            return 0
+
+    for r in rows:
+        sid = r.get("subagent_id") or ""
+        if not sid:
+            continue
+        # ``data`` BLOB carries the fields not promoted to first-class
+        # columns (model, label, displayName, sessionFile, updated_at_ms,
+        # runtime_ms). _decode_data_blob_rows already deserialised it.
+        extra = r.get("data") if isinstance(r.get("data"), dict) else {}
+        updated_at_ms = (extra.get("updated_at_ms")
+                         or _parse_ts_ms(r.get("updated_at"))
+                         or 0)
+        spawned_at_ms = _parse_ts_ms(r.get("spawned_at")) or updated_at_ms
+        ended_at_ms = _parse_ts_ms(r.get("ended_at")) or 0
+
+        # Status: prefer the daemon's explicit classification verbatim
+        # (it may emit ``completed`` / ``running`` / etc. that aren't in
+        # the legacy bucket set — the UI handles those directly).
+        # Fall back to age-derived bucket only when status is missing.
+        # Computed BEFORE runtime so a dead agent's clock can be frozen.
+        status = (r.get("status") or "").strip().lower()
+        if not status:
+            age_ms = now_ms - (updated_at_ms or 0)
+            if age_ms < 120000:
+                status = "active"
+            elif age_ms < 600000:
+                status = "idle"
+            else:
+                status = "stale"
+
+        # Runtime is *active work time*, not wall-clock since spawn. #2031
+        # follow-up: the first fix recomputed only when runtime_ms was absent,
+        # but the daemon caches a `runtime_ms` that is itself a now-minus-spawn
+        # re-derived every snapshot (402M -> 403M -> 404M, ever-growing). So for
+        # a dead agent the cached value is poison and must be ignored, not
+        # trusted. Only an active/running agent's clock runs to now (and may use
+        # its cached value); idle / stale / completed / failed agents ALWAYS
+        # recompute frozen at their last known activity (ended_at, else last
+        # updated_at — updated_at_ms already prefers the real data-blob
+        # timestamp over the row's per-snapshot-bumped column).
+        _running = status in ("active", "running")
+        cached_rt = int(extra.get("runtime_ms") or 0)
+        if _running:
+            runtime_ms = cached_rt or (
+                max(0, int(now_ms - spawned_at_ms)) if spawned_at_ms else 0)
+        elif spawned_at_ms:
+            _end_ref = ended_at_ms or updated_at_ms or spawned_at_ms
+            runtime_ms = max(0, int(_end_ref - spawned_at_ms))
+        else:
+            runtime_ms = 0
+
+        token_count = int(r.get("token_count") or 0)
+        # Build key in OpenClaw's canonical shape so Active-Tasks modal
+        # lookups keep working when the legacy path falls back later.
+        key = extra.get("key") or f"agent:main:subagent:{sid}"
+        display = (extra.get("displayName") or extra.get("label")
+                   or (r.get("task") or "")[:80] or sid[:20])
+        model = extra.get("model") or "unknown"
+
+        elapsed_s = runtime_ms // 1000
+        if elapsed_s < 60:
+            runtime = f"{elapsed_s}s"
+        elif elapsed_s < 3600:
+            runtime = f"{elapsed_s // 60}m"
+        else:
+            runtime = f"{elapsed_s // 3600}h {(elapsed_s % 3600) // 60}m"
+
+        counts["total"] += 1
+        counts[status] = counts.get(status, 0) + 1
+        subagents.append({
+            "sessionId":        sid,
+            "key":              key,
+            "displayName":      display,
+            "model":            model,
+            "status":           status,
+            "depth":            int(extra.get("depth") or 1),
+            "parent":           r.get("parent_session_id") or extra.get("spawnedBy"),
+            "totalTokens":      token_count,
+            "costUsd":          round(float(r.get("cost_usd") or 0.0), 4),
+            "runtime":          runtime,
+            "runtimeMs":        runtime_ms,
+            "startedAt":        spawned_at_ms or updated_at_ms,
+            "updatedAt":        updated_at_ms,
+            "task":             r.get("task") or "",
+            "error":            extra.get("error") or "",
+            "completionResult": extra.get("completionResult") or "",
+            "completionStatus": extra.get("completionStatus") or "",
+            "completionTs":     extra.get("completionTs") or "",
+            "runtimeFormatted": extra.get("runtimeFormatted") or runtime,
+            "tokensIn":         int(extra.get("tokensIn") or 0),
+            "tokensOut":        int(extra.get("tokensOut") or 0),
+            "spawnAck":         extra.get("spawnAck") or "",
+            "runId":            extra.get("runId") or "",
+        })
+
+    _status_rank = {"active": 0, "idle": 1, "stale": 2, "failed": 3}
+    subagents.sort(key=lambda x: (_status_rank.get(x["status"], 9), x["depth"]))
+    return {
+        "subagents": subagents,
+        "counts":    counts,
+        "_source":   "local_store",
+    }
+
+
 @bp_sessions.route("/api/subagents")
 def api_subagents():
     """Return sub-agent list with depth/parent fields for the tree view.
 
     Data sources merged (in priority order):
 
+    0. DuckDB ``subagents`` table fast path (when the local store is
+       enabled) — pre-aggregated by the sync daemon's snapshot pass, so
+       we don't re-walk every session JSONL on every dashboard render.
     1. OpenClaw's canonical `subagents action=list` registry — live +
        last-30-min recent, with status explicitly.
     2. `sessions_list` gateway RPC filtered by key substring — catches
@@ -1437,6 +2114,20 @@ def api_subagents():
         cached = _SUBAGENTS_CACHE.get("data")
         if cached is not None and (time.time() - float(_SUBAGENTS_CACHE.get("ts") or 0)) < _SUBAGENTS_CACHE_TTL_SECONDS:
             return jsonify(cached)
+
+    # Source 0: DuckDB fast path. Skips the JSONL spawn-scan + gateway RPC
+    # entirely. ``full_scan`` still defers to the legacy path so the "force
+    # a complete JSONL rescan" escape hatch keeps working.
+    if not full_scan and is_local_store_read_enabled():
+        fast = _try_local_store_subagents()
+        if fast is not None:
+            if _paused_agents:
+                for _sa in fast.get("subagents", []):
+                    if (_sa.get("key") or _sa.get("sessionId") or "") in _paused_agents:
+                        _sa["status"] = "paused"
+            _SUBAGENTS_CACHE["data"] = fast
+            _SUBAGENTS_CACHE["ts"] = time.time()
+            return jsonify(fast)
 
     # Source 1: canonical subagent registry
     reg_active = []
@@ -1630,7 +2321,11 @@ def api_subagents():
             "runId":     s.get("runId") or sp_match.get("runId") or "",
         })
 
-    _status_rank = {"active": 0, "idle": 1, "stale": 2, "failed": 3}
+    if _paused_agents:
+        for _sa in subagents:
+            if (_sa.get("key") or _sa.get("sessionId") or "") in _paused_agents:
+                _sa["status"] = "paused"
+    _status_rank = {"active": 0, "idle": 1, "stale": 2, "paused": 3, "failed": 4}
     subagents.sort(key=lambda x: (_status_rank.get(x["status"], 9), x["depth"]))
     payload = {"subagents": subagents, "counts": counts}
     if not full_scan:
@@ -1639,14 +2334,612 @@ def api_subagents():
     return jsonify(payload)
 
 
+def _check_duplicate_completions(sessions_dir, max_files=None):
+    """Scan JSONL files for duplicate 'Internal task completion' events per child key.
+
+    Returns list of {type, subagentKey, count, timestamps} for any child
+    that received more than one completion broadcast in the parent transcript.
+    """
+    import glob as _glob
+    import re as _re
+    _session_key_re = _re.compile(r"session_key:\s*(agent:main:subagent:[\w-]+)")
+    completion_counts: dict = {}  # child_key -> [ts, ...]
+    if not sessions_dir or not os.path.isdir(sessions_dir):
+        return []
+    files = _glob.glob(os.path.join(sessions_dir, "*.jsonl"))
+    try:
+        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    except Exception:
+        pass
+    if max_files and max_files > 0:
+        files = files[:max_files]
+    for fpath in files:
+        if ".deleted." in fpath or ".checkpoint." in fpath:
+            continue
+        try:
+            with open(fpath, "r", errors="replace") as fh:
+                for raw in fh:
+                    raw = raw.strip()
+                    if not raw or "Internal task completion event" not in raw:
+                        continue
+                    try:
+                        ev = json.loads(raw)
+                    except Exception:
+                        continue
+                    msg = ev.get("message") or {}
+                    if msg.get("role") != "user":
+                        continue
+                    ts = ev.get("timestamp", "")
+                    for blk in msg.get("content") or []:
+                        if not isinstance(blk, dict) or blk.get("type") != "text":
+                            continue
+                        txt = blk.get("text") or ""
+                        if "Internal task completion event" not in txt or "source: subagent" not in txt:
+                            continue
+                        sk_m = _session_key_re.search(txt)
+                        if not sk_m:
+                            continue
+                        child_key = sk_m.group(1)
+                        completion_counts.setdefault(child_key, []).append(ts)
+        except Exception:
+            continue
+    return [
+        {"type": "duplicate_completion", "subagentKey": ck, "count": len(ts_list), "timestamps": ts_list}
+        for ck, ts_list in completion_counts.items()
+        if len(ts_list) > 1
+    ]
+
+
+def _check_integrity(subagents):
+    """Run orphan and cycle integrity checks on an assembled subagent list.
+
+    Orphan: child references a parent key not present in the live session set,
+    age-gated to 7 days to avoid false-positives for GC'd old sessions.
+    Cycle: DFS detects back-edges in the parent→child adjacency graph.
+
+    Returns list of violation dicts.
+    """
+    violations = []
+    keys = {s["key"] for s in subagents if s.get("key")}
+    seven_days_ms = 7 * 24 * 3600 * 1000
+    now_ms = time.time() * 1000
+
+    for s in subagents:
+        parent = s.get("parent")
+        key = s.get("key", "")
+        if not parent or not key:
+            continue
+        # Only flag if parent looks like a subagent key (nested subagent
+        # whose parent is gone). Depth-1 subagents have a main session
+        # as parent — those will never appear in the subagent list and
+        # should not be flagged.
+        if "subagent" in parent and parent not in keys:
+            started = s.get("startedAt") or 0
+            if now_ms - started < seven_days_ms:
+                violations.append({
+                    "type": "orphan",
+                    "subagentKey": key,
+                    "displayName": s.get("displayName", ""),
+                    "parentKey": parent,
+                })
+
+    children_map: dict = {}
+    for s in subagents:
+        parent = s.get("parent")
+        key = s.get("key")
+        if parent and key:
+            children_map.setdefault(parent, []).append(key)
+
+    visited: set = set()
+    in_stack: set = set()
+
+    def _dfs(node, path):
+        if node in in_stack:
+            violations.append({"type": "cycle", "path": path + [node]})
+            return
+        if node in visited:
+            return
+        visited.add(node)
+        in_stack.add(node)
+        for child in children_map.get(node, []):
+            _dfs(child, path + [node])
+        in_stack.discard(node)
+
+    for s in subagents:
+        key = s.get("key")
+        if key and key not in visited:
+            _dfs(key, [])
+
+    return violations
+
+
+@bp_sessions.route("/api/orchestration")
+def api_orchestration():
+    """Compact orchestration status board — agent cards with cost and model tags.
+
+    Wraps the subagents DuckDB fast-path (same source as /api/subagents) and
+    adds a per-agent ``costUsd`` field for the status-board panel rendered
+    above the subagent tree. Returns an empty board when the local store is
+    unavailable so the existing tree view still works via its own fallback.
+    """
+    fast = _try_local_store_subagents()
+    agents = (fast or {}).get("subagents", [])
+    counts = (fast or {}).get("counts", {})
+    total_cost_usd = round(sum(a.get("costUsd", 0.0) for a in agents), 4)
+    return jsonify({
+        "agents": agents,
+        "summary": {
+            "total":          counts.get("total", 0),
+            "active":         counts.get("active", 0),
+            "total_cost_usd": total_cost_usd,
+        },
+    })
+
+
+@bp_sessions.route("/api/subagents/integrity")
+def api_subagents_integrity():
+    """Validate subagent state-machine: orphans, cycles, duplicate completions.
+
+    Returns {violations, stats, checked_at}. Backend-only — no UI yet;
+    the endpoint exists for the Subagents tab to consume when the badge
+    is wired up.
+    """
+    import dashboard as _d
+    sub_resp = api_subagents()
+    try:
+        sub_data = json.loads(sub_resp.get_data(as_text=True))
+    except Exception:
+        sub_data = {}
+    subagents = sub_data.get("subagents") or []
+
+    violations = _check_integrity(subagents)
+
+    sessions_dir = getattr(_d, "SESSIONS_DIR", None) or os.path.expanduser(
+        "~/.openclaw/agents/main/sessions"
+    )
+    try:
+        violations.extend(
+            _check_duplicate_completions(sessions_dir, max_files=_SUBAGENTS_SCAN_MAX_FILES)
+        )
+    except Exception:
+        pass
+
+    stats = {
+        "orphan_count": sum(1 for v in violations if v["type"] == "orphan"),
+        "cycle_count": sum(1 for v in violations if v["type"] == "cycle"),
+        "duplicate_count": sum(1 for v in violations if v["type"] == "duplicate_completion"),
+        "subagents_checked": len(subagents),
+    }
+    return jsonify({"violations": violations, "stats": stats, "checked_at": time.time()})
+
+
+def _try_local_store_delegation_tree():
+    """Fast path for /api/delegation-tree (Tier-1 from #1778 punch list).
+
+    Reads the pre-aggregated ``subagents`` table (same source as
+    ``_try_local_store_subagents``) and groups by ``parent_session_id``
+    to produce the per-chain token + cost totals. Skips the JSONL spawn
+    walker + sessions.json index read entirely — the daemon's snapshot
+    pass already computed both ``cost_usd`` and ``token_count`` per
+    subagent row, so chain totals are a server-side sum.
+
+    Returns ``None`` when the ``subagents`` table is empty so the
+    legacy ``sessions.json`` fallback fires for installs whose daemon
+    hasn't snapshotted yet. Returns a populated empty shell only when
+    the store is reachable AND no subagents have been spawned, which
+    is the right answer (the legacy path would also return empty).
+    """
+    import dashboard as _d
+    rows = _ls_call("query_subagents", limit=500)
+    if rows is None:
+        # Store unreachable. Defer to legacy so older installs keep working.
+        return None
+    if not rows:
+        # Store reachable, just empty. Serve the empty shell directly so
+        # we don't trigger an unnecessary sessions.json open + walk.
+        return {
+            "chains": [],
+            "total_subagents": 0,
+            "total_chain_cost_usd": 0.0,
+            "_source": "local_store",
+        }
+
+    # Fall back to the OSS pricing estimator only when the row lacks a
+    # daemon-computed ``cost_usd``. Cloud's dashboard.py doesn't export
+    # this helper; guard with getattr so we degrade to zero rather than 500.
+    _estimate_usd_per_token = getattr(_d, "_estimate_usd_per_token", None)
+    usd_per_tok = _estimate_usd_per_token() if _estimate_usd_per_token else 3.0 / 1_000_000.0
+    now_ms = time.time() * 1000
+
+    chains_map: dict = {}
+    parent_display_map: dict = {}
+
+    for r in rows:
+        sid = r.get("subagent_id") or ""
+        if not sid:
+            continue
+        extra = r.get("data") if isinstance(r.get("data"), dict) else {}
+        # The daemon stores parent_session_id as a bare session id; the
+        # legacy route grouped by ``spawnedBy`` (a full canonical key). Prefer
+        # the full key from the ``data`` blob when present so the response
+        # shape stays byte-compatible with the legacy walker.
+        parent_key = (extra.get("spawnedBy")
+                      or r.get("parent_session_id")
+                      or "unknown")
+        token_count = int(r.get("token_count") or 0)
+        # The daemon's cost_usd column is already deduped (issue #1460
+        # sibling-pair fix landed in query_sessions); prefer it verbatim and
+        # fall back to the token-based estimator only when the daemon
+        # snapshotted a row without cost (older sync.py builds).
+        cost_usd = r.get("cost_usd")
+        if cost_usd is None or cost_usd == 0:
+            cost_usd = round(token_count * usd_per_tok, 6)
+        else:
+            cost_usd = float(cost_usd)
+
+        # Status: prefer daemon classification, fall back to age bucket.
+        status = (r.get("status") or "").strip().lower()
+        if not status:
+            updated_ms = extra.get("updated_at_ms") or 0
+            try:
+                if not updated_ms and r.get("updated_at"):
+                    updated_ms = int(datetime.fromisoformat(
+                        str(r["updated_at"]).replace("Z", "+00:00")
+                    ).timestamp() * 1000)
+            except Exception:
+                updated_ms = 0
+            age_ms = now_ms - (updated_ms or 0)
+            if age_ms < 120000:
+                status = "active"
+            elif age_ms < 600000:
+                status = "idle"
+            else:
+                status = "stale"
+
+        key = extra.get("key") or f"agent:main:subagent:{sid}"
+        label = extra.get("label") or extra.get("displayName") or key.split(":")[-1]
+        model = extra.get("model") or "unknown"
+        try:
+            updated_iso = r.get("updated_at")
+            updated_at = (int(datetime.fromisoformat(
+                str(updated_iso).replace("Z", "+00:00")
+            ).timestamp() * 1000)
+                          if updated_iso else (extra.get("updated_at_ms") or 0))
+        except Exception:
+            updated_at = extra.get("updated_at_ms") or 0
+
+        chains_map.setdefault(parent_key, []).append({
+            "key":               key,
+            "label":             label,
+            "model":             model,
+            "prov_agent_type":   "subagent",
+            "prov_session_turn": 2,
+            "prov_parent_key":   parent_key,
+            "prov_total_tokens": token_count,
+            "input_tokens":      int(extra.get("tokensIn") or extra.get("inputTokens") or 0),
+            "output_tokens":     int(extra.get("tokensOut") or extra.get("outputTokens") or 0),
+            "total_tokens":      token_count,
+            "cost_usd":          round(float(cost_usd), 6),
+            "status":            status,
+            "updated_at":        updated_at,
+        })
+        if "displayName" in extra or "subject" in extra:
+            parent_display_map.setdefault(parent_key,
+                                          extra.get("displayName") or extra.get("subject"))
+
+    chains = []
+    total_chain_cost = 0.0
+    for parent_key, children in chains_map.items():
+        parts = parent_key.split(":")
+        channel = parts[2] if len(parts) > 2 else "unknown"
+        display = parts[-1] if parts else parent_key
+        chain_tokens = sum(c["total_tokens"] for c in children)
+        chain_cost = round(sum(c["cost_usd"] for c in children), 6)
+        total_chain_cost += chain_cost
+        chains.append({
+            "parent_key":      parent_key,
+            "parent_display":  parent_display_map.get(parent_key) or display,
+            "parent_channel":  channel,
+            "children":        sorted(children, key=lambda x: x["total_tokens"], reverse=True),
+            "chain_tokens":    chain_tokens,
+            "chain_cost_usd":  chain_cost,
+            "child_count":     len(children),
+        })
+
+    chains.sort(key=lambda x: x["chain_tokens"], reverse=True)
+    return {
+        "chains":               chains,
+        "total_subagents":      len(rows),
+        "total_chain_cost_usd": round(total_chain_cost, 4),
+        "_source":              "local_store",
+    }
+
+
+def _derive_waste_summary(sessions: list) -> dict:
+    """Fleet-level 'recoverable spend' — the blog's framework as a real number.
+
+    Aggregates the per-session cost-intel rows (from cost-breakdown) into a
+    breakdown of where the bill is going to waste: reasoning tax, low cache,
+    failing tools, compaction thrash, silent model fallbacks. Pure (testable).
+    Counts are honest (a session is flagged once per category it trips); the
+    reasoning figure is a real $ sum, the rest are session counts the operator
+    can drill into. We deliberately do NOT invent a single 'you saved $X' total.
+    """
+    sessions = sessions or []
+    total_cost = sum(float(s.get("cost_usd") or 0.0) for s in sessions)
+    reasoning = round(sum(float(s.get("reasoning_cost_usd") or 0.0) for s in sessions), 4)
+    low_cache, failing, compacting, mixed, flagged = [], [], [], [], set()
+    reread, reread_usd = [], 0.0
+    compressible, compressible_usd, compressible_tok = [], 0.0, 0
+    cache_expiry, cache_expiry_count = [], 0
+    for s in sessions:
+        sid = s.get("session_id")
+        chp = s.get("cache_hit_pct")
+        if chp is not None and chp < 40 and (s.get("cost_usd") or 0) > 0:
+            low_cache.append(sid); flagged.add(sid)
+        # Re-read tax: paid more to rebuild the prompt cache than reuse saved.
+        cwc = s.get("cache_write_cost_usd")
+        if cwc and float(cwc) > 0.005 and float(cwc) > float(s.get("cache_saved_usd") or 0.0):
+            reread.append(sid); reread_usd += float(cwc); flagged.add(sid)
+        # Cache-bust risk: idle gaps crossed the 5-min TTL and re-derived context.
+        cec = s.get("cache_expiry_count")
+        if cec and int(cec) > 0:
+            cache_expiry.append(sid); cache_expiry_count += int(cec); flagged.add(sid)
+        # Compression potential: tool output that is compressible without
+        # changing answers (JSON/logs/diffs). Recoverable, not yet recovered.
+        cpp = s.get("compression_potential_pct")
+        cru = s.get("compression_recoverable_usd")
+        if cpp is not None and float(cpp) >= 50 and (s.get("compressible_tool_tokens") or 0) >= 2000:
+            compressible.append(sid)
+            compressible_usd += float(cru or 0.0)
+            compressible_tok += int(s.get("compressible_tool_tokens") or 0)
+            flagged.add(sid)
+        if (s.get("tool_error_pct") or 0) >= 20:
+            failing.append(sid); flagged.add(sid)
+        if (s.get("compaction_count") or 0) >= 2:
+            compacting.append(sid); flagged.add(sid)
+        if s.get("model_mix"):
+            mixed.append(sid); flagged.add(sid)
+        if (s.get("reasoning_cost_usd") or 0) > 0 and s.get("cost_usd") and (s["reasoning_cost_usd"] / s["cost_usd"]) > 0.25:
+            flagged.add(sid)
+    return {
+        "total_cost_usd": round(total_cost, 4),
+        "session_count": len(sessions),
+        "flagged_session_count": len(flagged),
+        "reasoning_cost_usd": reasoning,
+        "reasoning_pct_of_cost": round(reasoning / total_cost * 100, 1) if total_cost else 0.0,
+        "low_cache_sessions": len(low_cache),
+        "reread_tax_sessions": len(reread),
+        "reread_tax_usd": round(reread_usd, 4),
+        "cache_expiry_sessions": len(cache_expiry),
+        "cache_expiry_count": cache_expiry_count,
+        "compressible_sessions": len(compressible),
+        "compressible_tokens": compressible_tok,
+        "compressible_usd": round(compressible_usd, 4),
+        "tool_failing_sessions": len(failing),
+        "compaction_heavy_sessions": len(compacting),
+        "model_fallback_sessions": len(mixed),
+    }
+
+
+@bp_sessions.route("/api/waste-summary")
+def api_waste_summary():
+    """Fleet 'recoverable spend' breakdown — where the agent bill is going to
+    waste across recent sessions (reasoning tax, low cache, failing tools,
+    compaction thrash, silent model fallbacks). The cost-intel cluster rolled
+    up to the fleet level; the productivity-gains framework as a live number.
+    """
+    try:
+        cb = _try_local_store_cost_breakdown() or {"sessions": []}
+        sessions = cb.get("sessions", [])
+    except Exception:
+        sessions = []
+    return jsonify(_derive_waste_summary(sessions))
+
+
+_WASTE_RECOMMENDATIONS = {
+    "reasoning_heavy": "Reasoning is over a quarter of this session's cost — billed like output but with no visible deliverable. Lower the reasoning effort, or use a cheaper model for routine work.",
+    "cache_poor": "Low cache hit — context is being re-sent at full price every turn. Keep the system prompt stable and reuse the session so the prompt cache stays warm.",
+    "tools_failing": "A tool came back a real error on 20%+ of calls — you're paying tokens on the retries. Fix or remove the failing tool.",
+    "compaction_thrash": "This session auto-compacted repeatedly, re-summarising (and re-billing) the context each time. Work in a smaller context window.",
+    "reread_tax": "This session paid more to REBUILD the prompt cache than reuse saved — the cache's 5-minute TTL expired between turns, so it re-derived context that never changed. Keep the session warm (a heartbeat or batched turns inside the TTL) so the cache is read at ~0.1x instead of re-written at full price.",
+    "model_fallback": "This session silently ran on more than one model — a downgrade/upcharge you didn't choose. Pin the model you actually want.",
+    "fanned_out": "This ask spawned sub-agents, so its true cost includes everything they spent (see the fan-out figure) — not just this session's own line.",
+    "policy_denied": "A tool call was denied by governance. Review the policy if it blocked legitimate work.",
+}
+
+
+def _derive_session_insight(sess: dict, lineage: list) -> dict:
+    """Unify the per-session cost-intel + the lineage fan-out into ONE decision
+    insight: the TRUE cost of an ask (its own spend + everything its sub-agents
+    spent) plus the waste flags that fired. The context graph's per-session
+    answer — no single flat tab gives it. Pure function (so it's testable).
+    """
+    sess = sess or {}
+    lineage = lineage or []
+    cost = float(sess.get("cost_usd") or 0.0)
+    children = [n for n in lineage if (n.get("depth") or 0) > 0]
+    downstream = round(sum(float(n.get("cost_usd") or 0.0) for n in children), 6)
+    flags: list[str] = []
+    rc = sess.get("reasoning_cost_usd")
+    if rc and cost and (rc / cost) > 0.25:
+        flags.append("reasoning_heavy")
+    chp = sess.get("cache_hit_pct")
+    if chp is not None and chp < 40:
+        flags.append("cache_poor")
+    # Cache re-read tax (sharper than cache_poor): you paid MORE to rebuild the
+    # cache than reuse saved — the 5-min TTL expired between turns and the
+    # context was re-derived. Fires on the cost heuristic (write cost dwarfs
+    # savings) OR on direct evidence: turns that idled past the TTL (≥2).
+    cwc = sess.get("cache_write_cost_usd")
+    csv = float(sess.get("cache_saved_usd") or 0.0)
+    expiry = int(sess.get("cache_expiry_count") or 0)
+    if (cwc and float(cwc) > 0.005 and float(cwc) > csv) or expiry >= 2:
+        flags.append("reread_tax")
+    if (sess.get("tool_error_pct") or 0) >= 20:
+        flags.append("tools_failing")
+    if (sess.get("compaction_count") or 0) >= 2:
+        flags.append("compaction_thrash")
+    if sess.get("model_mix"):
+        flags.append("model_fallback")
+    if children:
+        flags.append("fanned_out")
+    return {
+        "cost_usd": round(cost, 6),
+        "reasoning_cost_usd": sess.get("reasoning_cost_usd"),
+        "cache_hit_pct": sess.get("cache_hit_pct"),
+        "cache_write_cost_usd": sess.get("cache_write_cost_usd"),
+        "cache_saved_usd": sess.get("cache_saved_usd"),
+        "cache_expiry_count": sess.get("cache_expiry_count"),
+        "tool_error_pct": sess.get("tool_error_pct"),
+        "compaction_count": sess.get("compaction_count"),
+        "model_mix": bool(sess.get("model_mix")),
+        "subagent_count": len(children),
+        "downstream_cost_usd": downstream,
+        "true_cost_usd": round(cost + downstream, 6),
+        "waste_flags": flags,
+    }
+
+
+def _session_governance(approvals: list, guardrails: list, session_id: str) -> dict:
+    """Context graph — the decision->approval / decision->guardrail edges for one
+    session: which tool calls were gated, and how they were decided. Joins the
+    approval queue (by requestor_session_id) with NeMo guardrail verdicts (by
+    session_id) into the session's governance lineage. Pure (testable).
+    """
+    _DENY = {"deny", "denied", "reject", "rejected", "block", "blocked"}
+    appr = [
+        {"kind": "approval", "action": a.get("action"),
+         "decision": a.get("decision") or a.get("status") or "", "reason": a.get("decision_reason") or "",
+         "status": a.get("status") or ""}
+        for a in (approvals or []) if a.get("requestor_session_id") == session_id
+    ]
+    grd = [
+        {"kind": "guardrail", "action": g.get("action"), "rule": g.get("rule_name"),
+         "verdict": g.get("verdict") or ""}
+        for g in (guardrails or []) if g.get("session_id") == session_id
+    ]
+    denied = sum(1 for a in appr if str(a.get("decision", "")).lower() in _DENY) \
+        + sum(1 for g in grd if str(g.get("verdict", "")).lower() in _DENY)
+    return {
+        "approvals": appr,
+        "guardrails": grd,
+        "decision_count": len(appr) + len(grd),
+        "denied_count": denied,
+    }
+
+
+@bp_sessions.route("/api/session-governance/<path:session_id>")
+def api_session_governance(session_id):
+    """Context graph — a session's governance lineage: its approval decisions +
+    NeMo guardrail verdicts (decision->approval / decision->guardrail edges).
+    """
+    try:
+        approvals = _ls_call("query_approvals", limit=500) or []
+    except Exception:
+        approvals = []
+    try:
+        guardrails = _ls_call("query_guardrail_events", limit=500) or []
+    except Exception:
+        guardrails = []
+    out = _session_governance(approvals, guardrails, session_id)
+    out["session_id"] = session_id
+    return jsonify(out)
+
+
+@bp_sessions.route("/api/session-insight/<path:session_id>")
+def api_session_insight(session_id):
+    """Context graph — the unified per-session decision insight: true cost
+    (own + sub-agent fan-out) + the waste flags that fired, joining the
+    cost-intel cluster with the lineage traversal in one answer.
+    """
+    try:
+        cb = _try_local_store_cost_breakdown() or {"sessions": []}
+        sess = next((s for s in cb.get("sessions", []) if s.get("session_id") == session_id), {})
+    except Exception:
+        sess = {}
+    try:
+        lineage = _ls_call("query_session_lineage", session_id=session_id) or []
+    except Exception:
+        lineage = []
+    out = _derive_session_insight(sess, lineage)
+    # Fold in the governance lineage so this is the COMPLETE per-session graph
+    # answer (cost + waste + fan-out + policy) — one call powers the card.
+    try:
+        gov = _session_governance(
+            _ls_call("query_approvals", limit=500) or [],
+            _ls_call("query_guardrail_events", limit=500) or [],
+            session_id,
+        )
+        out["governance"] = {"decision_count": gov["decision_count"], "denied_count": gov["denied_count"]}
+        if gov["denied_count"] > 0:
+            out["waste_flags"].append("policy_denied")
+    except Exception:
+        out["governance"] = {"decision_count": 0, "denied_count": 0}
+    # Turn the waste flags into actionable advice — what to DO, not just what
+    # happened. This is what makes the decision insight useful, not just a readout.
+    out["recommendations"] = [
+        {"flag": f, "text": _WASTE_RECOMMENDATIONS[f]}
+        for f in out.get("waste_flags", []) if f in _WASTE_RECOMMENDATIONS
+    ]
+    out["session_id"] = session_id
+    return jsonify(out)
+
+
+@bp_sessions.route("/api/session-errors/<path:session_id>")
+def api_session_errors(session_id):
+    """Context graph — the error->cause edge: this session's failed spans, each
+    with its parent span (the upstream decision one hop away)."""
+    try:
+        errors = _ls_call("query_session_errors", session_id=session_id) or []
+    except Exception:
+        errors = []
+    return jsonify({"session_id": session_id, "errors": errors, "error_count": len(errors)})
+
+
+@bp_sessions.route("/api/session-lineage/<path:session_id>")
+def api_session_lineage(session_id):
+    """Context graph — first view: the decision-lineage tree rooted at a session.
+
+    The full subagent fan-out of one ask + the cost each branch incurred,
+    traversed recursively over the existing subagent edges (no new tables). The
+    seed of the temporal decision graph that unifies Brain/Tracing/Subagents.
+    """
+    try:
+        nodes = _ls_call("query_session_lineage", session_id=session_id) or []
+    except Exception:
+        nodes = []
+    root_cost = next((n.get("cost_usd", 0.0) for n in nodes if n.get("depth") == 0), 0.0)
+    downstream = round(sum(n.get("cost_usd", 0.0) for n in nodes if (n.get("depth") or 0) > 0), 6)
+    return jsonify({
+        "session_id": session_id,
+        "nodes": nodes,
+        "node_count": len(nodes),
+        "root_cost_usd": round(float(root_cost or 0.0), 6),
+        "downstream_cost_usd": downstream,
+        "total_cost_usd": round(float(root_cost or 0.0) + downstream, 6),
+    })
+
+
 @bp_sessions.route("/api/delegation-tree")
 def api_delegation_tree():
     """Agent delegation chains -- inspired by AgentWeave provenance tracing.
 
-    Reads sessions.json, groups subagents by their spawnedBy parent key,
-    and returns per-chain token totals and estimated cost.
+    Source 0 (DuckDB fast path): groups the ``subagents`` table by
+    ``parent_session_id``; per-chain token + cost totals come from the
+    daemon-aggregated columns (no JSONL re-walk).
+
+    Source 1 (legacy fallback): reads sessions.json, groups subagents
+    by their ``spawnedBy`` parent key. Kept so older OpenClaw installs
+    without the local store keep rendering this view.
     """
     import dashboard as _d
+    # Source 0: DuckDB fast path. Skips sessions.json entirely.
+    if is_local_store_read_enabled():
+        fast = _try_local_store_delegation_tree()
+        if fast is not None:
+            return jsonify(fast)
+
     # Cloud's dashboard.py is a different module than OSS's; some helpers
     # (e.g. _get_sessions_dir, _estimate_usd_per_token) only exist in OSS.
     # Guard with getattr so we degrade to an empty response instead of 500.
@@ -1878,6 +3171,101 @@ def _try_local_store_cost_breakdown():
             "day": day,
             "start_ts": start_ts,
         })
+    # Merge per-session cost-intelligence (reasoning-tax $, cache-hit %) that the
+    # daemon stashed on the sessions-table metadata. query_sessions (above)
+    # aggregates events and can't see the per-session token split, so we read it
+    # from the sessions table here and graft it onto the matching rows.
+    try:
+        meta_rows = _ls_call("query_sessions_table", limit=1000) or []
+        intel = {}
+        for mr in meta_rows:
+            md = mr.get("metadata") or {}
+            if isinstance(md, dict) and any(md.get(k) is not None for k in ("reasoningCostUsd", "cacheHitPct", "toolErrorPct", "compactionCount", "cacheExpiryCount", "compressionPotentialPct", "compressionRecoverableUsd", "cacheWriteCostUsd", "cacheSavedUsd", "maxIdleGapSec")):
+                intel[mr.get("session_id") or ""] = md
+        if intel:
+            for row in result:
+                md = intel.get(row["session_id"])
+                if not md:
+                    continue
+                if md.get("reasoningCostUsd") is not None:
+                    row["reasoning_cost_usd"] = md["reasoningCostUsd"]
+                if md.get("cacheHitPct") is not None:
+                    row["cache_hit_pct"] = md["cacheHitPct"]
+                if md.get("toolErrorPct") is not None:
+                    row["tool_error_pct"] = md["toolErrorPct"]
+                if md.get("compactionCount") is not None:
+                    row["compaction_count"] = md["compactionCount"]
+                if md.get("cacheExpiryCount") is not None:
+                    row["cache_expiry_count"] = md["cacheExpiryCount"]
+                if md.get("compressionPotentialPct") is not None:
+                    row["compression_potential_pct"] = md["compressionPotentialPct"]
+                if md.get("compressibleToolTokens") is not None:
+                    row["compressible_tool_tokens"] = md["compressibleToolTokens"]
+                if md.get("compressionRecoverableUsd") is not None:
+                    row["compression_recoverable_usd"] = md["compressionRecoverableUsd"]
+                if md.get("cacheWriteCostUsd") is not None:
+                    row["cache_write_cost_usd"] = md["cacheWriteCostUsd"]
+                if md.get("cacheSavedUsd") is not None:
+                    row["cache_saved_usd"] = md["cacheSavedUsd"]
+                if md.get("maxIdleGapSec") is not None:
+                    row["max_idle_gap_sec"] = md["maxIdleGapSec"]
+    except Exception:
+        pass
+    # Cache-hit % (for the event-usage runtimes: OpenClaw / Claude Code) + the
+    # silent model-mix flag, from the existing per-session cost-split aggregator.
+    # Family runtimes get cache % from the metadata above; this covers the rest
+    # and adds the >1-model fallback flag for any session.
+    try:
+        by_id = {r["session_id"]: r for r in result}
+        for sr in (_ls_call("query_cost_split", limit=1000) or []):
+            row = by_id.get(sr.get("session_id") or "")
+            if not row:
+                continue
+            if row.get("cache_hit_pct") is None and sr.get("cache_hit_ratio_pct") is not None:
+                row["cache_hit_pct"] = sr["cache_hit_ratio_pct"]
+            if int(sr.get("model_count") or 0) > 1:
+                row["model_mix"] = True
+                row["primary_model"] = sr.get("primary_model") or ""
+                row["secondary_model"] = sr.get("secondary_model") or ""
+    except Exception:
+        pass
+    # Sub-agent fan-out cost — the TRUE cost of an ask = its own cost + what its
+    # children spent (one GROUP BY, not an N-query recursive walk). Context graph.
+    try:
+        roll = {r["parent_session_id"]: r for r in (_ls_call("query_subagent_cost_rollup", limit=2000) or [])}
+        for row in result:
+            rr = roll.get(row["session_id"])
+            if rr and rr.get("child_cost_usd", 0) > 0:
+                row["downstream_cost_usd"] = rr["child_cost_usd"]
+                row["subagent_count"] = rr.get("child_count") or 0
+    except Exception:
+        pass
+    # Governance lineage counts per session — tool calls gated by the approval
+    # queue + NeMo guardrails, and how many were denied/blocked. Context graph.
+    try:
+        _DENY = {"deny", "denied", "reject", "rejected", "block", "blocked"}
+        gov: dict = {}
+        for a in (_ls_call("query_approvals", limit=1000) or []):
+            sid = a.get("requestor_session_id")
+            if not sid:
+                continue
+            d = gov.setdefault(sid, {"n": 0, "deny": 0}); d["n"] += 1
+            if str(a.get("decision", "")).lower() in _DENY:
+                d["deny"] += 1
+        for g in (_ls_call("query_guardrail_events", limit=1000) or []):
+            sid = g.get("session_id")
+            if not sid:
+                continue
+            d = gov.setdefault(sid, {"n": 0, "deny": 0}); d["n"] += 1
+            if str(g.get("verdict", "")).lower() in _DENY:
+                d["deny"] += 1
+        for row in result:
+            gv = gov.get(row["session_id"])
+            if gv and gv["n"] > 0:
+                row["governance_count"] = gv["n"]
+                row["governance_denied"] = gv["deny"]
+    except Exception:
+        pass
     result.sort(key=lambda x: x["cost_usd"], reverse=True)
     top10 = result[:10]
     total_cost = sum(r["cost_usd"] for r in result)
@@ -1976,6 +3364,168 @@ def api_session_stop(session_id):
     )
 
 
+@bp_sessions.route("/api/agents/<path:agent_key>/pause", methods=["POST"])
+def api_agent_pause(agent_key):
+    """Pause a single agent via gateway RPC; tracks state in _paused_agents."""
+    import dashboard as _d
+    result = _d._gw_invoke("subagents", {"action": "pause", "key": agent_key})
+    _paused_agents.add(agent_key)
+    _agent_control_audit.append({
+        "ts": time.time(), "action": "pause", "key": agent_key,
+        "gw_ok": result is not None, "source": request.remote_addr,
+    })
+    return jsonify({"ok": True, "key": agent_key, "status": "paused",
+                    "gw_ok": result is not None})
+
+
+@bp_sessions.route("/api/agents/<path:agent_key>/resume", methods=["POST"])
+def api_agent_resume(agent_key):
+    """Resume a paused agent via gateway RPC; clears the key from _paused_agents."""
+    import dashboard as _d
+    result = _d._gw_invoke("subagents", {"action": "resume", "key": agent_key})
+    _paused_agents.discard(agent_key)
+    _agent_control_audit.append({
+        "ts": time.time(), "action": "resume", "key": agent_key,
+        "gw_ok": result is not None, "source": request.remote_addr,
+    })
+    return jsonify({"ok": True, "key": agent_key, "status": "active",
+                    "gw_ok": result is not None})
+
+
+@bp_sessions.route("/api/agents/<path:agent_key>/stop", methods=["POST"])
+def api_agent_stop(agent_key):
+    """Stop a single agent via gateway RPC. Requires {\"confirm\": true} in body."""
+    import dashboard as _d
+    body = request.get_json(silent=True) or {}
+    if not body.get("confirm"):
+        return jsonify({"ok": False, "error": "confirm:true required to stop an agent"}), 400
+    result = _d._gw_invoke("subagents", {"action": "stop", "key": agent_key})
+    _paused_agents.discard(agent_key)
+    _agent_control_audit.append({
+        "ts": time.time(), "action": "stop", "key": agent_key,
+        "gw_ok": result is not None, "source": request.remote_addr,
+    })
+    return jsonify({"ok": True, "key": agent_key, "status": "stopped",
+                    "gw_ok": result is not None})
+
+
+@bp_sessions.route("/api/agents/audit")
+def api_agents_audit():
+    """Return the last 50 agent control actions (pause/resume/stop)."""
+    return jsonify({"entries": list(_agent_control_audit)[-50:]})
+
+
+# Issue #1718: event_types whose ``data`` is a transcript-renderable turn.
+# Single source of truth for THREE places that must agree:
+#   1. ``LocalStore.query_sessions`` ``message_count`` (SQL CASE WHEN).
+#   2. ``_try_local_store_transcript`` (DuckDB detail path — early skip).
+#   3. ``_count_jsonl_renderable_lines`` (legacy JSONL list fallback).
+# Keep aligned with ``LocalStore._RENDERABLE_EVENT_TYPES`` in
+# ``clawmetry/local_store.py``. The two lists are deliberately duplicated
+# so each layer can evolve without a cross-module import cycle.
+_RENDERABLE_TRANSCRIPT_EVENT_TYPES = frozenset({
+    # Anthropic-style (no dotted type) → role-bearing turns.
+    "message", "user", "assistant", "system", "tool", "tool_result",
+    # Tool-call variants (see ``_TOOL_CALL_TOPLEVEL_EVENT_TYPES`` in
+    # ``clawmetry/local_store.py``) — different ingest paths use different
+    # spellings; all four are renderable.
+    "tool_call", "toolCall", "tool_use", "tool-result",
+    # OpenClaw v3 / dotted types — must match _expand_openclaw_event arms.
+    "prompt.submitted", "trace.artifacts", "model.completed",
+    "tool.call", "tool.invoked", "tool.result", "tool.completed",
+    "compaction",
+    # Subagent fan-out — child turns surface in the parent's transcript
+    # via ``query_events_with_subagents`` (#1597).
+    "subagent:assistant", "subagent:user",
+})
+
+# Issue #1718: OpenClaw event types whose JSONL line maps to a transcript
+# turn — the dotted-type subset of ``_RENDERABLE_TRANSCRIPT_EVENT_TYPES``.
+_RENDERABLE_JSONL_OPENCLAW_TYPES = frozenset({
+    "prompt.submitted", "trace.artifacts", "model.completed",
+    "tool.call", "tool.invoked", "tool.result", "tool.completed",
+    "compaction",
+})
+_RENDERABLE_JSONL_ANTHROPIC_ROLES = frozenset({
+    "user", "assistant", "system", "tool", "tool_result",
+})
+
+
+def _count_jsonl_renderable_lines(fpath: str) -> int:
+    """Count session-JSONL lines that map to a transcript turn.
+
+    Cheap streaming parse: each line is JSON-decoded once and matched
+    against the same renderable predicate ``LocalStore.query_sessions``
+    applies at the SQL layer. Lines that fail to parse, lack both a role
+    and a recognised OpenClaw ``type``, or carry plumbing-only types
+    (``session.*``, ``model.changed``, ``thinking_level_change``,
+    ``context.compiled``, ``agent.heartbeat``, ``channel.in``/``.out``,
+    ``custom``/``custom_message``) do NOT count.
+
+    Caller catches all exceptions and falls back to 0 on a corrupt file.
+    """
+    count = 0
+    with open(fpath) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                # A non-JSON line is never renderable — skip.
+                continue
+            if not isinstance(obj, dict):
+                continue
+            role = obj.get("role")
+            if isinstance(role, str) and role in _RENDERABLE_JSONL_ANTHROPIC_ROLES:
+                count += 1
+                continue
+            # Tool-bearing assistant rows (some Anthropic shapes ship
+            # ``tool_calls`` / ``tool_use`` without a top-level role).
+            if obj.get("tool_calls") or obj.get("tool_use"):
+                count += 1
+                continue
+            etype = obj.get("type")
+            if isinstance(etype, str) and etype in _RENDERABLE_JSONL_OPENCLAW_TYPES:
+                count += 1
+    return count
+
+
+def _first_user_title(fpath: str) -> str:
+    """First user-message text from a session file — a ChatGPT-style title.
+
+    The cloud snapshot ships a derived title (see ``_derive_transcript_title``),
+    but the legacy local endpoint left ``title`` empty, so the Session-replay
+    list showed every session as "Untitled" and the client-side "Show plumbing"
+    filter (which keys off the title) couldn't tell a Self-Evolve run from real
+    work. Handles both Anthropic-shape rows (top-level ``role``) and OpenClaw v3
+    rows nested under ``message``. Cheap: stops at the first user turn. Capped so
+    it never bloats the list payload; the renderer ellipsises for display.
+    """
+    try:
+        with open(fpath) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
+                if msg.get("role") != "user":
+                    continue
+                text = _stringify_content(msg.get("content")).strip()
+                if text:
+                    return text[:200]
+    except Exception:
+        pass
+    return ""
+
+
 def _try_local_store_transcripts():
     """Fast path for /api/transcripts. Lists distinct sessions with their
     event counts + most-recent ts, straight from DuckDB.
@@ -1991,10 +3541,19 @@ def _try_local_store_transcripts():
     rows = _ls_call("query_sessions", limit=50)
     if not rows:
         return None
+    import dashboard as _d
+    sessions_dir = _d.SESSIONS_DIR or os.path.expanduser(
+        "~/.openclaw/agents/main/sessions"
+    )
     transcripts = []
     for r in rows:
         sid = r.get("session_id") or ""
         if not sid:
+            continue
+        # Issue #1896 follow-up: hide ClawMetry's own helper sessions
+        # (clawmetry-fix / clawmetry-selfevolve / clawmetry-mem-probe …) so
+        # our plumbing doesn't mix with the user's agent activity.
+        if hide_clawmetry_session(sid):
             continue
         # Coerce ts (ISO string) to ms-since-epoch for parity with the
         # legacy ``int(os.path.getmtime(fpath) * 1000)`` shape.
@@ -2008,10 +3567,22 @@ def _try_local_store_transcripts():
                 )
             except Exception:
                 modified_ms = 0
+        # Issue #1718: prefer the SQL-filtered ``message_count`` (renderable-
+        # event count, matches the detail modal) over the legacy raw
+        # ``event_count``. The OR-fallback keeps callers running against
+        # an older daemon that hasn't picked up the schema bump yet —
+        # they still see the pre-fix inflated count, but no crash.
+        msg_count = r.get("message_count")
+        if msg_count is None:
+            msg_count = r.get("event_count") or 0
         transcripts.append({
             "id": sid,
+            # Derive the same ChatGPT-style title the legacy path / cloud use, so
+            # the client "Show plumbing" filter can spot Self-Evolve runs. Cheap:
+            # reads only up to the first user line of each session file.
+            "title": _first_user_title(os.path.join(sessions_dir, sid + ".jsonl")),
             "name": sid[:40],
-            "messages": int(r.get("event_count") or 0),
+            "messages": int(msg_count or 0),
             "size": 0,  # unknown from DuckDB; UI shows "—" when 0
             "modified": modified_ms,
         })
@@ -2041,15 +3612,23 @@ def api_transcripts():
         ):
             if not fname.endswith(".jsonl") or "deleted" in fname:
                 continue
+            # Hide ClawMetry's own helper sessions (see _try_local_store_transcripts).
+            if hide_clawmetry_session(fname.replace(".jsonl", "")):
+                continue
             fpath = os.path.join(sessions_dir, fname)
             try:
-                msg_count = 0
-                with open(fpath) as f:
-                    for _ in f:
-                        msg_count += 1
+                # Issue #1718: count only the JSONL lines the transcript
+                # detail view will actually render as messages — i.e. skip
+                # plumbing rows like ``session.started`` / ``model.changed``
+                # / ``thinking_level_change`` / ``custom`` / ``channel.*``.
+                # Mirrors the SQL filter in ``LocalStore.query_sessions``
+                # so the legacy JSONL fallback agrees with the DuckDB fast
+                # path (and with what ``/api/transcript/<sid>`` returns).
+                msg_count = _count_jsonl_renderable_lines(fpath)
                 transcripts.append(
                     {
                         "id": fname.replace(".jsonl", ""),
+                        "title": _first_user_title(fpath),
                         "name": fname.replace(".jsonl", "")[:40],
                         "messages": msg_count,
                         "size": os.path.getsize(fpath),
@@ -2124,6 +3703,111 @@ def _stringify_content(content) -> str:
                 parts.append(str(part))
         return "\n".join(parts)
     return str(content) if content else ""
+
+
+# Issue #1895: expose the verbatim event payload so the transcript viewer can
+# toggle between the beautified turn and the exact JSON OpenClaw recorded/sent
+# upstream (requested by users studying OpenClaw's behavior). Capped per-message
+# so attaching it to every turn never bloats the response or the cloud snapshot
+# it rides into.
+_RAW_PAYLOAD_CAP = 12000
+
+
+def _bounded_raw_payload(obj, cap: int = _RAW_PAYLOAD_CAP):
+    """Return ``obj`` for inline raw-payload display, or a small truncation
+    marker when its serialized form exceeds ``cap`` bytes. Never raises."""
+    try:
+        serialized = json.dumps(obj, default=str)
+    except Exception:
+        return None
+    if len(serialized) > cap:
+        return {"_raw_truncated": True, "_raw_bytes": len(serialized)}
+    return obj
+
+
+# Issue #1911: Anthropic Messages content-block tools. Claude-Code rows nest the
+# real message under ``data.message`` and record each tool as a *content block*
+# (``{"type":"tool_use","name","input"}`` / ``{"type":"tool_result",
+# "tool_use_id","content"}``) rather than a top-level ``tool_calls`` key. The
+# flat transcript path missed these entirely, so tool-heavy sessions replayed as
+# a wall of nameless "Tool call"/"Tool result" chips. We lift each block into a
+# real turn carrying the tool name + input/output so the replay can deep-dive
+# into what actually happened.
+_TOOL_DETAIL_CAP = 4000
+
+
+def _cap_text(s, cap: int = _TOOL_DETAIL_CAP) -> str:
+    """Truncate a string to ``cap`` chars with a visible marker. Never raises."""
+    s = s if isinstance(s, str) else str(s)
+    if len(s) > cap:
+        return s[:cap] + f"\n… (truncated, {len(s)} chars total)"
+    return s
+
+
+def _pretty_json(x, cap: int = _TOOL_DETAIL_CAP) -> str:
+    """Pretty-print a tool input/output payload to a capped string for inline
+    display. Falls back to ``str()`` for anything not JSON-serializable."""
+    try:
+        s = json.dumps(x, indent=2, default=str)
+    except (TypeError, ValueError):
+        s = str(x)
+    return _cap_text(s, cap)
+
+
+def _anthropic_tool_turns(blocks, ts_ms, name_by_id):
+    """Map an Anthropic message ``content`` block list to ``(tool_turns, text)``.
+
+    ``tool_turns`` is one turn per ``tool_use`` / ``tool_result`` block, each
+    carrying a ``tool`` dict (``{kind, name, input|output}``) the replay renders
+    as an expandable deep-dive. ``text`` is the joined text blocks, used only
+    when the session has no v3 prose event (pure Claude Code) so we never double
+    the assistant reply. ``name_by_id`` maps a ``tool_use`` id to its name so
+    the matching ``tool_result`` (which only references the id) can show which
+    tool it came from.
+    """
+    tool_turns: list[dict] = []
+    texts: list[str] = []
+    if not isinstance(blocks, list):
+        return tool_turns, ""
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        bt = b.get("type")
+        if bt == "text":
+            t = b.get("text")
+            if t:
+                texts.append(t if isinstance(t, str) else str(t))
+        elif bt == "tool_use":
+            name = b.get("name") or "tool"
+            tid = b.get("id")
+            if tid:
+                name_by_id[tid] = name
+            tool_turns.append({
+                "role": "assistant",
+                "content": "",
+                "timestamp": ts_ms,
+                "type": "tool_use",
+                "tool": {
+                    "kind": "call",
+                    "name": name,
+                    "input": _pretty_json(b.get("input") or {}),
+                },
+            })
+        elif bt == "tool_result":
+            name = name_by_id.get(b.get("tool_use_id"), "")
+            tool_turns.append({
+                "role": "tool",
+                "content": "",
+                "timestamp": ts_ms,
+                "type": "tool_use",
+                "tool": {
+                    "kind": "result",
+                    "name": name,
+                    "output": _cap_text(_stringify_content(b.get("content"))),
+                    "is_error": bool(b.get("is_error")),
+                },
+            })
+    return tool_turns, "\n".join(texts)
 
 
 def _expand_openclaw_event(obj: dict, ts_ms):
@@ -2352,7 +4036,7 @@ def _extract_decoding_params(obj):
     return out
 
 
-def _try_local_store_transcript(session_id: str):
+def _try_local_store_transcript(session_id: str, _events=None):
     """Read a session transcript directly from the DuckDB events table.
 
     Returns the same response shape as the JSONL parser. Returns ``None``
@@ -2372,13 +4056,14 @@ def _try_local_store_transcript(session_id: str):
     # `reference_duckdb_process_lock.md`), forced fall-through to the JSONL
     # walker → 5.5s p95 the latency probe (#1287) surfaced for
     # ``sessions.api_transcript``.
-    rows = None
-    try:
-        from routes.local_query import local_store_via_daemon
-        rows = local_store_via_daemon(
-            "query_events", session_id=session_id, limit=10000)
-    except Exception:
-        rows = None
+    rows = _events
+    if rows is None:
+        try:
+            from routes.local_query import local_store_via_daemon
+            rows = local_store_via_daemon(
+                "query_events", session_id=session_id, limit=10000)
+        except Exception:
+            rows = None
     if rows is None:
         # Single-process fallback (tests/dev with no sync daemon).
         try:
@@ -2388,18 +4073,13 @@ def _try_local_store_transcript(session_id: str):
         except Exception:
             return None
     if not rows:
-        # Empty is a legitimate "no events for this session yet" — return a
-        # populated shell so the JSONL walker doesn't get a second chance
-        # to do the same 5.5s walk for the same empty answer (PR #1266
-        # pattern). Caller decorates with `_source: "local_store"`.
-        return {
-            "messages":     [],
-            "model":        None,
-            "total_tokens": 0,
-            "first_ts":     None,
-            "last_ts":      None,
-            "_source":      "local_store",
-        }
+        # Return None so the caller falls through to the JSONL parser.
+        # When DuckDB has no events for a session (broken ingest pipeline or
+        # genuinely new session), the JSONL fallback will either serve the
+        # real transcript from disk (#1772) or return 404 if no file exists —
+        # both are correct. Returning an empty shell here blocks the fallback
+        # and produces silent zeros when the pipeline is offline.
+        return None
     # query_events returns DESC by ts; transcripts read forward.
     rows = list(reversed(rows))
     messages: list[dict] = []
@@ -2407,9 +4087,52 @@ def _try_local_store_transcript(session_id: str):
     total_tokens = 0
     first_ts = None
     last_ts = None
+    # Anthropic ``tool_result`` blocks reference their call by id only; map
+    # id→name as we see ``tool_use`` blocks so results show which tool ran.
+    tool_name_by_id: dict = {}
+    # When v3 (``model.completed`` / ``prompt.submitted``) events are present
+    # they already supply the prose for Claude-Code sessions, so we take *tools*
+    # from the raw ``message`` rows but skip their text to avoid doubling the
+    # reply. Pure Claude-Code sessions (no v3 events) keep their message text.
+    has_v3_messages = any(
+        isinstance(r.get("data"), dict)
+        and r["data"].get("_v3_type") == "message"
+        for r in rows
+    )
     for ev in rows:
         obj = ev.get("data")
         if not isinstance(obj, dict):
+            continue
+        # Issue #1718: skip plumbing event_types (``session.started``,
+        # ``model.changed``, ``thinking_level_change``, ``channel.in/out``,
+        # ``custom``/``custom_message``, ``queue-operation``, ``attachment``,
+        # …) so the transcript modal stops rendering non-message noise as
+        # ``{role: "custom_message", ...}`` chat bubbles. The list endpoint
+        # (``/api/transcripts``) applies the SAME predicate at the SQL
+        # layer, so list-vs-detail counts now agree.
+        #
+        # Discriminator order (renderable if ANY matches):
+        #   1. outer ``event_type`` — production ingest stamps this from
+        #      ``data.type`` (real OpenClaw v3 + Claude Code rows).
+        #   2. inner ``data.type`` — some older ingest paths and a handful
+        #      of test fixtures store a coarse outer type (``"brain"``)
+        #      with the real type buried in ``data.type``.
+        #   3. inner ``data.role`` — Anthropic-shape rows have no
+        #      ``type`` field; they're identified by their top-level role
+        #      (``user``/``assistant``/``system``/``tool``/…) and are
+        #      always renderable.
+        et = (ev.get("event_type") or "").strip()
+        inner_type = obj.get("type") if isinstance(obj.get("type"), str) else ""
+        inner_role = obj.get("role") if isinstance(obj.get("role"), str) else ""
+        renderable = (
+            (et and et in _RENDERABLE_TRANSCRIPT_EVENT_TYPES)
+            or (inner_type and inner_type in _RENDERABLE_TRANSCRIPT_EVENT_TYPES)
+            or (inner_role and inner_role in _RENDERABLE_JSONL_ANTHROPIC_ROLES)
+            # Anthropic ``tool_calls``/``tool_use`` rows often omit the
+            # top-level role but still render as tool turns.
+            or bool(obj.get("tool_calls") or obj.get("tool_use"))
+        )
+        if not renderable:
             continue
         ts = obj.get("timestamp") or obj.get("time") or obj.get("created_at") or ev.get("ts")
         ts_ms = None
@@ -2439,17 +4162,53 @@ def _try_local_store_transcript(session_id: str):
             # Issue #564: surface decoding params on assistant turns so the UI
             # can show the "T=… top_p=… max=…" pill inline with the reply.
             decoding = _extract_decoding_params(obj)
+            raw_payload = _bounded_raw_payload(obj)
             for turn in _expand_openclaw_event(obj, ts_ms):
                 if not turn.get("content", "").strip():
                     continue
                 if decoding and turn.get("role") == "assistant":
                     turn["params"] = decoding
+                if raw_payload is not None:
+                    turn["raw"] = raw_payload
                 messages.append(turn)
+            continue
+
+        # Claude-Code shape (#1911): the real Anthropic message is nested under
+        # ``data.message`` and tools are content blocks, not top-level keys.
+        # Lift each tool_use/tool_result block into a named, deep-divable turn;
+        # emit prose only when no v3 event already covered it.
+        msg_obj = obj.get("message") if isinstance(obj.get("message"), dict) else None
+        if msg_obj is not None:
+            raw_payload = _bounded_raw_payload(obj)
+            role = msg_obj.get("role") or obj.get("type") or "assistant"
+            if not model:
+                model = msg_obj.get("model") or obj.get("model") or ev.get("model")
+            usage = msg_obj.get("usage")
+            if isinstance(usage, dict):
+                total_tokens += usage.get("total_tokens", 0) or (
+                    (usage.get("input_tokens", 0) or 0)
+                    + (usage.get("output_tokens", 0) or 0)
+                )
+            tool_turns, block_text = _anthropic_tool_turns(
+                msg_obj.get("content"), ts_ms, tool_name_by_id)
+            for tt in tool_turns:
+                if raw_payload is not None:
+                    tt["raw"] = raw_payload
+                messages.append(tt)
+            if block_text.strip() and not has_v3_messages:
+                entry = {"role": role, "content": block_text, "timestamp": ts_ms}
+                decoding = _extract_decoding_params(obj)
+                if decoding and role == "assistant":
+                    entry["params"] = decoding
+                if raw_payload is not None:
+                    entry["raw"] = raw_payload
+                messages.append(entry)
             continue
 
         # Anthropic-style fallback (existing logic).
         role = obj.get("role", obj.get("type", "unknown"))
         content = _stringify_content(obj.get("content", ""))
+        raw_payload = _bounded_raw_payload(obj)
         if obj.get("tool_calls") or obj.get("tool_use"):
             tools = obj.get("tool_calls") or obj.get("tool_use") or []
             if isinstance(tools, list):
@@ -2459,6 +4218,7 @@ def _try_local_store_transcript(session_id: str):
                         "role": "tool",
                         "content": f"[Tool Call: {tname}]\n{json.dumps(tc.get('input', tc.get('arguments', {})), indent=2)[:500]}",
                         "timestamp": ts_ms,
+                        "raw": _bounded_raw_payload(tc),
                     })
         if role == "tool_result":
             role = "tool"
@@ -2475,6 +4235,8 @@ def _try_local_store_transcript(session_id: str):
                 decoding = _extract_decoding_params(obj)
                 if decoding:
                     msg_entry["params"] = decoding
+            if raw_payload is not None:
+                msg_entry["raw"] = raw_payload
             messages.append(msg_entry)
     duration = None
     if first_ts and last_ts and last_ts > first_ts:
@@ -2485,6 +4247,22 @@ def _try_local_store_transcript(session_id: str):
             duration = f"{dur_sec / 60:.0f}m"
         else:
             duration = f"{dur_sec / 3600:.1f}h"
+    # Fetch external HTTP calls logged by the interceptor for this session.
+    # Routes through the daemon proxy (same pattern as query_events above);
+    # falls back to a direct read-only open in single-process installs / tests.
+    ext_calls: list = []
+    try:
+        _ext = local_store_via_daemon(
+            "query_external_calls", session_id=session_id, limit=200
+        )
+        if _ext is None:
+            from clawmetry import local_store as _ls
+            _ext = _ls.get_store(read_only=True).query_external_calls(
+                session_id=session_id, limit=200
+            )
+        ext_calls = _ext or []
+    except Exception:
+        ext_calls = []
     return {
         "name": session_id[:40],
         "messageCount": len(messages),
@@ -2492,6 +4270,7 @@ def _try_local_store_transcript(session_id: str):
         "totalTokens": total_tokens,
         "duration": duration,
         "messages": messages[:500],
+        "external_api_calls": ext_calls,
         "_source": "local_store",
     }
 
@@ -2551,6 +4330,7 @@ def api_transcript(session_id):
                                         "content": f"[Tool Call: {tname}]\n{json.dumps(tc.get('input', tc.get('arguments', {})), indent=2)[:500]}",
                                         "timestamp": obj.get("timestamp")
                                         or obj.get("time"),
+                                        "raw": _bounded_raw_payload(tc),
                                     }
                                 )
                     if role == "tool_result":
@@ -2598,6 +4378,10 @@ def api_transcript(session_id):
                             decoding = _extract_decoding_params(obj)
                             if decoding:
                                 msg_entry["params"] = decoding
+                        # Issue #1895: verbatim payload for the raw/pretty toggle.
+                        raw_payload = _bounded_raw_payload(obj)
+                        if raw_payload is not None:
+                            msg_entry["raw"] = raw_payload
                         messages.append(msg_entry)
                 except (json.JSONDecodeError, ValueError):
                     pass
@@ -2633,8 +4417,15 @@ def _try_local_store_transcript_events(session_id: str):
     Issue #1088: routes through the daemon HTTP proxy first, with the standard
     direct-open fallback inside ``_ls_call``. Returns ``None`` to defer to the
     JSONL parser when the events table has no rows for this session.
+
+    Issue #1597 class drain: UNIONs sub-agent events so the transcript modal
+    on a parent session shows every model/tool turn the parent delegated to a
+    Task-tool child. Falls back to the parent-only query when the daemon
+    predates the helper (staged rollout).
     """
-    rows = _ls_call("query_events", session_id=session_id, limit=10000)
+    rows = _ls_call("query_events_with_subagents", session_id=session_id, limit=10000)
+    if rows is None:
+        rows = _ls_call("query_events", session_id=session_id, limit=10000)
     if not rows:
         return None
     rows = list(reversed(rows))  # query_events is DESC; the modal reads forward.
@@ -2785,7 +4576,7 @@ def api_transcript_events(session_id):
                     })
                     continue
 
-                if obj_type == "message":
+                if obj_type == "message":  # v3-shape-gate: allow (reason: JSONL on-disk walker — api_transcript_events iterates per-line obj from .jsonl)
                     msg = obj.get("message", {})
                     role = msg.get("role", "")
                     content = msg.get("content", "")
@@ -2931,12 +4722,24 @@ def _try_local_store_session_model_journey(session_id: str):
     the same ``segments`` shape the JSONL walker produces.
 
     Issue #1088 phase 3. Returns ``None`` when the events table has no
-    matching rows so the route falls through to the JSONL walker."""
+    matching rows so the route falls through to the JSONL walker.
+
+    Issue #1597 class drain: uses the sub-agent-rollup variant so a parent
+    that delegated to a Task-tool child with a different model (e.g. Opus
+    parent → Haiku worker) shows the full model journey instead of just
+    the parent's initial line. Falls back to parent-only on older daemons.
+    """
     rows = _ls_call(
-        "query_session_model_journey",
+        "query_session_model_journey_with_subagents",
         session_id=session_id,
         limit=5000,
     )
+    if rows is None:
+        rows = _ls_call(
+            "query_session_model_journey",
+            session_id=session_id,
+            limit=5000,
+        )
     if not rows:
         return None
 
@@ -3144,7 +4947,7 @@ def api_session_model_journey(session_id):
                     })
                     continue
 
-                if etype == "message":
+                if etype == "message":  # v3-shape-gate: allow (reason: JSONL on-disk walker — api_session_model_journey fallback iterates per-line obj from .jsonl)
                     msg = ev.get("message", {}) or {}
                     if not isinstance(msg, dict):
                         continue
@@ -3222,8 +5025,14 @@ def _try_local_store_session_cost_breakdown(session_id: str):
       - no events exist for this session_id (fresh sync, etc.)
       - data blobs aren't shaped like assistant messages
       - any unexpected error happens
+
+    Issue #1597 class drain: UNIONs sub-agent events so the per-turn cost
+    breakdown attributes Task-tool sub-agent turns back to the parent.
+    Falls back to the parent-only query on older daemons.
     """
-    evs = _ls_call("query_events", session_id=session_id, limit=5000)
+    evs = _ls_call("query_events_with_subagents", session_id=session_id, limit=5000)
+    if evs is None:
+        evs = _ls_call("query_events", session_id=session_id, limit=5000)
     if not evs:
         return None
     # Walk events oldest-first so turn_index is meaningful.
@@ -3470,13 +5279,63 @@ def _try_local_store_session_export(session_id: str):
 
     Reads events from DuckDB and re-projects them into the same export shape
     the JSONL parser produces. Issue #1088 — uses ``_ls_call`` so the daemon
-    HTTP proxy fires under the standard install. Returns ``None`` to defer to
-    the JSONL parser when the events table has no rows for this session.
+    HTTP proxy fires under the standard install.
+
+    v3-silent-zero fix (issue #1588): the legacy version filtered on
+    ``ev_type == 'message'`` which silently matched ZERO rows on every real
+    OpenClaw v3 install (daemon writes ``assistant`` / ``model.completed`` /
+    ``prompt.submitted`` / ``tool.call`` / ``tool.result``). Endpoint
+    returned an empty ``messages`` array and the JSONL fallback never fired.
+    Same family as PR #1583 (token-attribution). This version:
+
+    * Filters on the union of pre-v3 ('message') AND v3 names so both
+      shapes hydrate the export.
+    * Dedupes the v3 sibling pair (``assistant`` + slim ``model.completed``
+      ~100 ms apart) via ``build_sibling_bucket_max`` so we don't emit the
+      same turn twice.
+    * Falls back to the daemon-stamped ``token_count`` / ``cost_usd``
+      scalar columns when a standalone ``model.completed`` row has no rich
+      sibling — defends against the Eng G "replace aggregate with deduped
+      subset" failure mode.
+    * Returns ``None`` (not an empty-messages dict) when no attributable
+      rows survived, so the JSONL parser fallback fires.
+
+    Issue #1597 class drain: the export now UNIONs sub-agent events so
+    downstream re-import / audit pipelines see the full delegated work, not
+    just the parent's direct turns. Falls back to parent-only on older
+    daemons (pre-#1611 wheel).
     """
-    rows = _ls_call("query_events", session_id=session_id, limit=10000)
+    rows = _ls_call("query_events_with_subagents", session_id=session_id, limit=10000)
+    if rows is None:
+        rows = _ls_call("query_events", session_id=session_id, limit=10000)
     if not rows:
         return None
     rows = list(reversed(rows))  # query_events is DESC; export reads forward.
+
+    # Sibling-pair dedupe (issue #1451 family). Build the bucket map BEFORE
+    # the projection loop so we can skip slim ``model.completed`` rows that
+    # have a richer ``assistant`` / ``message`` sibling in the same
+    # (sid, sec±1) window.
+    bucket_max = build_sibling_bucket_max(rows)
+
+    # Event-type → role mapping for v3 + legacy shapes. Tool-result rows
+    # don't carry a "role" in the chat sense — they're attributed under
+    # ``tool_calls`` rather than ``messages``.
+    _MSG_EVENT_TYPES = {
+        "message",          # pre-v3 synthetic
+        "assistant",        # v3 rich envelope
+        "model.completed",  # v3 slim sibling (only used when standalone)
+        "prompt.submitted", # v3 user-turn
+        "user",             # legacy / v3 fallback
+    }
+    _ROLE_BY_EVENT = {
+        "message":          None,           # use msg.role from envelope
+        "assistant":        "assistant",
+        "model.completed":  "assistant",
+        "prompt.submitted": "user",
+        "user":             "user",
+    }
+
     out = {
         "session_id": session_id,
         "exported_at": datetime.now(timezone.utc).isoformat(),
@@ -3508,15 +5367,30 @@ def _try_local_store_session_export(session_id: str):
                 ts_ms = int(datetime.fromisoformat(str(ts_str).replace("Z", "+00:00")).timestamp() * 1000)
             except Exception:
                 ts_ms = None
-        if ev_type == "model_change":
-            if data.get("modelId"):
-                model = data.get("modelId")
+        if ev_type == "model_change" or ev_type == "model.changed":
+            mid = data.get("modelId") or data.get("model")
+            if mid:
+                model = mid
                 out["metadata"]["model"] = model
-        elif ev_type == "message":
+        elif ev_type in _MSG_EVENT_TYPES:
+            # Skip the slim sibling when a richer envelope already covers
+            # this (sid, sec±1) bucket. Otherwise the same billable turn
+            # would emit two ``messages[]`` entries.
+            if is_sibling_dup(ev, bucket_max):
+                if ts_ms:
+                    if start_time is None or ts_ms < start_time:
+                        start_time = ts_ms
+                    if end_time is None or ts_ms > end_time:
+                        end_time = ts_ms
+                continue
+
             msg = data.get("message") if isinstance(data.get("message"), dict) else {}
-            role = msg.get("role", "")
             content = msg.get("content", [])
             usage = msg.get("usage") or {}
+            # Role: prefer the explicit envelope role; fall back to the
+            # event-type inference so v3 ``prompt.submitted`` rows still
+            # render as ``user`` even when the envelope is bare.
+            role = msg.get("role", "") or _ROLE_BY_EVENT.get(ev_type) or ""
             text_parts: list[str] = []
             tool_calls_in_msg: list[dict] = []
             if isinstance(content, list):
@@ -3536,31 +5410,59 @@ def _try_local_store_session_export(session_id: str):
                         })
             elif isinstance(content, str):
                 text_parts.append(content)
+            # v3 ``prompt.submitted`` carries the user text in
+            # ``data.finalPromptText`` (per reference_openclaw_v3_event_types.md),
+            # not in a chat envelope. Surface it so the export isn't
+            # silently empty for prompt rows.
+            if not text_parts and isinstance(data, dict):
+                fpt = data.get("finalPromptText") or data.get("promptText")
+                if isinstance(fpt, str) and fpt:
+                    text_parts.append(fpt)
             msg_entry = {
                 "timestamp": ts_str if isinstance(ts_str, str) else None,
                 "role": role,
                 "content": "\n".join(text_parts) if text_parts else None,
                 "model": msg.get("model") or model,
             }
+            in_t = out_t = cr_t = cw_t = 0
+            cost_total = 0.0
             if isinstance(usage, dict) and usage:
-                in_t = int(usage.get("input", 0) or 0)
-                out_t = int(usage.get("output", 0) or 0)
-                cr_t = int(usage.get("cacheRead", 0) or 0)
-                cw_t = int(usage.get("cacheWrite", 0) or 0)
+                in_t = int(usage.get("input", 0) or usage.get("input_tokens", 0) or 0)
+                out_t = int(usage.get("output", 0) or usage.get("output_tokens", 0) or 0)
+                cr_t = int(usage.get("cacheRead", 0) or usage.get("cache_read_input_tokens", 0) or 0)
+                cw_t = int(usage.get("cacheWrite", 0) or usage.get("cache_creation_input_tokens", 0) or 0)
+                cost_obj = usage.get("cost") or {}
+                if isinstance(cost_obj, dict):
+                    cost_total = float(cost_obj.get("total", 0) or 0)
+            # Scalar-column fallback (defends against Eng G's
+            # "blind-replace-aggregate-with-deduped-subset" failure mode):
+            # if the data blob carried no usage splits, attribute the
+            # daemon-stamped scalar columns so a standalone
+            # ``model.completed`` row still shows up in the export.
+            if in_t + out_t + cr_t + cw_t == 0:
+                col_tok = int(ev.get("token_count") or 0)
+                if col_tok > 0:
+                    in_t = col_tok
+            if cost_total <= 0:
+                try:
+                    col_cost = float(ev.get("cost_usd") or 0.0)
+                except (TypeError, ValueError):
+                    col_cost = 0.0
+                if col_cost > 0:
+                    cost_total = col_cost
+            if in_t + out_t + cr_t + cw_t > 0 or cost_total > 0:
                 msg_entry["tokens"] = {
                     "input": in_t, "output": out_t,
                     "cache_read": cr_t, "cache_write": cw_t,
-                    "total": usage.get("totalTokens", in_t + out_t),
+                    "total": in_t + out_t + cr_t + cw_t,
                 }
-                cost_obj = usage.get("cost") or {}
-                if isinstance(cost_obj, dict):
-                    msg_entry["cost_usd"] = cost_obj.get("total", 0.0)
-                    out["cost_data"]["total_cost_usd"] += float(cost_obj.get("total", 0) or 0)
-                    out["cost_data"]["input_tokens"] += in_t
-                    out["cost_data"]["output_tokens"] += out_t
-                    out["cost_data"]["cache_read_tokens"] += cr_t
-                    out["cost_data"]["cache_write_tokens"] += cw_t
-                    out["cost_data"]["total_tokens"] += in_t + out_t + cr_t + cw_t
+                msg_entry["cost_usd"] = cost_total
+                out["cost_data"]["total_cost_usd"] += cost_total
+                out["cost_data"]["input_tokens"] += in_t
+                out["cost_data"]["output_tokens"] += out_t
+                out["cost_data"]["cache_read_tokens"] += cr_t
+                out["cost_data"]["cache_write_tokens"] += cw_t
+                out["cost_data"]["total_tokens"] += in_t + out_t + cr_t + cw_t
             out["messages"].append(msg_entry)
             out["metadata"]["message_count"] += 1
             for tc in tool_calls_in_msg:
@@ -3572,11 +5474,31 @@ def _try_local_store_session_export(session_id: str):
                     "model": msg.get("model") or model,
                 })
                 out["metadata"]["tool_call_count"] += 1
+        elif ev_type in ("tool.call", "tool_call"):
+            # v3 explicit tool-call event (outside an assistant envelope).
+            tname = data.get("toolName") or data.get("name") or data.get("tool")
+            if tname:
+                out["tool_calls"].append({
+                    "timestamp": ts_str if isinstance(ts_str, str) else None,
+                    "tool_call_id": data.get("toolCallId") or data.get("id"),
+                    "tool_name": tname,
+                    "arguments": data.get("arguments") or data.get("input") or {},
+                    "model": model,
+                })
+                out["metadata"]["tool_call_count"] += 1
         if ts_ms:
             if start_time is None or ts_ms < start_time:
                 start_time = ts_ms
             if end_time is None or ts_ms > end_time:
                 end_time = ts_ms
+
+    # Return None (not an empty-messages shell) when no projectable rows
+    # survived, so the JSONL parser fallback fires instead of mis-tagging
+    # an empty answer as ``_source: 'local_store'``. This is the exact
+    # mistake the 6 prior fixes (PR #1571/#1576/#1580/#1583/etc.) made.
+    if not out["messages"] and not out["tool_calls"]:
+        return None
+
     out["metadata"]["start_time_ms"] = start_time
     out["metadata"]["end_time_ms"] = end_time
     return out
@@ -3672,7 +5594,7 @@ def api_session_export(session_id):
                     if obj.get("modelId"):
                         model = obj.get("modelId")
                         session_data["metadata"]["model"] = model
-                elif ev_type == "message":
+                elif ev_type == "message":  # v3-shape-gate: allow (reason: JSONL on-disk walker — api_session_export fallback iterates per-line obj from .jsonl)
                     msg = obj.get("message", {})
                     role = msg.get("role", "")
                     content = msg.get("content", [])
@@ -3904,12 +5826,84 @@ def _detect_model_transitions(path):
     return transitions
 
 
+def _try_local_store_model_transitions(sid: str):
+    """Tier-1 DuckDB fast path for /api/sessions/<sid>/model-transitions
+    (issue #1565). Reads ``event_type='model.changed'`` rows for one
+    session out of the DuckDB ``events`` table and folds them into the
+    same ``transitions`` shape the legacy JSONL walker produces.
+
+    Real OpenClaw v3 emits an explicit ``model_change`` JSONL event for
+    every model switch, which the sync daemon namespaces to
+    ``model.changed`` (see ``reference_openclaw_v3_event_types.md`` +
+    ``tests/test_v3_schema_parser.py::test_v3_model_change_becomes_model_changed``).
+    Each row's ``data`` blob carries ``modelId`` + ``provider`` — the
+    only fields the response needs. ``turn`` is the 1-based ordinal of
+    the transition (i.e. position in the model.changed sequence) since
+    we no longer have a cheap assistant-message counter without a
+    second query.
+
+    Returns ``None`` when no ``model.changed`` rows exist for the
+    session so the legacy JSONL walker still fires for older OpenClaw
+    installs (pre-v3 daemons, or sessions ingested before the namespace
+    rewrite landed).
+    """
+    if not sid:
+        return None
+    rows = _ls_call(
+        "query_events",
+        session_id=sid,
+        event_type="model.changed",
+        limit=5000,
+    )
+    if not rows:
+        return None
+    # ``query_events`` returns most-recent first; transitions need chronological.
+    rows = sorted(rows, key=lambda r: (r.get("ts") or "", r.get("id") or 0))
+
+    transitions: list = []
+    prev_model = None
+    prev_provider = None
+    turn = 0
+    for r in rows:
+        data = r.get("data") if isinstance(r.get("data"), dict) else {}
+        model = (data.get("modelId") or data.get("model") or r.get("model") or "").strip()
+        provider = (data.get("provider") or "").strip()
+        if not model:
+            continue
+        turn += 1
+        if prev_model is not None and (
+            model != prev_model or provider != prev_provider
+        ):
+            transitions.append({
+                "turn":          turn,
+                "ts":            r.get("ts") or "",
+                "from_model":    prev_model,
+                "from_provider": prev_provider,
+                "to_model":      model,
+                "to_provider":   provider,
+            })
+        prev_model = model
+        prev_provider = provider
+
+    return {
+        "sessionId":       sid,
+        "transitions":     transitions,
+        "count":           len(transitions),
+        "has_transitions": bool(transitions),
+        "_source":         "local_store",
+    }
+
+
 @bp_sessions.route("/api/sessions/<sid>/model-transitions")
 def api_session_model_transitions(sid):
     """Return model/provider transitions detected within a single session."""
     import dashboard as _d
     if not sid or any(c in sid for c in ("/", "\\", "..")):
         return jsonify({"error": "invalid session id"}), 400
+    if is_local_store_read_enabled():
+        fast = _try_local_store_model_transitions(sid)
+        if fast is not None:
+            return jsonify(fast)
     sessions_dir = _d.SESSIONS_DIR or os.path.expanduser(
         "~/.openclaw/agents/main/sessions"
     )
@@ -3925,6 +5919,263 @@ def api_session_model_transitions(sid):
             "has_transitions": bool(transitions),
         }
     )
+
+
+def _diff_params(p1, p2):
+    """Return list of decoding-param keys that differ between p1 and p2.
+
+    Compares temperature, top_p, top_k, and max_tokens. A missing key is
+    treated as None — a key present in one dict but not the other counts as
+    a change.  Floats are compared exactly (provider-switch drift is typically
+    a deliberate user change, not floating-point noise).
+    """
+    changed = []
+    for k in ("temperature", "top_p", "top_k", "max_tokens"):
+        v1 = (p1 or {}).get(k)
+        v2 = (p2 or {}).get(k)
+        if v1 != v2 and not (v1 is None and v2 is None):
+            changed.append(k)
+    return changed
+
+
+def _detect_config_drift_jsonl(path):
+    """Scan a session JSONL for provider switches that also changed decoding params.
+
+    A "config drift" event fires when both of these are true at the same turn:
+      1. The provider field changed from the previous assistant turn.
+      2. At least one of temperature / top_p / top_k / max_tokens differs.
+
+    Returns a dict ``{has_drift, drift_count, drifts}`` where each drift entry
+    is ``{turn, ts, from_provider, to_provider, from_params, to_params,
+    changed_keys}``.  Always returns a result dict (never raises).
+    """
+    drifts = []
+    prev_provider = None
+    prev_params: dict = {}
+    turn = 0
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                msg = obj
+                if obj.get("type") in ("message", "user", "assistant") and isinstance(
+                    obj.get("message"), dict
+                ):
+                    msg = obj["message"]
+                if msg.get("role") != "assistant":
+                    continue
+                turn += 1
+                provider = (msg.get("provider") or "").strip()
+                params = _extract_decoding_params(obj)
+                ts = (
+                    obj.get("timestamp")
+                    or obj.get("time")
+                    or msg.get("timestamp")
+                    or ""
+                )
+                if (
+                    prev_provider is not None
+                    and provider
+                    and prev_provider
+                    and provider != prev_provider
+                ):
+                    changed = _diff_params(prev_params, params)
+                    if changed:
+                        drifts.append(
+                            {
+                                "turn": turn,
+                                "ts": ts,
+                                "from_provider": prev_provider,
+                                "to_provider": provider,
+                                "from_params": prev_params,
+                                "to_params": params,
+                                "changed_keys": changed,
+                            }
+                        )
+                if provider:
+                    prev_provider = provider
+                    prev_params = params
+                elif prev_provider is None:
+                    prev_provider = ""
+                    prev_params = params
+    except Exception:
+        pass
+    return {
+        "has_drift": bool(drifts),
+        "drift_count": len(drifts),
+        "drifts": drifts,
+    }
+
+
+@bp_sessions.route("/api/sessions/<sid>/config-drift")
+def api_session_config_drift(sid):
+    """Return provider-switch config-drift events for a session (issue #570).
+
+    A drift fires when the provider changes between assistant turns AND at
+    least one decoding param (temperature, top_p, top_k, max_tokens) also
+    changes.  Different providers interpret the same temperature value
+    differently, so a silent param change at a provider switch can alter
+    model behaviour in ways that are hard to spot turn-by-turn.
+
+    Response: ``{sessionId, has_drift, drift_count, drifts: [{turn, ts,
+    from_provider, to_provider, from_params, to_params, changed_keys}]}``.
+    """
+    import dashboard as _d
+    if not sid or any(c in sid for c in ("/", "\\", "..")):
+        return jsonify({"error": "invalid session id"}), 400
+    sessions_dir = _d.SESSIONS_DIR or os.path.expanduser(
+        "~/.openclaw/agents/main/sessions"
+    )
+    path = os.path.join(sessions_dir, sid + ".jsonl")
+    path = os.path.normpath(path)
+    if not path.startswith(os.path.normpath(sessions_dir)):
+        return jsonify({"error": "access denied"}), 403
+    if not os.path.isfile(path):
+        return jsonify({"sessionId": sid, "has_drift": False, "drift_count": 0, "drifts": []})
+    result = _detect_config_drift_jsonl(path)
+    result["sessionId"] = sid
+    return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# Lexical drift endpoint — TF-IDF cosine similarity vs anchor turn (issue #569)
+# ---------------------------------------------------------------------------
+
+def _compute_lexical_drift(fpath: str, threshold: float = 0.1):
+    """Return per-turn lexical drift relative to the first message turn.
+
+    Uses smoothed TF-IDF cosine similarity (pure Python, zero deps). Labeled
+    as *lexical* drift — vocabulary overlap, not semantic embedding similarity.
+    Threshold default 0.1 is calibrated for TF-IDF on short conversation texts;
+    values differ from semantic-embedding cosine similarity.
+    """
+    import math
+    import re as _re
+
+    def _tokenize(text: str):
+        return _re.findall(r"[a-z0-9]+", text.lower())
+
+    def _tfidf(docs):
+        N = len(docs)
+        df: dict = {}
+        for doc in docs:
+            for term in set(doc):
+                df[term] = df.get(term, 0) + 1
+        idf = {t: math.log(1 + N / f) for t, f in df.items() if f > 0}
+        vecs = []
+        for doc in docs:
+            tf: dict = {}
+            for term in doc:
+                tf[term] = tf.get(term, 0) + 1
+            total = len(doc) or 1
+            vecs.append({t: (c / total) * idf.get(t, 0.0) for t, c in tf.items()})
+        return vecs
+
+    def _cosine(v1: dict, v2: dict) -> float:
+        dot = sum(v1.get(t, 0.0) * v for t, v in v2.items())
+        n1 = math.sqrt(sum(x * x for x in v1.values()))
+        n2 = math.sqrt(sum(x * x for x in v2.values()))
+        if n1 == 0.0 or n2 == 0.0:
+            return 0.0
+        return dot / (n1 * n2)
+
+    entries: list = []
+    try:
+        with open(fpath, "r", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") != "message":
+                    continue
+                role = obj.get("role", "")
+                if role not in ("user", "assistant"):
+                    continue
+                content = obj.get("content", "")
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    parts = []
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            parts.append(block.get("text", ""))
+                        elif isinstance(block, str):
+                            parts.append(block)
+                    text = " ".join(parts)
+                else:
+                    continue
+                text = text.strip()
+                if text:
+                    entries.append({"role": role, "text": text})
+    except OSError:
+        return None
+
+    if len(entries) < 2:
+        return {
+            "turns": [],
+            "avg_similarity": None,
+            "min_similarity": None,
+            "min_turn": None,
+            "has_drift": False,
+            "message_count": len(entries),
+            "threshold": threshold,
+            "_note": "too few messages",
+        }
+
+    docs = [_tokenize(e["text"]) for e in entries]
+    vecs = _tfidf(docs)
+    anchor = vecs[0]
+
+    turns = []
+    for i, (entry, vec) in enumerate(zip(entries, vecs)):
+        sim = 1.0 if i == 0 else round(_cosine(anchor, vec), 4)
+        turns.append({"turn": i, "role": entry["role"], "similarity": sim, "flagged": i > 0 and sim < threshold})
+
+    sims = [t["similarity"] for t in turns]
+    avg_sim = round(sum(sims) / len(sims), 4)
+    min_sim = round(min(sims), 4)
+    min_turn = sims.index(min_sim)
+
+    return {
+        "turns": turns,
+        "avg_similarity": avg_sim,
+        "min_similarity": min_sim,
+        "min_turn": min_turn,
+        "has_drift": any(t["flagged"] for t in turns),
+        "message_count": len(entries),
+        "threshold": threshold,
+    }
+
+
+@bp_sessions.route("/api/sessions/<session_id>/lexical-drift")
+def api_session_lexical_drift(session_id):
+    """Return per-turn lexical drift (TF-IDF cosine vs anchor) for a session."""
+    import dashboard as _d
+    if not session_id or any(c in session_id for c in ("/", "\\", "..")):
+        return jsonify({"error": "invalid session id"}), 400
+    sessions_dir = _d.SESSIONS_DIR or os.path.expanduser(
+        "~/.openclaw/agents/main/sessions"
+    )
+    fpath = os.path.normpath(os.path.join(sessions_dir, session_id + ".jsonl"))
+    if not fpath.startswith(os.path.normpath(sessions_dir)):
+        return jsonify({"error": "access denied"}), 403
+    if not os.path.isfile(fpath):
+        return jsonify({"error": "session not found"}), 404
+    result = _compute_lexical_drift(fpath)
+    if result is None:
+        return jsonify({"error": "could not read session"}), 500
+    result["session_id"] = session_id
+    return jsonify(result)
 
 
 def _try_local_store_fallbacks(limit: int, top: int):
@@ -4053,6 +6304,11 @@ def api_spans():
     Query params:
       * ``limit`` — max rows (default 50, clamped 1-500)
       * ``session_id`` — optional session filter
+      * ``since`` — optional unix-second floor on ``start_ts``. Issue #1374:
+        OSS / Cloud-Free callers are clamped to ``now - 24h``; Cloud-Pro
+        users (validated by ``dashboard._is_pro_user``) get unlimited
+        history. Response carries ``capped_at_24h`` so the UI can render
+        the upgrade CTA.
 
     Response shape::
 
@@ -4062,13 +6318,14 @@ def api_spans():
                         duration_ms, status, model, tool_name, cost_usd,
                         tokens_input, tokens_output}, ... ],
           "count":   <int>,
-          "_source": "local_store"
+          "_source": "local_store",
+          "capped_at_24h": <bool>
         }
 
     Graceful fallback: when the local store / daemon is unreachable we
-    return ``{"spans": [], "count": 0, "_source": "unavailable"}`` with
-    HTTP 200 so the UI table renders an empty state instead of an error
-    banner.
+    return ``{"spans": [], "count": 0, "_source": "unavailable",
+    "capped_at_24h": <bool>}`` with HTTP 200 so the UI table renders an
+    empty state instead of an error banner.
     """
     try:
         limit = int(request.args.get("limit", 50))
@@ -4077,15 +6334,1186 @@ def api_spans():
     limit = max(1, min(500, limit))
     session_id = (request.args.get("session_id") or "").strip() or None
 
+    # Optional unix-second floor (caller-supplied).
+    since_raw = (request.args.get("since") or "").strip()
+    since: float | None
+    try:
+        since = float(since_raw) if since_raw else None
+    except (TypeError, ValueError):
+        since = None
+
+    # OSS retention cap (issue #1374). Cloud-Pro bypasses; everyone else
+    # gets clamped to the last 24 h of ``start_ts``. Mirrors the pattern
+    # used by /api/flow/runs (issue #1173).
+    capped_at_24h = False
+    try:
+        import dashboard as _d
+        is_pro = bool(_d._is_pro_user())
+    except Exception:
+        is_pro = False
+    if not is_pro:
+        cap_floor = time.time() - 24 * 3600
+        if since is None or since < cap_floor:
+            since = cap_floor
+            capped_at_24h = True
+
     rows = _ls_call(
         "query_recent_spans",
         limit=limit,
         session_id=session_id,
+        since=since,
     )
     if rows is None:
-        return jsonify({"spans": [], "count": 0, "_source": "unavailable"})
+        return jsonify({
+            "spans": [],
+            "count": 0,
+            "_source": "unavailable",
+            "capped_at_24h": capped_at_24h,
+        })
     return jsonify({
         "spans":   rows,
         "count":   len(rows),
         "_source": "local_store",
+        "capped_at_24h": capped_at_24h,
     })
+
+
+# ── Issue #1614 — outcome labeling ──────────────────────────────────────────
+#
+# Every session gets one of: success / failed / escalated / ongoing. Auto-
+# detected by ``clawmetry.outcome_classifier`` from event-stream + approvals
+# table + session metadata. Persisted on the sessions table so the tile
+# query is a one-row roll-up, not a per-session event scan.
+#
+# Two endpoints:
+#   GET /api/outcomes?window=1d        — totals + success-rate (Overview tile)
+#   GET /api/outcomes/timeline?days=7  — per-day series for sparklines
+#
+# Both pre-compute via DuckDB (memory ``feedback_duckdb_first_rule``). When
+# the daemon proxy is unreachable we degrade to ``{available: false}`` rather
+# than 500ing — overview-tab MUST stay responsive (issue #1127 lesson).
+
+_OUTCOME_WINDOW_TO_SECS = {
+    "1h": 3600,
+    "1d": 86400,
+    "24h": 86400,
+    "7d": 7 * 86400,
+    "30d": 30 * 86400,
+}
+
+
+def _outcome_window_to_iso_since(window):
+    """Convert a window shorthand to an ISO ``since`` timestamp.
+
+    Returns None if the window string is invalid — caller treats that as
+    "no time filter" so the tile still renders something useful.
+    """
+    secs = _OUTCOME_WINDOW_TO_SECS.get((window or "").lower())
+    if not secs:
+        return None
+    from datetime import datetime, timedelta, timezone
+    since_dt = datetime.now(timezone.utc) - timedelta(seconds=secs)
+    return since_dt.isoformat().replace("+00:00", "Z")
+
+
+@bp_sessions.route("/api/outcomes")
+def api_outcomes():
+    """Outcome roll-up for the Overview tile.
+
+    Query params:
+      ``window`` — one of ``1h``, ``1d`` (default), ``7d``, ``30d``.
+      ``agent_type`` — default ``openclaw``.
+
+    Returns the shape ``clawmetry.outcome_classifier.aggregate_outcomes``
+    produces plus a ``window`` echo + ``_source`` tag. On total-failure
+    paths (DuckDB unreachable + no fallback) we still 200 with zeros so
+    the tile renders "No completed tasks yet" instead of a JS error.
+    """
+    from clawmetry.outcome_classifier import aggregate_outcomes
+    window = (request.args.get("window") or "1d").lower()
+    agent_type = request.args.get("agent_type") or "openclaw"
+    since = _outcome_window_to_iso_since(window)
+
+    rows = _ls_call(
+        "query_outcomes",
+        agent_type=agent_type,
+        since=since,
+        runtime=(request.args.get("runtime") or None),
+        limit=int(request.args.get("limit") or 1000),
+    )
+    if rows is None:
+        # Daemon proxy unreachable AND no in-process fallback succeeded.
+        # Return a zeroed shell so the UI degrades gracefully.
+        return jsonify({
+            "window": window,
+            "total": 0,
+            "success": 0,
+            "failed": 0,
+            "escalated": 0,
+            "ongoing": 0,
+            "success_rate": 0.0,
+            "needed_human_rate": 0.0,
+            "_source": "unavailable",
+        })
+    agg = aggregate_outcomes(rows)
+    agg["window"] = window
+    agg["_source"] = "local_store"
+    return jsonify(agg)
+
+
+@bp_sessions.route("/api/outcomes/timeline")
+def api_outcomes_timeline():
+    """Per-day outcome series for the drill-down sparkline.
+
+    Buckets every session into a YYYY-MM-DD key by ``last_active_at`` (the
+    same field the Overview Tasks panel uses), then runs the aggregator
+    per day. Returns up to ``days`` days, newest-first.
+    """
+    from clawmetry.outcome_classifier import aggregate_outcomes
+    try:
+        days = max(1, min(90, int(request.args.get("days") or 7)))
+    except (TypeError, ValueError):
+        days = 7
+    agent_type = request.args.get("agent_type") or "openclaw"
+    from datetime import datetime, timedelta, timezone
+    since_dt = datetime.now(timezone.utc) - timedelta(days=days)
+    since_iso = since_dt.isoformat().replace("+00:00", "Z")
+
+    rows = _ls_call(
+        "query_outcomes",
+        agent_type=agent_type,
+        since=since_iso,
+        limit=5000,
+    ) or []
+
+    by_day: dict[str, list[dict]] = {}
+    for r in rows:
+        ts = r.get("last_active_at") or r.get("ended_at") or ""
+        day = ts[:10] if len(ts) >= 10 else ""
+        if not day:
+            continue
+        by_day.setdefault(day, []).append(r)
+    series = []
+    for day in sorted(by_day.keys(), reverse=True):
+        agg = aggregate_outcomes(by_day[day])
+        agg["day"] = day
+        series.append(agg)
+    return jsonify({
+        "days": days,
+        "series": series,
+        "_source": "local_store" if rows else "empty",
+    })
+
+
+@bp_sessions.route("/api/outcomes/sessions")
+def api_outcomes_sessions():
+    """Drill-down list: which sessions failed / escalated. Powers the
+    expanded view when the Overview tile is clicked.
+
+    Query params:
+      ``outcome`` — filter to one outcome (``failed`` / ``escalated`` /
+        ``ongoing`` / ``success``). Default ``failed``.
+      ``window`` — same shorthand as /api/outcomes (default ``1d``).
+      ``limit``  — cap (default 50).
+    """
+    outcome = (request.args.get("outcome") or "failed").lower()
+    window = (request.args.get("window") or "1d").lower()
+    agent_type = request.args.get("agent_type") or "openclaw"
+    try:
+        limit = max(1, min(500, int(request.args.get("limit") or 50)))
+    except (TypeError, ValueError):
+        limit = 50
+    since = _outcome_window_to_iso_since(window)
+    rows = _ls_call(
+        "query_outcomes",
+        agent_type=agent_type,
+        since=since,
+        limit=2000,
+    ) or []
+    filtered = [r for r in rows if (r.get("outcome") or "") == outcome][:limit]
+    # Slim the payload — the drill-down UI needs id/title/cost/timestamp only.
+    out = [
+        {
+            "session_id":      r.get("session_id"),
+            "title":           r.get("title"),
+            "last_active_at":  r.get("last_active_at"),
+            "ended_at":        r.get("ended_at"),
+            "cost_usd":        r.get("cost_usd") or 0,
+            "total_tokens":    r.get("total_tokens") or 0,
+            "outcome":         r.get("outcome"),
+            "confidence":      r.get("outcome_confidence"),
+        }
+        for r in filtered
+    ]
+    return jsonify({
+        "outcome": outcome,
+        "window":  window,
+        "count":   len(out),
+        "sessions": out,
+        "_source": "local_store",
+    })
+
+
+@bp_sessions.route("/api/outcomes/impact")
+def api_outcomes_impact():
+    """Impact-taxonomy breakdown for sessions in the requested window (issue #1649).
+
+    Classifies non-success sessions into OpenClaw's failure-mode labels:
+    message-loss, session-state, crash-loop, auth-provider, security.
+    A session may carry multiple tags.
+
+    Query params:
+      window     — 1h / 1d (default) / 7d / 30d
+      agent_type — default openclaw
+      limit      — max sessions to classify (default 50, cap 50)
+    """
+    from clawmetry.outcome_classifier import (
+        classify_session_impact,
+        aggregate_impacts,
+        OUTCOME_SUCCESS,
+        OUTCOME_ONGOING,
+    )
+    window = (request.args.get("window") or "1d").lower()
+    agent_type = request.args.get("agent_type") or "openclaw"
+    try:
+        limit = max(1, min(50, int(request.args.get("limit") or 50)))
+    except (TypeError, ValueError):
+        limit = 50
+    since = _outcome_window_to_iso_since(window)
+
+    outcome_rows = _ls_call(
+        "query_outcomes",
+        agent_type=agent_type,
+        since=since,
+        limit=500,
+    ) or []
+
+    # Only classify sessions that didn't simply succeed / are still ongoing —
+    # keeps the per-session event queries bounded to the interesting minority.
+    candidates = [
+        r for r in outcome_rows
+        if (r.get("outcome") or "") not in (OUTCOME_SUCCESS, OUTCOME_ONGOING, "")
+    ][:limit]
+
+    pairs: list[tuple[str, list[str]]] = []
+    for row in candidates:
+        sid = row.get("session_id")
+        if not sid:
+            continue
+        evs = _ls_call("query_events", session_id=sid, limit=200) or []
+        meta = {k: row.get(k) for k in ("status", "ended_at", "last_active_at")}
+        tags = classify_session_impact(evs, meta)
+        pairs.append((sid, tags))
+
+    agg = aggregate_impacts(pairs)
+    agg["window"] = window
+    agg["total_sessions_in_window"] = len(outcome_rows)
+    agg["_source"] = "local_store" if outcome_rows else "empty"
+    return jsonify(agg)
+
+
+# ── Authority footprint (#880) ────────────────────────────────────────────────
+
+# Matches absolute filesystem paths inside tool arg JSON/strings.
+# Stops at whitespace and common JSON delimiters to avoid over-matching.
+_AUTH_FILE_RE = re.compile(r'(?:^|[\s"\'`=,({])((?:/[^\s"\'`<>:;,)}\[\]]{2,})+)')
+
+# Matches the host (and optional port) portion of http/https URLs.
+_AUTH_URL_RE = re.compile(r'https?://([a-zA-Z0-9._%-]+(?::\d+)?)')
+
+# Event types that carry a top-level tool invocation (all known variants).
+_AUTH_TOOL_TYPES = frozenset({
+    "tool_call", "tool.call", "tool_use", "toolCall",
+})
+
+
+def _extract_authority(events: list) -> dict:
+    """Derive an authority footprint from a list of DuckDB events.
+
+    Returns dict with keys:
+      tools      — [{name, calls}] sorted by call count desc
+      filesystem — [{path, via_tools}] up to 100 unique paths
+      network    — [{host, via_tools}] up to 50 unique hosts
+    """
+    tool_counts: dict = {}
+    file_paths: dict = {}   # path  -> set of tool names
+    net_hosts: dict = {}    # host  -> set of tool names
+
+    for ev in (events or []):
+        if ev.get("event_type", "") not in _AUTH_TOOL_TYPES:
+            continue
+        data = ev.get("data") or {}
+        if not isinstance(data, dict):
+            continue
+
+        name = (
+            data.get("tool") or data.get("tool_name") or data.get("name") or ""
+        ).lower().strip()
+        if not name:
+            continue
+
+        tool_counts[name] = tool_counts.get(name, 0) + 1
+
+        args_raw = (
+            data.get("args") if data.get("args") is not None
+            else data.get("arguments") if data.get("arguments") is not None
+            else data.get("input")
+        )
+        if args_raw is None:
+            continue
+        if isinstance(args_raw, str):
+            args_str = args_raw
+        else:
+            try:
+                args_str = json.dumps(args_raw)
+            except Exception:
+                args_str = str(args_raw)
+
+        for m in _AUTH_FILE_RE.findall(args_str):
+            path = m.strip()
+            # Skip noise: very short paths, kernel pseudo-filesystems
+            if len(path) > 3 and not path.startswith(("/proc", "/sys", "/dev")):
+                file_paths.setdefault(path, set()).add(name)
+
+        for host in _AUTH_URL_RE.findall(args_str):
+            if host:
+                net_hosts.setdefault(host, set()).add(name)
+
+    return {
+        "tools": [
+            {"name": n, "calls": c}
+            for n, c in sorted(tool_counts.items(), key=lambda x: -x[1])
+        ],
+        "filesystem": [
+            {"path": p, "via_tools": sorted(t)}
+            for p, t in sorted(file_paths.items())
+        ][:100],
+        "network": [
+            {"host": h, "via_tools": sorted(t)}
+            for h, t in sorted(net_hosts.items())
+        ][:50],
+    }
+
+
+@bp_sessions.route("/api/authority")
+def api_authority():
+    """Authority footprint for one session: tools called, files touched,
+    network hosts contacted. Implements issue #880.
+
+    Query params:
+      session_id  — required
+      limit       — max events to scan (default 2000, cap 10000)
+    """
+    session_id = (
+        request.args.get("session_id") or request.args.get("session") or ""
+    )
+    if not session_id:
+        return jsonify({"error": "session_id required"}), 400
+    try:
+        limit = max(1, min(10000, int(request.args.get("limit") or 2000)))
+    except (TypeError, ValueError):
+        limit = 2000
+
+    events = _ls_call("query_events", session_id=session_id, limit=limit) or []
+    footprint = _extract_authority(events)
+    footprint["session_id"] = session_id
+    footprint["scanned_events"] = len(events)
+    return jsonify(footprint)
+# ─────────────────────────────────────────────────────────────────────────────
+# Intent vs. execution divergence detection  (issue #879)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Three rule sets: (1) claims search/read but calls write/execute,
+# (2) claims read-only but calls write/execute/delete,
+# (3) claims local-only but calls a network/external tool.
+_INTENT_DIVERGENCE_RULES = [
+    {
+        "id": "INT-001",
+        "description": "Claims to search/read but writes or executes",
+        "severity": "medium",
+        "compiled": [
+            _re.compile(r, _re.IGNORECASE) for r in [
+                r"\bi(?:'?ll| will| am going to)\s+(?:search|look up|browse|fetch|retrieve)\b",
+                r"\blet me\s+(?:search|look|check|browse|find)\b",
+                r"\bi(?:'?ll| will)\s+(?:just\s+)?(?:read|look at|check)\b",
+            ]
+        ],
+        "mismatched_substrings": ("write", "edit", "create", "bash", "execute", "run"),
+    },
+    {
+        "id": "INT-002",
+        "description": "Claims read-only intent but calls write or execute tool",
+        "severity": "high",
+        "compiled": [
+            _re.compile(r, _re.IGNORECASE) for r in [
+                r"\bonly\s+(?:read|check|look|inspect|view)\b",
+                r"\bwon'?t\s+(?:change|modify|write|execute|run)\b",
+                r"\bnot\s+(?:going to\s+)?(?:change|modify|write|run|execute)\b",
+                r"\bwithout\s+(?:modifying|changing|writing|executing)\b",
+            ]
+        ],
+        "mismatched_substrings": ("write", "edit", "create", "bash", "execute", "run", "delete"),
+    },
+    {
+        "id": "INT-003",
+        "description": "Claims local-only operation but calls network or external tool",
+        "severity": "medium",
+        "compiled": [
+            _re.compile(r, _re.IGNORECASE) for r in [
+                r"\b(?:only\s+(?:\w+\s+)?local(?:ly)?|local(?:ly)?\s+only|work(?:ing)?\s+local(?:ly)?)\b",
+                r"\bno\s+(?:external|network|internet|remote|online)\b",
+                r"\bwithout\s+(?:connect(?:ing)?|network|internet|uploading|downloading)\b",
+            ]
+        ],
+        "mismatched_substrings": ("web_search", "web_fetch", "http", "curl", "wget", "fetch", "download", "upload", "request"),
+    },
+]
+
+
+def _extract_tool_names_from_obj(obj: dict) -> list:
+    """Return all tool names referenced in a single JSONL event object.
+
+    Handles legacy ``tool_calls``/``tool_use`` arrays, v3 ``tool.call`` events,
+    and Anthropic-style ``tool_use`` content blocks.
+    """
+    names = []
+    for field in ("tool_calls", "tool_use"):
+        for tc in (obj.get(field) or []):
+            if isinstance(tc, dict):
+                n = tc.get("name") or (tc.get("function") or {}).get("name") or ""
+                if n:
+                    names.append(n.lower())
+    data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+    if obj.get("event_type") in ("tool.call", "tool_use"):
+        n = data.get("tool") or data.get("toolName") or data.get("name") or ""
+        if n:
+            names.append(n.lower())
+    for container in (obj, obj.get("message") if isinstance(obj.get("message"), dict) else {}):
+        if not isinstance(container, dict):
+            continue
+        for blk in (container.get("content") or []):
+            if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                n = blk.get("name") or ""
+                if n:
+                    names.append(n.lower())
+    return names
+
+
+def _extract_assistant_text(obj: dict) -> str:
+    """Return the assistant's text content from a JSONL line object, or ''."""
+    et = obj.get("event_type") or obj.get("type") or ""
+    role = obj.get("role") or ""
+    msg = obj
+    if et in ("message", "user", "assistant") and isinstance(obj.get("message"), dict):
+        msg = obj["message"]
+    if msg.get("role") == "assistant" or role == "assistant" or et == "model.completed":
+        content = msg.get("content") or obj.get("content") or ""
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            return " ".join(
+                blk.get("text", "") if isinstance(blk, dict) and blk.get("type") == "text" else ""
+                for blk in content
+            ).strip()
+    return ""
+
+
+def _detect_intent_divergence(path: str) -> dict:
+    """Scan a session JSONL for intent vs. execution divergence (issue #879).
+
+    Single-pass state machine: tracks the last assistant text; on each tool call
+    checks whether the preceding stated intent contradicts the tool name.
+    Resets on user / prompt.submitted turns.
+
+    Returns ``{has_divergence, divergence_count, flags}`` where each flag is
+    ``{turn, ts, check_id, description, severity, intent_evidence, actual_tool}``.
+    Always returns a result dict — never raises.
+    """
+    flags: list = []
+    last_text = ""
+    last_ts = ""
+    last_turn = 0
+    turn = 0
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    continue
+                et = obj.get("event_type") or obj.get("type") or ""
+                role = obj.get("role") or ""
+                ts = obj.get("ts") or obj.get("timestamp") or obj.get("time") or ""
+                if role == "user" or et in ("prompt.submitted", "user"):
+                    last_text = ""
+                    continue
+                text = _extract_assistant_text(obj)
+                if text:
+                    turn += 1
+                    last_text = text
+                    last_ts = ts
+                    last_turn = turn
+                if not last_text:
+                    continue
+                for tool_name in _extract_tool_names_from_obj(obj):
+                    for rule in _INTENT_DIVERGENCE_RULES:
+                        if not any(p.search(last_text) for p in rule["compiled"]):
+                            continue
+                        if not any(sub in tool_name for sub in rule["mismatched_substrings"]):
+                            continue
+                        flags.append({
+                            "turn": last_turn,
+                            "ts": last_ts or ts,
+                            "check_id": rule["id"],
+                            "description": rule["description"],
+                            "severity": rule["severity"],
+                            "intent_evidence": last_text[:300],
+                            "actual_tool": tool_name,
+                        })
+    except Exception:
+        pass
+    return {
+        "has_divergence": bool(flags),
+        "divergence_count": len(flags),
+        "flags": flags,
+    }
+
+
+@bp_sessions.route("/api/sessions/<session_id>/intent-divergence")
+def api_session_intent_divergence(session_id):
+    """Check for intent vs. execution divergence in a session (issue #879).
+
+    Compares what the assistant says it will do (stated intent in text turns)
+    against the tool calls that follow. Uses three heuristic rules:
+    INT-001 (search/read claim + write/execute action),
+    INT-002 (read-only claim + write/execute action),
+    INT-003 (local-only claim + network/external action).
+
+    Response: ``{sessionId, has_divergence, divergence_count, flags: [{turn,
+    ts, check_id, description, severity, intent_evidence, actual_tool}]}``.
+    """
+    import dashboard as _d
+    if not session_id or any(c in session_id for c in ("/", "\\", "..")):
+        return jsonify({"error": "invalid session id"}), 400
+    sessions_dir = _d.SESSIONS_DIR or os.path.expanduser(
+        "~/.openclaw/agents/main/sessions"
+    )
+    path = os.path.join(sessions_dir, session_id + ".jsonl")
+    path = os.path.normpath(path)
+    if not path.startswith(os.path.normpath(sessions_dir)):
+        return jsonify({"error": "access denied"}), 403
+    if not os.path.isfile(path):
+        return jsonify({
+            "sessionId": session_id,
+            "has_divergence": False,
+            "divergence_count": 0,
+            "flags": [],
+        })
+    result = _detect_intent_divergence(path)
+    result["sessionId"] = session_id
+    return jsonify(result)
+
+
+def _detect_intent_drift_from_events(events: list) -> dict:
+    """Run intent-drift analysis on DuckDB event dicts (issue #3442).
+
+    Accepts the list returned by ``query_events`` — each element has
+    ``event_type``, ``ts``, and a decoded ``data`` dict — and runs the same
+    state machine as :func:`_detect_intent_divergence`.  The two helpers
+    (:func:`_extract_assistant_text`, :func:`_extract_tool_names_from_obj`)
+    expect a flat dict that looks like a raw JSONL line; we produce that by
+    merging ``data`` with the top-level ``event_type``/``ts`` keys.
+
+    Returns ``{has_drift, drift_count, flags}`` — parallel to the filesystem
+    variant's ``{has_divergence, divergence_count, flags}`` but with shorter
+    keys so the two endpoints are clearly distinct.
+    """
+    flags: list = []
+    last_text = ""
+    last_ts = ""
+    last_turn = 0
+    turn = 0
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        et = ev.get("event_type") or ""
+        ts = ev.get("ts") or ""
+        data = ev.get("data") or {}
+        if not isinstance(data, dict):
+            data = {}
+        # Merge data into a flat dict so existing helpers work unchanged.
+        obj = {**data, "event_type": et, "ts": ts}
+        role = data.get("role") or ""
+        if role == "user" or et in ("prompt.submitted", "user"):
+            last_text = ""
+            continue
+        text = _extract_assistant_text(obj)
+        if text:
+            turn += 1
+            last_text = text
+            last_ts = ts
+            last_turn = turn
+        if not last_text:
+            continue
+        for tool_name in _extract_tool_names_from_obj(obj):
+            for rule in _INTENT_DIVERGENCE_RULES:
+                if not any(p.search(last_text) for p in rule["compiled"]):
+                    continue
+                if not any(sub in tool_name for sub in rule["mismatched_substrings"]):
+                    continue
+                flags.append({
+                    "turn": last_turn,
+                    "ts": last_ts or ts,
+                    "check_id": rule["id"],
+                    "description": rule["description"],
+                    "severity": rule["severity"],
+                    "intent_evidence": last_text[:300],
+                    "actual_tool": tool_name,
+                })
+    return {"has_drift": bool(flags), "drift_count": len(flags), "flags": flags}
+
+
+@bp_sessions.route("/api/sessions/<session_id>/intent-drift")
+def api_session_intent_drift(session_id):
+    """Intent vs. execution drift for a session — DuckDB-backed (issue #3442).
+
+    DuckDB-first variant of /intent-divergence that works in cloud and
+    multi-process installs where the container has no ~/.openclaw.  Falls back
+    to the filesystem scanner when DuckDB is unavailable.
+
+    Query params: none.
+
+    Response shape::
+
+        {
+          "sessionId": str,
+          "has_drift": bool,
+          "drift_count": int,
+          "flags": [
+            {
+              "turn": int,
+              "ts": str,
+              "check_id": str,       # INT-001 / INT-002 / INT-003
+              "description": str,
+              "severity": str,       # "medium" | "high"
+              "intent_evidence": str,
+              "actual_tool": str
+            }
+          ],
+          "_source": "duckdb" | "filesystem" | "unavailable"
+        }
+    """
+    if not session_id or any(c in session_id for c in ("/", "\\", "..")):
+        return jsonify({"error": "invalid session id"}), 400
+
+    if is_local_store_read_enabled():
+        try:
+            from routes.local_query import local_store_via_daemon
+            raw = local_store_via_daemon(
+                "query_events", session_id=session_id, limit=500
+            )
+            if raw is not None:
+                ordered = sorted(
+                    raw,
+                    key=lambda e: (e.get("ts") or "", e.get("id") or 0),
+                )
+                result = _detect_intent_drift_from_events(ordered)
+                result["sessionId"] = session_id
+                result["_source"] = "duckdb"
+                return jsonify(result)
+        except Exception:
+            pass
+
+    # Filesystem fallback for local-only installs without a running daemon.
+    try:
+        import dashboard as _d
+        sessions_dir = _d.SESSIONS_DIR or os.path.expanduser(
+            "~/.openclaw/agents/main/sessions"
+        )
+        path = os.path.normpath(os.path.join(sessions_dir, session_id + ".jsonl"))
+        if path.startswith(os.path.normpath(sessions_dir)) and os.path.isfile(path):
+            fs = _detect_intent_divergence(path)
+            return jsonify({
+                "sessionId": session_id,
+                "has_drift": fs.get("has_divergence", False),
+                "drift_count": fs.get("divergence_count", 0),
+                "flags": fs.get("flags", []),
+                "_source": "filesystem",
+            })
+    except Exception:
+        pass
+
+    return jsonify({
+        "sessionId": session_id,
+        "has_drift": False,
+        "drift_count": 0,
+        "flags": [],
+        "_source": "unavailable",
+    })
+
+
+# ── Per-run A/B compare (#2196 item #2) ───────────────────────────────────────
+# Pick two runs, get the side-by-side stats + signed deltas. Stats are
+# computed from the same primitives the snapshot uses (#2215 waste-flags
+# signals + #2202 corrected error flag), so a Compare view reads the same
+# truth the Overview health timeline + cost numbers do.
+
+_RUN_COMPARE_LOWER_BETTER = (
+    "cost_usd",
+    "total_tokens",
+    "step_count",
+    "max_event_token_count",
+    "max_tool_result_bytes",
+    "error_count",
+    "flag_count",
+)
+_RUN_COMPARE_HIGHER_BETTER = ("cache_hit_rate", "eval_score")
+
+# Outcome rank for the run-compare quality row. Higher = better. Drives the
+# improved / regressed / same verdict (no delta arithmetic on the textual
+# label). Mirrors clawmetry/outcome_classifier.py's label vocabulary; the
+# three failure-ish labels share the lowest rank.
+_RUN_COMPARE_OUTCOME_RANK = {
+    "success":         4,
+    "escalated":       3,
+    "ongoing":         2,
+    "tool_call_stuck": 1,
+    "cognitive_loop":  1,
+    "failed":          1,
+}
+
+
+def _run_compare_outcome_verdict(outcome_a, outcome_b):
+    """improved / regressed / same / null for the textual outcome row.
+
+    ``null`` when either side has no outcome (so the UI can show a neutral
+    dash instead of a bogus verdict). Uses the rank table above."""
+    if not outcome_a or not outcome_b:
+        return None
+    ra = _RUN_COMPARE_OUTCOME_RANK.get(outcome_a)
+    rb = _RUN_COMPARE_OUTCOME_RANK.get(outcome_b)
+    if ra is None or rb is None:
+        return None
+    if rb > ra:
+        return "improved"
+    if rb < ra:
+        return "regressed"
+    return "same"
+
+
+def _run_compare_stats(sid, quality=None):
+    """Compute the per-session stats panel used by /api/run-compare. Returns a
+    dict (with ``missing: True`` when the session id has no events / summary).
+
+    ``quality`` is the optional ``{session_id: {eval_score, eval_reason,
+    outcome, outcome_confidence}}`` map from query_session_quality. Null-safe:
+    a session with no eval score / outcome simply reports those fields as
+    ``None`` (the response shape stays additive + backward compatible)."""
+    from clawmetry import waste_flags as _wf
+    from routes.local_query import local_store_via_daemon
+
+    # Session summary: best-effort lookup in a bounded recent window.
+    try:
+        sessions = local_store_via_daemon("query_sessions", limit=500) or []
+    except Exception:
+        sessions = []
+    meta = next((s for s in sessions if s.get("session_id") == sid), None)
+
+    try:
+        events = local_store_via_daemon("query_events", session_id=sid, limit=500) or []
+    except Exception:
+        events = []
+
+    signals = _wf.compute_signals_from_events(events)
+    flags = _wf.compute_flags(signals)
+    error_count = sum(1 for e in events if _wf.event_is_real_error(e))
+
+    cache_read = int(signals.get("cache_read_tokens") or 0)
+    input_tokens = int(signals.get("input_tokens") or 0)
+    cache_total = cache_read + input_tokens
+    cache_hit_rate = (cache_read / cache_total) if cache_total > 0 else None
+
+    try:
+        cost_usd = float((meta or {}).get("cost_usd") or 0.0)
+    except (TypeError, ValueError):
+        cost_usd = 0.0
+    try:
+        total_tokens = int((meta or {}).get("token_count") or 0)
+    except (TypeError, ValueError):
+        total_tokens = 0
+
+    # Quality fields (eval->monitor loop): null-safe pull from the per-session
+    # eval-score / outcome map. Sessions never scored / classified report
+    # ``None`` so the row renders a neutral dash instead of a fake number.
+    q = (quality or {}).get(sid) or {}
+    eval_score = q.get("eval_score")
+    try:
+        eval_score = None if eval_score is None else float(eval_score)
+    except (TypeError, ValueError):
+        eval_score = None
+
+    return {
+        "session_id": sid,
+        "runtime": _wf.runtime_from_session_id(sid),
+        "started_at": (meta or {}).get("started_at"),
+        "updated_at": (meta or {}).get("updated_at"),
+        "cost_usd": cost_usd,
+        "total_tokens": total_tokens,
+        "message_count": int((meta or {}).get("message_count") or 0),
+        "event_count": int((meta or {}).get("event_count") or 0),
+        "step_count": int(signals.get("step_count") or 0),
+        "max_event_token_count": int(signals.get("max_event_token_count") or 0),
+        "max_tool_result_bytes": int(signals.get("max_tool_result_bytes") or 0),
+        "cache_read_tokens": cache_read,
+        "input_tokens": input_tokens,
+        "cache_hit_rate": cache_hit_rate,
+        "error_count": error_count,
+        "flag_count": len(flags),
+        "flags": flags,
+        "severity": _wf.severity_from_counts(error_count, len(flags)),
+        # Additive quality fields. ``eval_score`` (0-5, higher better) gets a
+        # signed delta in _run_compare_deltas; ``outcome`` is textual (verdict
+        # below, no delta arithmetic).
+        "eval_score": eval_score,
+        "eval_reason": q.get("eval_reason"),
+        "outcome": q.get("outcome"),
+        "outcome_confidence": q.get("outcome_confidence"),
+        "missing": meta is None and not events,
+    }
+
+
+def _run_compare_deltas(a, b):
+    """Signed deltas for every numeric metric in both stats panels. Each entry
+    carries ``favorable`` so the UI can colour improvements green and
+    regressions red without re-applying the rule."""
+    out = {}
+    for key in (_RUN_COMPARE_LOWER_BETTER + _RUN_COMPARE_HIGHER_BETTER):
+        va = a.get(key)
+        vb = b.get(key)
+        if va is None or vb is None:
+            continue
+        try:
+            absd = vb - va
+        except TypeError:
+            continue
+        # percent change relative to A; None when A is zero (avoid /0).
+        pct = (absd / va * 100.0) if va not in (0, 0.0) else None
+        if key in _RUN_COMPARE_LOWER_BETTER:
+            favorable = absd < 0  # decreased -> improvement
+        else:
+            favorable = absd > 0
+        out[key] = {
+            "a": va, "b": vb, "abs": absd, "pct": pct,
+            "favorable": favorable, "favorable_lower": key in _RUN_COMPARE_LOWER_BETTER,
+        }
+    return out
+
+
+@bp_sessions.route("/api/run-compare")
+def api_run_compare():
+    """Side-by-side stats + signed deltas for two runs (#2196 item #2).
+
+    Query params:
+
+    - ``a`` (required) — session id of the baseline run
+    - ``b`` (required) — session id of the candidate run
+
+    Stats per side: cost, tokens, step count, context, cache hit, errors,
+    waste flags, severity. Each numeric metric appears in ``deltas`` with
+    ``abs``, ``pct`` (None when A is zero), and ``favorable`` (lower-is-better
+    for cost/steps/errors/flags/etc.; higher-is-better for cache hit). The UI
+    colours improvements green, regressions red, off this flag.
+    """
+    a = (request.args.get("a") or "").strip()
+    b = (request.args.get("b") or "").strip()
+    if not a or not b:
+        return jsonify({"error": "missing 'a' or 'b' query parameter"}), 400
+    if a == b:
+        return jsonify({"error": "'a' and 'b' must be different session ids"}), 400
+
+    # Eval->monitor loop: pull eval scores + outcomes for both runs in one
+    # round-trip so the quality rows render with deltas. Null-safe — a read
+    # failure leaves the map empty and the quality fields come back as null.
+    from routes.local_query import local_store_via_daemon
+    try:
+        quality = local_store_via_daemon(
+            "query_session_quality", session_ids=[a, b],
+        ) or {}
+    except Exception:
+        quality = {}
+
+    stats_a = _run_compare_stats(a, quality)
+    stats_b = _run_compare_stats(b, quality)
+    return jsonify({
+        "a": stats_a,
+        "b": stats_b,
+        "deltas": _run_compare_deltas(stats_a, stats_b),
+        # Textual outcome verdict (improved / regressed / same / null). No
+        # delta arithmetic on the label — it's a simple rank comparison.
+        "outcome_verdict": _run_compare_outcome_verdict(
+            stats_a.get("outcome"), stats_b.get("outcome"),
+        ),
+    })
+
+
+# ── Run-vs-run flow diff (#3001) ─────────────────────────────────────────────
+# Compare the execution graphs of two sessions: find the first step where they
+# diverge, compute the downstream blast radius, and return a plain-English
+# narrative so users can quickly pinpoint what changed between two runs of the
+# same task.
+
+
+def _build_step_sequence(session_id):
+    """Return ordered [{step, name, ts}] for a session's execution graph.
+
+    Queries DuckDB via the daemon proxy (cloud-safe; direct file reads return
+    empty in cloud containers per CLAUDE.md). Returns [] on miss.
+
+    Step types emitted:
+      "tool"  — a tool_use / toolCall block inside an assistant message turn
+      "spawn" — a subagent_spawn event
+
+    Pure text-only assistant turns are skipped; they don't contribute to the
+    structural diff that matters for root-cause analysis.
+    """
+    rows = _ls_call("query_events", session_id=session_id, limit=10000) or []
+    # query_events returns DESC; reverse so we walk oldest-first.
+    rows = list(reversed(rows))
+    steps = []
+    for ev in rows:
+        etype = ev.get("event_type", "")
+        data = ev.get("data") or {}
+        ts = ev.get("ts") or ""
+        if etype in ("tool_call", "tool.call"):
+            # v3: standalone tool-call event row.
+            tool_name = (
+                data.get("tool") or data.get("tool_name")
+                or data.get("name") or ""
+            )
+            if tool_name:
+                steps.append({"step": "tool", "name": tool_name, "ts": ts})
+        elif etype == "model.completed":
+            # v3 assistant turn: tools in toolMetas[] or message.content[].
+            tool_metas = []
+            inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+            for src in (data.get("toolMetas"), inner.get("toolMetas")):
+                if isinstance(src, list):
+                    tool_metas.extend(src)
+            for envelope in (data.get("message"), inner.get("message")):
+                if isinstance(envelope, dict):
+                    blk_content = envelope.get("content")
+                    if isinstance(blk_content, list):
+                        for blk in blk_content:
+                            if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                                tool_metas.append({"name": blk.get("name") or "tool"})
+            seen = set()
+            for meta in tool_metas:
+                if not isinstance(meta, dict):
+                    continue
+                name = meta.get("name") or "tool"
+                tid = meta.get("id") or name
+                if tid not in seen:
+                    seen.add(tid)
+                    steps.append({"step": "tool", "name": name, "ts": ts})
+        elif etype == "message":  # v3-shape-gate: allow (reason: handles legacy+v3 in same fn)
+            # Pre-v3 legacy: toolCall blocks nested inside message.content[].
+            msg = data.get("message") or {}
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") in ("tool_use", "toolCall"):
+                    steps.append({
+                        "step": "tool",
+                        "name": block.get("name") or "",
+                        "ts": ts,
+                    })
+        elif etype == "subagent_spawn":
+            spawn_name = (
+                data.get("agent_type")
+                or data.get("subagent_type")
+                or data.get("type")
+                or "subagent"
+            )
+            steps.append({"step": "spawn", "name": spawn_name, "ts": ts})
+    return steps
+
+
+def _diff_step_sequences(seq_a, seq_b):
+    """Diff two step sequences; return divergence dict or None if identical.
+
+    Uses stdlib difflib.SequenceMatcher on (step, name) tuples so paraphrased
+    inputs that call the same tool still match structurally.
+    """
+    import difflib
+
+    keys_a = [(s["step"], s["name"]) for s in seq_a]
+    keys_b = [(s["step"], s["name"]) for s in seq_b]
+    if keys_a == keys_b:
+        return None
+
+    sm = difflib.SequenceMatcher(None, keys_a, keys_b, autojunk=False)
+    opcodes = sm.get_opcodes()
+
+    first_div = next(
+        ((i1, j1) for tag, i1, _i2, j1, _j2 in opcodes if tag != "equal"),
+        None,
+    )
+    if first_div is None:
+        return None
+
+    fi, fj = first_div
+    step_a = seq_a[fi] if fi < len(seq_a) else None
+    step_b = seq_b[fj] if fj < len(seq_b) else None
+    blast = sum(
+        abs(i2 - i1) + abs(j2 - j1)
+        for tag, i1, i2, j1, j2 in opcodes
+        if tag != "equal"
+    )
+
+    def _label(s):
+        return f"{s['step']}:{s['name']}" if s else "end-of-trace"
+
+    narrative = (
+        f"First diverged at step {fi + 1}: "
+        f"target called {_label(step_a)} but baseline called {_label(step_b)}. "
+        f"{blast} later step(s) differed."
+    )
+    return {
+        "first_divergent_index": fi,
+        "step_target": step_a,
+        "step_baseline": step_b,
+        "blast_radius": blast,
+        "narrative": narrative,
+        "diff_ops": [
+            {"tag": tag, "i1": i1, "i2": i2, "j1": j1, "j2": j2}
+            for tag, i1, i2, j1, j2 in opcodes
+        ],
+    }
+
+
+@bp_sessions.route("/api/sessions/<session_id>/compare")
+def api_session_compare(session_id):
+    """Run-vs-run flow diff for two sessions (issue #3001).
+
+    Compares the execution graph of ``session_id`` (target) against a
+    ``baseline`` run: returns both step sequences and highlights the first
+    divergent step with a blast-radius count and plain-English narrative.
+
+    Query params:
+    - ``baseline`` (required) — session id of the reference run
+
+    Response keys:
+    - ``session_id``, ``baseline_id``
+    - ``target_steps``, ``baseline_steps`` — [{step, name, ts}, ...]
+    - ``divergence`` — {first_divergent_index, step_target, step_baseline,
+      blast_radius, narrative, diff_ops} or null when structurally identical
+    """
+    baseline_id = (request.args.get("baseline") or "").strip()
+    if not baseline_id:
+        return jsonify({"error": "missing 'baseline' query parameter"}), 400
+    for sid in (session_id, baseline_id):
+        if not sid or any(c in sid for c in ("/", "\\", "..")):
+            return jsonify({"error": "invalid session id"}), 400
+    if session_id == baseline_id:
+        return jsonify({"error": "target and baseline must be different"}), 400
+
+    target_steps = _build_step_sequence(session_id)
+    baseline_steps = _build_step_sequence(baseline_id)
+    divergence = _diff_step_sequences(target_steps, baseline_steps)
+
+    return jsonify({
+        "session_id": session_id,
+        "baseline_id": baseline_id,
+        "target_steps": target_steps,
+        "baseline_steps": baseline_steps,
+        "divergence": divergence,
+    })
+
+
+# ── Error triage: mark known/expected errors as resolved (#2196 item #5) ─────
+# Persists the resolved-set in DuckDB (the source-tool kept it in localStorage,
+# which would not survive our E2E-encrypted cloud model). Each entry is keyed
+# by the unique event_id of the error-bearing tool_result row so the relation
+# joins cleanly back to ``events``.
+
+def _err_triage_event_id():
+    """Pull ``event_id`` from JSON body or query string. Returns "" on miss."""
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        eid = body.get("event_id") or body.get("eventId")
+    else:
+        eid = request.args.get("event_id") or request.args.get("eventId")
+    return (eid or "").strip() if isinstance(eid, str) else ""
+
+
+@bp_sessions.route("/api/error-triage/resolve", methods=["POST"])
+def api_error_triage_resolve():
+    """Mark an error as resolved (idempotent — re-POST refreshes the note).
+
+    Body: ``{"event_id": "<id>", "note": "<optional>"}``. Returns
+    ``{"ok": true, "event_id": ...}`` on success.
+    """
+    from routes.local_query import local_store_via_daemon
+
+    eid = _err_triage_event_id()
+    if not eid:
+        return jsonify({"ok": False, "error": "missing event_id"}), 400
+    body = request.get_json(silent=True) or {}
+    note = body.get("note")
+    if note is not None and not isinstance(note, str):
+        return jsonify({"ok": False, "error": "note must be a string"}), 400
+    try:
+        ok = bool(local_store_via_daemon("mark_error_resolved", event_id=eid, note=note))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"daemon unavailable: {exc}"}), 503
+    if not ok:
+        return jsonify({"ok": False, "error": "write failed"}), 500
+    return jsonify({"ok": True, "event_id": eid})
+
+
+@bp_sessions.route("/api/error-triage/resolve", methods=["DELETE"])
+def api_error_triage_unresolve():
+    """Remove the resolved marker for an error.
+
+    Query: ``?event_id=<id>``. ``{"ok": true, "removed": bool}`` on success;
+    ``removed`` is False when the id had no marker (idempotent).
+    """
+    from routes.local_query import local_store_via_daemon
+
+    eid = _err_triage_event_id()
+    if not eid:
+        return jsonify({"ok": False, "error": "missing event_id"}), 400
+    try:
+        removed = bool(local_store_via_daemon("unmark_error_resolved", event_id=eid))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"daemon unavailable: {exc}"}), 503
+    return jsonify({"ok": True, "removed": removed, "event_id": eid})
+
+
+@bp_sessions.route("/api/error-triage/resolved")
+def api_error_triage_resolved():
+    """Return the current resolved-set as ``{event_id: {resolved_at, note}}``.
+
+    Query: ``?limit=<N>`` (default 5000, clamped 1-5000).
+    """
+    from routes.local_query import local_store_via_daemon
+
+    try:
+        limit = max(1, min(int(request.args.get("limit") or 5000), 5000))
+    except (TypeError, ValueError):
+        limit = 5000
+    try:
+        out = local_store_via_daemon("query_resolved_errors", limit=limit) or {}
+    except Exception as exc:
+        return jsonify({"resolved": {}, "error": f"daemon unavailable: {exc}"}), 503
+    if not isinstance(out, dict):
+        out = {}
+    return jsonify({"resolved": out, "count": len(out)})

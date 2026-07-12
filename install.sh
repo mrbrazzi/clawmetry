@@ -12,7 +12,7 @@ DIM='\033[2m'
 NC='\033[0m'
 
 echo ""
-echo -e "  ${BOLD}🦞 ClawMetry${NC}  ${DIM}AI Observability for OpenClaw${NC}"
+echo -e "  ${BOLD}🦞 ClawMetry${NC}  ${DIM}Observability for your AI agents${NC}"
 echo -e "  $(printf '%.0s─' {1..50})"
 echo ""
 
@@ -184,7 +184,9 @@ fi
 
 # ── Install into venv ────────────────────────────────────────────────────────
 
-# Preserve config before wiping venv (contains node_id, encryption_key)
+# Back up config (node_id, encryption_key) as a belt-and-suspenders guard —
+# the in-place upgrade below preserves it, but keep a copy in case a future
+# change reintroduces a venv rebuild.
 _CM_CFG_BAK=""
 if [ -f "$INSTALL_DIR/config.json" ]; then
   _CM_CFG_BAK=$(mktemp)
@@ -193,7 +195,34 @@ elif [ -f "$HOME/.clawmetry/config.json" ] && [ "$INSTALL_DIR" = "$HOME/.clawmet
   _CM_CFG_BAK=$(mktemp)
   cp "$HOME/.clawmetry/config.json" "$_CM_CFG_BAK"
 fi
-$USE_SUDO rm -rf "$INSTALL_DIR"
+
+# Upgrade in place when a venv already exists — do NOT `rm -rf "$INSTALL_DIR"`.
+# That directory also holds the user's DuckDB store (~/.clawmetry/clawmetry.duckdb),
+# config.json, sync.pid and the LIVE sync daemon's working files. A blanket wipe
+# (a) silently destroys local history on every upgrade, and (b) races the running
+# daemon, which keeps recreating DuckDB WAL/tmp files mid-delete so the final
+# rmdir fails with "Directory not empty" and `set -e` aborts the whole install.
+# Reported 2026-05-25 (curl … | bash on a machine with an active daemon: pid 9316).
+_venv_exists=0
+_CM_STASH=""
+if [ -x "$INSTALL_DIR/bin/python3" ] && [ -f "$INSTALL_DIR/pyvenv.cfg" ]; then
+  _venv_exists=1
+elif [ -d "$INSTALL_DIR" ] && [ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]; then
+  # Dir present but no valid venv (stale/partial — e.g. a previous installer
+  # interrupted mid-wipe). We must recreate the venv WITHOUT destroying the
+  # co-located data (config.json, the DuckDB store, sync-state.json, logs) that
+  # shares INSTALL_DIR. `uv venv` refuses a non-empty target, so stash the
+  # non-venv files aside, create the venv into a now-clean dir, and restore them
+  # below. Stale venv subdirs are dropped, not stashed.
+  _CM_STASH=$(mktemp -d)
+  ( shopt -s dotglob nullglob
+    for _e in "$INSTALL_DIR"/*; do
+      case "$(basename "$_e")" in
+        bin|lib|lib64|include|share|pyvenv.cfg) $USE_SUDO rm -rf "$_e" 2>/dev/null || true ;;
+        *) $USE_SUDO mv "$_e" "$_CM_STASH/" 2>/dev/null || true ;;
+      esac
+    done )
+fi
 
 # Try `uv` (Astral's Rust-based pip replacement) for ~5x faster installs.
 # Bootstrap a copy if missing; on any failure, silently fall back to pip so
@@ -214,8 +243,10 @@ if command -v uv >/dev/null 2>&1; then
   # Estimates from observed timings on PyPI cold-cache + Apple Silicon /
   # mid-range Linux. uv handles the heavy lifting; --quiet suppresses uv's
   # native progress bar so OUR spinner is the only thing on screen.
-  _step "Creating virtual environment (uv)" 2 \
-    $USE_SUDO "$_UV_BIN" venv "$INSTALL_DIR" --quiet
+  if [ "$_venv_exists" = "0" ]; then
+    _step "Creating virtual environment (uv)" 2 \
+      $USE_SUDO "$_UV_BIN" venv "$INSTALL_DIR" --quiet
+  fi
   # --refresh forces uv to re-fetch the PyPI index even if a cached copy
   # exists. Without this, running install.sh seconds after a [RELEASE]
   # auto-publish silently no-ops ("already at latest" against a stale
@@ -227,12 +258,22 @@ if command -v uv >/dev/null 2>&1; then
 else
   # pip path is much slower (~30s for the install alone) — make sure the
   # spinner conveys that so users don't think the script is wedged.
-  _step "Bootstrapping pip fallback venv" 5 \
-    $USE_SUDO python3 -m venv "$INSTALL_DIR"
+  if [ "$_venv_exists" = "0" ]; then
+    _step "Bootstrapping pip fallback venv" 5 \
+      $USE_SUDO python3 -m venv "$INSTALL_DIR"
+  fi
   _step "Upgrading pip" 5 \
     $USE_SUDO "$INSTALL_DIR/bin/pip" install --upgrade pip
   _step "Installing clawmetry from PyPI (pip)" 30 \
     $USE_SUDO "$INSTALL_DIR/bin/pip" install --no-cache-dir --upgrade clawmetry
+fi
+
+# Restore data files stashed aside for the venv rebuild (DuckDB store, config,
+# sync-state, logs) back into the freshly-created venv dir. (See stash above.)
+if [ -n "$_CM_STASH" ] && [ -d "$_CM_STASH" ]; then
+  ( shopt -s dotglob nullglob
+    for _e in "$_CM_STASH"/*; do $USE_SUDO mv "$_e" "$INSTALL_DIR/" 2>/dev/null || true; done )
+  rmdir "$_CM_STASH" 2>/dev/null || $USE_SUDO rm -rf "$_CM_STASH" 2>/dev/null || true
 fi
 
 # Restore config if it was backed up
@@ -358,7 +399,16 @@ if [ "$OS" = "Linux" ]; then
   # install.sh doesn't stall on daemon startup — matches the macOS launchd
   # fire-and-forget pattern. (#1215)
   if [ "$_IS_WSL" = "0" ] && command -v systemctl >/dev/null 2>&1; then
-    if systemctl --user list-unit-files 2>/dev/null | grep -q '^clawmetry-sync\.service'; then
+    # root over SSH usually has no `systemctl --user` D-Bus session, so
+    # clawmetry/cli.py::_register_systemd installs a SYSTEM service for root.
+    # Restart that one for root; the --user unit for everyone else.
+    if [ "$(id -u)" = "0" ] && systemctl list-unit-files 2>/dev/null | grep -q '^clawmetry-sync\.service'; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      if systemctl restart --no-block clawmetry-sync.service >/dev/null 2>&1; then
+        echo -e "  ${DIM}↺ clawmetry-sync (system) restarting in background${NC}"
+        _RESTARTED=1
+      fi
+    elif systemctl --user list-unit-files 2>/dev/null | grep -q '^clawmetry-sync\.service'; then
       systemctl --user daemon-reload >/dev/null 2>&1 || true
       if systemctl --user restart --no-block clawmetry-sync.service >/dev/null 2>&1; then
         echo -e "  ${DIM}↺ clawmetry-sync restarting in background${NC}"
@@ -722,6 +772,17 @@ fi
 
 # ── Onboarding ───────────────────────────────────────────────────────────────
 # Runs: clawmetry onboard (skipped when NemoClaw is detected — onboard happens inside sandbox)
+
+# Local-only opt-out: CLAWMETRY_LOCAL_ONLY=1 means "never create a cloud
+# account, nothing leaves this machine." Write the persistent marker now so it
+# holds even when onboard is skipped; onboard itself also defaults to local.
+case "${CLAWMETRY_LOCAL_ONLY:-}" in
+  1|true|yes|on|TRUE|YES|ON)
+    mkdir -p "$HOME/.clawmetry" 2>/dev/null || true
+    touch "$HOME/.clawmetry/nocloud" 2>/dev/null || true
+    echo -e "  ${DIM}Local-only mode (CLAWMETRY_LOCAL_ONLY set): no cloud account will be created.${NC}"
+    ;;
+esac
 
 if [ "${CLAWMETRY_SKIP_ONBOARD:-}" = "1" ] || [ "$NEMOCLAW_DETECTED" = "1" ]; then
   [ "$NEMOCLAW_DETECTED" = "1" ] || echo -e "  ${DIM}Skipping onboard (CLAWMETRY_SKIP_ONBOARD=1)${NC}"

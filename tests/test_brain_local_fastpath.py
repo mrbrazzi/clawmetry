@@ -26,6 +26,12 @@ def app(tmp_path, monkeypatch):
     import routes.brain as br
     importlib.reload(br)
 
+    # Pre-#1448 fixtures seed historical timestamps that fall outside the
+    # OSS 24h retention cap. Default to a Pro user so existing assertions
+    # still pass; the cap tests monkeypatch ``_is_pro_user`` explicitly.
+    import dashboard as _d
+    monkeypatch.setattr(_d, "_is_pro_user", lambda: True)
+
     a = Flask(__name__)
     a.register_blueprint(br.bp_brain)
     yield a, ls
@@ -122,3 +128,92 @@ def test_brain_fast_path_disabled_without_env_flag(tmp_path, monkeypatch):
         store.stop(flush=True)
     except Exception:
         pass
+
+
+# ── No local retention cap (founder call, 2026-06-23) ───────────────────────
+#
+# Local dashboards show ALL Brain history for free: the data is in the user's
+# own DuckDB and OpenClaw / NeMo observability is free on every plan, so
+# /api/brain-history never caps to 24h and never sets capped_at_24h. (The
+# former issue #1448 cap only ever gated a user's own local data, since the
+# cloud serves Brain from the snapshot via a cm-cloud interceptor, not this
+# route.) The response always carries ``capped_at_24h`` (now always False).
+
+
+def _seed_old_and_recent_events(store):
+    """One ancient event (8 days old) + one fresh event (now)."""
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    old_ts = (now - _dt.timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    new_ts = (now - _dt.timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    store.ingest({
+        "id": "ev-old", "node_id": "n1", "agent_id": "main",
+        "session_id": "sess-old", "event_type": "tool_call",
+        "ts": old_ts, "data": {"tool": "Bash", "input": "echo ancient"},
+        "cost_usd": 0.01, "token_count": 10, "model": "claude-opus-4-7",
+    })
+    store.ingest({
+        "id": "ev-new", "node_id": "n1", "agent_id": "main",
+        "session_id": "sess-new", "event_type": "tool_call",
+        "ts": new_ts, "data": {"tool": "Bash", "input": "echo fresh"},
+        "cost_usd": 0.01, "token_count": 10, "model": "claude-opus-4-7",
+    })
+    _wait_flush(store)
+
+
+def test_api_brain_history_no_cap_for_free(app, monkeypatch):
+    a, ls = app
+    _seed_old_and_recent_events(ls.get_store())
+    import dashboard as _d
+    monkeypatch.setattr(_d, "_is_pro_user", lambda: False)
+
+    r = a.test_client().get("/api/brain-history?limit=10")
+    assert r.status_code == 200, r.get_data(as_text=True)[:300]
+    body = r.get_json()
+    # Local/free is NOT capped: the 8-day-old event must be visible, no upsell.
+    assert body.get("capped_at_24h") is False
+    sids = {ev["sessionId"] for ev in body["events"]}
+    assert sids == {"sess-old", "sess-new"}
+
+
+def test_api_brain_history_no_cap_for_pro(app, monkeypatch):
+    a, ls = app
+    _seed_old_and_recent_events(ls.get_store())
+    import dashboard as _d
+    monkeypatch.setattr(_d, "_is_pro_user", lambda: True)
+
+    r = a.test_client().get("/api/brain-history?limit=10")
+    body = r.get_json()
+    assert body.get("capped_at_24h") is False
+    sids = {ev["sessionId"] for ev in body["events"]}
+    # Pro users see the full history including the 8-day-old event.
+    assert sids == {"sess-old", "sess-new"}
+
+
+def test_api_brain_history_hides_daemon_diagnostics(app, monkeypatch):
+    """ClawMetry's own daemon-error tee (agent_id=clawmetry-daemon /
+    event_type=daemon.*) must not appear in the Brain conversation feed, or a
+    noisy daemon (or a crash loop) buries the user's real agent activity."""
+    a, ls = app
+    store = ls.get_store()
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    store.ingest({
+        "id": "ev-daemon", "node_id": "n1", "agent_id": "clawmetry-daemon",
+        "session_id": "", "event_type": "daemon.error", "ts": now,
+        "data": {"message": "Traceback ..."}, "cost_usd": 0.0, "token_count": 0,
+    })
+    store.ingest({
+        "id": "ev-agent", "node_id": "n1", "agent_id": "main",
+        "session_id": "sess-real", "event_type": "tool_call", "ts": now,
+        "data": {"tool": "Bash", "input": "echo hi"}, "cost_usd": 0.0, "token_count": 0,
+    })
+    _wait_flush(store)
+    import dashboard as _d
+    monkeypatch.setattr(_d, "_is_pro_user", lambda: False)
+
+    body = a.test_client().get("/api/brain-history?limit=20").get_json()
+    sids = {ev["sessionId"] for ev in body["events"]}
+    assert "sess-real" in sids, "real agent activity must show"
+    assert all(ev.get("agentId") != "clawmetry-daemon" for ev in body["events"])
+    assert all(not (ev.get("type") or "").upper().startswith("DAEMON.") for ev in body["events"])

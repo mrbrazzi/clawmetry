@@ -18,11 +18,37 @@ import glob
 import json
 import os
 import time
+from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, Response, jsonify, request
-from clawmetry.config import is_local_store_read_enabled
+from clawmetry.config import is_local_store_read_enabled, hide_clawmetry_session
+from clawmetry.risk import compute_hallucination_risk, is_llm_event
+from clawmetry.token_confidence import annotate_events as _annotate_token_confidence
+from clawmetry.token_confidence import annotate_tool_alternatives as _annotate_tool_alternatives
 
 bp_brain = Blueprint('brain', __name__)
+
+
+def _annotate_risk(events):
+    """Stamp each LLM-call event in ``events`` with a ``risk`` field.
+
+    Issue #567 (Hallucination Risk Indicator). Mutates ``events`` in
+    place and returns it for chaining. Non-LLM events (USER/EXEC/READ/…)
+    are left untouched so the dashboard renderer can cheaply branch on
+    ``ev.risk`` presence to decide whether to paint the small risk pill.
+    """
+    if not events:
+        return events
+    for ev in events:
+        try:
+            if is_llm_event(ev):
+                ev["risk"] = compute_hallucination_risk(ev)
+        except Exception:
+            # Never crash on bad input — the dashboard renders thousands
+            # of these per page-load and any one mis-shaped event must
+            # not poison the whole feed (per CLAUDE.md "graceful fallbacks").
+            pass
+    return events
 
 
 _BRAIN_HISTORY_CACHE = {}
@@ -78,6 +104,72 @@ def _brain_history_bool_arg(value):
     return str(value or "").strip().lower() in {"1", "true", "yes", "on", "all"}
 
 
+def _brain_history_time_arg(value):
+    """Parse a ``since``/``until`` query arg into a normalized UTC ISO string
+    (``YYYY-MM-DDTHH:MM:SSZ``) suitable for lexicographic comparison against
+    the store's ``ts`` column. Accepts ISO-8601 (with or without seconds,
+    ``Z`` or a numeric offset) and epoch seconds/milliseconds. Returns None
+    for anything unparseable — a bad time filter degrades to "no filter",
+    never a 500 (the never-crash-on-bad-input rule).
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    from datetime import datetime, timezone
+    # Epoch seconds / milliseconds (all-digits, optional fraction).
+    try:
+        num = float(raw)
+        if num > 1e12:  # epoch-ms
+            num /= 1000.0
+        if num > 1e8:   # sanity: after ~1973, so bare years don't match
+            return datetime.fromtimestamp(num, tz=timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+    except (TypeError, ValueError, OverflowError, OSError):
+        pass
+    iso = raw.replace(" ", "T")
+    if iso.endswith(("Z", "z")):
+        iso = iso[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        # Naive input (e.g. a raw <input type=datetime-local> value that
+        # skipped client-side UTC conversion): treat as UTC rather than
+        # guessing the server's zone.
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+import re as _re
+
+_TASK_NOTIF_SUMMARY_RE = _re.compile(r"<summary>([\s\S]*?)</summary>", _re.IGNORECASE)
+_TASK_NOTIF_STATUS_RE = _re.compile(r"<status>([\s\S]*?)</status>", _re.IGNORECASE)
+
+
+def _summarise_task_notification(text: str) -> str:
+    """Collapse an OpenClaw ``<task-notification>`` envelope to a compact
+    ``[status] summary`` line.
+
+    These envelopes are large raw XML/JSON blobs whose ``<summary>`` (the
+    only useful part) sits well past the 200-char truncation the brain feed
+    applies, so the UI used to surface only the noisy head. Returns "" when
+    ``text`` isn't a task-notification, so callers fall back to the raw text.
+    """
+    if not isinstance(text, str) or "<task-notification" not in text:
+        return ""
+    sm = _TASK_NOTIF_SUMMARY_RE.search(text)
+    summary = (sm.group(1).strip() if sm else "")
+    st = _TASK_NOTIF_STATUS_RE.search(text)
+    status = (st.group(1).strip() if st else "")
+    if not summary:
+        return ""
+    if len(summary) > 180:
+        summary = summary[:180] + "…"
+    return ("[" + status + "] " + summary) if status else summary
+
+
 def _v3_message_content_to_text(content) -> str:
     """Flatten an OpenClaw v3 ``data.message.content`` payload into plain text.
 
@@ -109,6 +201,20 @@ def _v3_message_content_to_text(content) -> str:
 
 
 def _extract_brain_detail(row: dict) -> str:
+    """Pull a human-readable ``detail`` snippet from a DuckDB event row, then
+    collapse any OpenClaw ``<task-notification>`` envelope to its summary so the
+    Brain feed never dumps the raw XML/JSON blob (which the 200-char truncation
+    would otherwise show only the noisy head of). Thin wrapper over
+    ``_extract_brain_detail_raw`` so every return path is covered."""
+    raw = _extract_brain_detail_raw(row)
+    if isinstance(raw, str) and "<task-notification" in raw:
+        tn = _summarise_task_notification(raw)
+        if tn:
+            return tn
+    return raw
+
+
+def _extract_brain_detail_raw(row: dict) -> str:
     """Pull a human-readable ``detail`` snippet from a DuckDB event row.
 
     Two ingest paths populate ``data`` with different shapes (P0 #1143 fix
@@ -137,6 +243,8 @@ def _extract_brain_detail(row: dict) -> str:
     if has_message_envelope:
         text = _v3_message_content_to_text(msg.get("content"))
         if text:
+            # (`<task-notification>` envelopes are summarised by the
+            # _extract_brain_detail wrapper, covering every return path.)
             return text
         # Encrypted-thinking-only assistant turns ship as
         # ``[{type:"thinking", thinking:"", signature:"…"}]``. The text is
@@ -193,7 +301,80 @@ def _extract_brain_detail(row: dict) -> str:
     return ""
 
 
-def _try_local_store_brain(limit: int, include_artifacts: bool):
+def _collapse_duplicate_brain_events(events):
+    """Collapse the multiple brain rows OpenClaw emits for ONE assistant turn.
+
+    A single assistant turn lands as an ``assistant``/``message`` row PLUS one
+    or two ``model.completed`` siblings a second or two apart, all carrying the
+    same text (one is a tokens=0 ``model: delivery-mirror`` echo). They have
+    different timestamps and ids, so the exact-tuple dedupe misses them and the
+    Brain feed shows the same paragraph two or three times (founder report,
+    2026-06-29).
+
+    Within one source (session) and one identical, substantial ``detail``, keep
+    the single richest row (a real assistant/message/agent row over a slim
+    model.completed; more tokens over fewer) and drop the rest. A time window
+    keeps a genuine re-utterance of the same text in a later turn intact.
+    """
+    import datetime as _dt
+
+    WINDOW_S = 120.0
+    MIN_DETAIL = 40
+    _PRIO = {"MESSAGE": 3, "ASSISTANT": 3, "AGENT": 3, "USER": 3, "RESULT": 3,
+             "THINK": 2, "MODEL.COMPLETED": 1, "MODEL": 1}
+
+    def _src(ev):
+        return ev.get("src") or ev.get("source") or ev.get("sessionId") or ""
+
+    def _parse(ev):
+        ts = ev.get("time") or ""
+        try:
+            return _dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    def _richness(ev):
+        return (_PRIO.get((ev.get("type") or "").upper(), 2), ev.get("tokens") or 0)
+
+    groups = {}
+    for ev in events:
+        detail = (ev.get("detail") or "").strip()
+        if len(detail) < MIN_DETAIL:
+            continue
+        groups.setdefault((_src(ev), detail), []).append(ev)
+
+    drop = set()
+    for evs in groups.values():
+        if len(evs) < 2:
+            continue
+        # Cluster copies that fall within WINDOW_S of each other; collapse each
+        # cluster to its richest row. Rows with no parseable time still cluster
+        # together (same content, same session) so a missing timestamp can't
+        # smuggle a duplicate through.
+        ordered = sorted(evs, key=lambda e: (_parse(e) or _dt.datetime.min))
+        cluster = [ordered[0]]
+        clusters = [cluster]
+        for prev, cur in zip(ordered, ordered[1:]):
+            tp, tc = _parse(prev), _parse(cur)
+            if tp is None or tc is None or abs((tc - tp).total_seconds()) <= WINDOW_S:
+                cluster.append(cur)
+            else:
+                cluster = [cur]
+                clusters.append(cluster)
+        for cl in clusters:
+            if len(cl) < 2:
+                continue
+            best = max(cl, key=_richness)
+            for e in cl:
+                if e is not best:
+                    drop.add(id(e))
+
+    if not drop:
+        return events
+    return [ev for ev in events if id(ev) not in drop]
+
+
+def _try_local_store_brain(limit, include_artifacts, since=None, until=None):
     """Epic #964 phase 1b fast path. Returns a brain-history-shaped dict
     when CLAWMETRY_LOCAL_STORE_READ=1 AND the local DuckDB store has
     enough events to be useful. Returns ``None`` to defer to the JSONL
@@ -204,8 +385,21 @@ def _try_local_store_brain(limit: int, include_artifacts: bool):
     enriched here. The full read-path migration is a follow-up; this
     is a measurable proof that the local store is the right answer for
     the simple list-of-events case.
+
+    ``since``/``until`` are forwarded to ``query_events`` so both the OSS
+    retention cap (issue #1448, currently off) and the user-facing
+    date-time range filter ("what happened at 3AM") are enforced at the
+    SQL layer, riding the ``idx_events_ts`` index.
     """
     rows = None
+    # exclude_daemon: drop ClawMetry's own daemon diagnostics at the SQL level
+    # so a noisy/erroring daemon can't bury the user's real agent events inside
+    # the fetch limit window (the post-loop filter below is belt-and-braces).
+    qkwargs = {"limit": limit, "exclude_daemon": True}
+    if since:
+        qkwargs["since"] = since
+    if until:
+        qkwargs["until"] = until
     # Issue #1088: cross-process fast-path. The standard install runs daemon
     # + dashboard as separate processes and DuckDB's exclusive writer lock
     # blocks the dashboard from opening the file even read-only. Ask the
@@ -213,25 +407,58 @@ def _try_local_store_brain(limit: int, include_artifacts: bool):
     # boots (tests, dev mode).
     try:
         from routes.local_query import local_store_via_daemon
-        rows = local_store_via_daemon("query_events", limit=limit)
+        rows = local_store_via_daemon("query_events", **qkwargs)
     except Exception:
         rows = None
     if rows is None:
         try:
             from clawmetry import local_store
-            store = local_store.get_store()
-            rows = store.query_events(limit=limit)
+            # Issue #1240: read_only=True so the single-process fallback
+            # doesn't pay DuckDB's writer-lock-retry tax under the standard
+            # install (daemon proxy above is the happy path; this fallback
+            # only fires in tests / dev mode).
+            store = local_store.get_store(read_only=True)
+            rows = store.query_events(**qkwargs)
         except Exception:
             return None
     if not rows:
         # Empty store → fall through to JSONL parser so a fresh install
         # without a populated local DB still gets a useful brain feed.
+        # Exception: when a time bound is active (a user's date-time range
+        # query, or the legacy #1448 retention cap) we MUST NOT fall
+        # through — the JSONL parser can't range-filter at source, so it
+        # would answer a "3AM last night" question with unbounded history.
+        # An honest empty window beats a wrong full feed.
+        if since or until:
+            return {
+                "events":        [],
+                "count":         0,
+                "_source":       "local_store",
+                "_shape":        "brain_history",
+                "capped_at_24h": False,
+                "window":        {"since": since, "until": until},
+            }
         return None
     # Translate the local-store row shape (id/node_id/agent_id/session_id/
     # event_type/ts/data/cost_usd/...) into the brain-history event shape
     # the dashboard JS expects (time/type/detail/src/sessionId/...).
     out = []
     for r in rows:
+        # Hide ClawMetry's own helper sessions (clawmetry-fix / -selfevolve /
+        # -mem-probe …) so our plumbing doesn't show up in the Brain feed.
+        if hide_clawmetry_session(r.get("session_id")):
+            continue
+        # Hide ClawMetry's OWN daemon diagnostics (the daemon-error -> DuckDB
+        # tee, PRD #1133) from the Brain conversation feed. These carry
+        # agent_id="clawmetry-daemon" / event_type="daemon.*" and an empty
+        # session_id, so the helper-session filter above misses them; left in,
+        # a noisy daemon (or a crash loop) buries the user's actual agent
+        # conversation under our own error spam. They still feed the health /
+        # diagnostics views.
+        _agent = (r.get("agent_id") or "")
+        _etype = (r.get("event_type") or "").lower()
+        if _agent == "clawmetry-daemon" or _etype.startswith("daemon."):
+            continue
         # P0 regression fix (#1143): the v3 sync mapper nests content under
         # ``data.data`` and the legacy trajectory parser nests it under
         # ``data.message.content`` — neither exposes the flat ``input/summary/
@@ -250,6 +477,11 @@ def _try_local_store_brain(limit: int, include_artifacts: bool):
             "tokens":     r.get("token_count") or 0,
             "cost":       float(r.get("cost_usd") or 0.0),
             "model":      r.get("model") or "",
+            # Issue #568 (LLM-call timeline view): expose the event row id
+            # so the Brain-tab UI can request a per-call lifecycle timeline
+            # via /api/llm-call-timeline/<event_id>. Cheap to add — the JSON
+            # carries one extra short string per row.
+            "eventId":    r.get("id") or "",
         }
         # ── Channel-event enrichment (PR aca53ec8 / Telegram ingest) ─────
         # Channel turns land here as event_type=channel.in|channel.out with
@@ -288,13 +520,37 @@ def _try_local_store_brain(limit: int, include_artifacts: bool):
                     chat_id = data["chat"].get("id") or ""
                 if chat_id:
                     row["chat_id"] = str(chat_id)[:80]
+                # Issue #1203: expose body_capture so the browser's
+                # _extractChannelInfo can set ackOnly=true on the local-store
+                # path (where ev.data is stripped and raw_blob isn't available).
+                body_capture = data.get("body_capture")
+                if body_capture:
+                    row["body_capture"] = str(body_capture)
+        # Issue #567 — Hallucination Risk Indicator. Compute the score
+        # from the RAW DuckDB row (which still carries ``data.params`` /
+        # ``data.usage``), then stamp it onto the trimmed output row.
+        # is_llm_event() filters non-assistant rows so we don't pay the
+        # extraction cost on every tool result / channel turn.
+        try:
+            if is_llm_event(r):
+                row["risk"] = compute_hallucination_risk(r)
+        except Exception:
+            pass
         out.append(row)
-    return {
-        "events":  out,
-        "count":   len(out),
-        "_source": "local_store",
-        "_shape":  "brain_history",
+    out = _collapse_duplicate_brain_events(out)
+    payload = {
+        "events":        out,
+        "count":         len(out),
+        "_source":       "local_store",
+        "_shape":        "brain_history",
+        # The #1448 retention cap is off (founder call 2026-06-23); since/
+        # until now carry the user's investigation window, which must never
+        # trip the upgrade CTA the cap flag drives in the UI.
+        "capped_at_24h": False,
     }
+    if since or until:
+        payload["window"] = {"since": since, "until": until}
+    return payload
 
 
 def _brain_history_is_artifact(path):
@@ -340,15 +596,39 @@ def api_brain_history():
     include_artifacts = _brain_history_bool_arg(
         request.args.get("include_artifacts") or request.args.get("artifacts")
     )
+    # Local dashboards show ALL Brain history for free (founder call,
+    # 2026-06-23). The data lives in the user's own DuckDB and OpenClaw / NeMo
+    # observability is free on every plan, so we never cap it or upsell here.
+    # This OSS route only serves real data on the LOCAL dashboard; on the cloud
+    # server it returns empty (no DuckDB) and a cm-cloud interceptor renders
+    # Brain from the encrypted snapshot, where retention is enforced separately.
+    # (Was issue #1448's 24h cap, which only ever gated a user's own local data.)
+    cap_since = None
+    # Date-time range filter ("what happened at 3AM"): optional since/until
+    # (aliases start/end) bound the window. Bad values parse to None and
+    # degrade to "no bound" rather than erroring.
+    rng_since = _brain_history_time_arg(
+        request.args.get("since") or request.args.get("start")
+    )
+    rng_until = _brain_history_time_arg(
+        request.args.get("until") or request.args.get("end")
+    )
+    if rng_since and rng_until and rng_since > rng_until:
+        rng_since, rng_until = rng_until, rng_since
     # Epic #964 phase 1b: opt-in local-store fast path. Skip the JSONL
     # parser entirely when CLAWMETRY_LOCAL_STORE_READ=1 AND the store
     # has data. Falls through to the full parser otherwise (so a fresh
     # install with an empty store still gets the rich brain feed).
     if is_local_store_read_enabled():
-        fast = _try_local_store_brain(limit, include_artifacts)
+        fast = _try_local_store_brain(
+            limit, include_artifacts, since=rng_since or cap_since, until=rng_until
+        )
         if fast is not None:
             return jsonify(fast)
-    cache_key = (limit, include_artifacts)
+    cache_key = (
+        limit, include_artifacts, bool(cap_since),
+        rng_since or "", rng_until or "",
+    )
     cached = _BRAIN_HISTORY_CACHE.get(cache_key)
     now_cache = time.time()
     if cached and now_cache - cached[0] < _BRAIN_HISTORY_CACHE_TTL_SECONDS:
@@ -874,6 +1154,9 @@ def api_brain_history():
         seen_keys.add(key)
         deduped.append(ev)
     events = deduped
+    # Collapse the assistant + model.completed (+ delivery-mirror) siblings that
+    # the exact-tuple dedupe above misses because their timestamps differ.
+    events = _collapse_duplicate_brain_events(events)
 
     events.sort(
         key=lambda ev: ev.get("time", "") or "", reverse=True
@@ -922,6 +1205,34 @@ def api_brain_history():
         if m:
             ev["skill"] = m.group(1)
 
+    # Hide ClawMetry's own helper sessions (clawmetry-fix / -selfevolve /
+    # -mem-probe …) from the Brain feed — plumbing, not the user's activity.
+    # (The local-store fast path above already excludes them at the source.)
+    events = [
+        ev for ev in events
+        if not hide_clawmetry_session(
+            ev.get("sessionId") or ev.get("source") or ev.get("src")
+        )
+    ]
+
+    # OSS 24h cap (issue #1448): drop any JSONL-sourced event older than
+    # the cap before we count + ship. CONTEXT pseudo-events have no
+    # meaningful ts so we keep them regardless (they describe the active
+    # window, not historical activity).
+    if cap_since:
+        events = [
+            ev for ev in events
+            if ev.get("type") == "CONTEXT" or (ev.get("time") or "") >= cap_since
+        ]
+
+    # Date-time range filter (JSONL slow path): the fast path bounds at the
+    # SQL layer; here we post-filter on the same lexicographic ISO compare.
+    # CONTEXT pseudo-events are NOT exempt — a window means a window.
+    if rng_since:
+        events = [ev for ev in events if (ev.get("time") or "") >= rng_since]
+    if rng_until:
+        events = [ev for ev in events if (ev.get("time") or "") <= rng_until]
+
     # Build channel summary for filter chips
     channel_counts = {}
     for ev in events:
@@ -929,16 +1240,409 @@ def api_brain_history():
         if ch:
             channel_counts[ch] = channel_counts.get(ch, 0) + 1
 
+    # Issue #567 — Hallucination Risk Indicator. Stamp every LLM-call
+    # event with a {risk_level, risk_explanation} dict so the Brain
+    # renderer can paint the small pill next to AGENT / THINK chips.
+    # JSONL-sourced events don't carry temperature / usage today so they
+    # fall through to "no risk signals available" — the contract is
+    # stable either way, and the local-store fast path above already
+    # picked up the rich rows.
+    _annotate_risk(events)
+
+    # Issue #563 — Token Probability Visualizer. Per-token confidence
+    # heatmap on assistant responses. Only stamps when upstream captured
+    # logprobs (OpenAI / Gemini compatible providers today). Anthropic
+    # calls fall through to a "not available" hint in the frontend.
+    try:
+        _annotate_token_confidence(events)
+    except Exception:
+        # Never crash the Brain feed on annotation failure — the rest of
+        # the payload is still useful even if confidence stamping fails.
+        pass
+
+    # Issue #1616 — Alternatives-considered. For every tool.call event we
+    # stamp ``ev["tool_alternatives"]`` with the chosen tool + rejected
+    # options the model evaluated (from logprobs or extended-thinking).
+    # Honest empty list when no real data is available — never invent
+    # alternatives.
+    try:
+        _annotate_tool_alternatives(events)
+    except Exception:
+        pass
+
     try:
         _d._ext_emit("brain.event", {"count": len(events)})
     except Exception:
         pass
-    payload = {"events": events, "total": len(events), "sources": sources_seen, "channels": channel_counts}
+    payload = {
+        "events":        events,
+        "total":         len(events),
+        "sources":       sources_seen,
+        "channels":      channel_counts,
+        "capped_at_24h": bool(cap_since),
+    }
+    if rng_since or rng_until:
+        payload["window"] = {"since": rng_since, "until": rng_until}
     _BRAIN_HISTORY_CACHE[cache_key] = (time.time(), payload)
     if len(_BRAIN_HISTORY_CACHE) > 8:
         oldest_key = min(_BRAIN_HISTORY_CACHE, key=lambda k: _BRAIN_HISTORY_CACHE[k][0])
         _BRAIN_HISTORY_CACHE.pop(oldest_key, None)
     return jsonify(payload)
+
+
+# ── Per-LLM-call lifecycle timeline (issue #568) ─────────────────────────
+#
+# Goal: turn the flat Brain stream into a per-call breakdown so the user
+# can see how much wall-clock each call's reasoning vs generation cost.
+# Reading from the DuckDB events table (DuckDB-first rule), we walk the
+# chain of v3 events the sync.py mapper persists:
+#
+#   prompt.submitted -> trace.artifacts(reasoning) -> model.completed
+#
+# Phase layout (5 markers for reasoning models, 3 when the model emitted
+# no reasoning artifacts — Sonnet without extended-thinking, Haiku, GPT-4
+# without ``o1`` etc.):
+#
+#   prompt_received      | ts of prompt.submitted
+#   reasoning_started    | first trace.artifacts.kind="reasoning"   (if any)
+#   reasoning_completed  | last  trace.artifacts.kind="reasoning"   (if any)
+#   first_output_token   | derived: completion ts - generation_ms
+#   completion           | ts of model.completed
+#
+# For non-reasoning models we still synthesise first_output_token from
+# completion - generation_ms so the bar is at least 3-phase (prompt /
+# first-token / completion). When no usage breakdown is available we
+# collapse to the 2 hard markers (prompt + completion).
+#
+# Cap on chain length: 200 events. Real chains are <50 — this is a guard
+# against pathological agent runs that wedge the read.
+
+_LLM_TIMELINE_REASONING_TYPES = frozenset({
+    "trace.artifacts",          # OpenClaw v3 mapper: reasoning text under data.artifacts
+    "thinking",                 # legacy trajectory parser: assistant thinking blocks
+    "reasoning",                # OpenAI o-series style
+})
+
+
+def _parse_iso_ts(ts):
+    """Best-effort ISO-8601 → epoch-ms parser. Returns None on failure.
+
+    DuckDB rows ship ts as either a plain string ("2026-05-11T12:00:00Z")
+    or a ``datetime`` object — handle both rather than crash on the rare
+    typed return path.
+    """
+    if not ts:
+        return None
+    if isinstance(ts, datetime):
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return int(ts.timestamp() * 1000)
+    if not isinstance(ts, str):
+        return None
+    s = ts.strip()
+    if not s:
+        return None
+    # Accept trailing "Z" (RFC 3339) by swapping in +00:00 for fromisoformat.
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def _fetch_session_chain(session_id, limit=200):
+    """Pull every event for ``session_id`` from the local DuckDB store.
+
+    Returns a list of raw event rows (oldest first), or ``None`` when the
+    store is unreachable. Uses the daemon proxy first so we never collide
+    with the daemon's writer lock (issue #1088); falls back to direct open
+    for single-process boots (tests + dev mode — same pattern as
+    ``_try_local_store_brain`` above).
+
+    Issue #1597 class drain — intentionally NOT using
+    ``query_events_with_subagents``: this helper feeds
+    ``_build_llm_call_timeline`` which walks back from an anchor event for
+    the nearest preceding ``prompt.submitted`` row of the SAME LLM call.
+    A single LLM call's lifecycle (prompt → reasoning → completion) lives
+    in one session — sub-agents are separate sessions with their own LLM
+    calls. Rolling parent + child here would mix two unrelated call chains
+    and the "preceding prompt.submitted" walk would jump across sessions.
+    The Brain feed already passes the row's OWN session_id when the user
+    clicks a child chip (see ``app.js::loadLlmCallTimeline``), so child
+    timelines work end-to-end without rollup.
+    """
+    if not session_id:
+        return None
+    rows = None
+    try:
+        from routes.local_query import local_store_via_daemon
+        rows = local_store_via_daemon(
+            "query_events", session_id=session_id, limit=limit
+        )
+    except Exception:
+        rows = None
+    if rows is None:
+        try:
+            from clawmetry import local_store
+            store = local_store.get_store(read_only=True)
+            rows = store.query_events(session_id=session_id, limit=limit)
+        except Exception:
+            return None
+    if not rows:
+        return []
+    # query_events returns most-recent-first; the timeline walker is
+    # easier to read oldest-first, so flip once here.
+    rows = list(rows)
+    rows.sort(key=lambda r: r.get("ts") or "")
+    return rows
+
+
+def _find_event_by_id(rows, event_id):
+    if not rows or not event_id:
+        return None
+    for r in rows:
+        if r.get("id") == event_id:
+            return r
+    return None
+
+
+def _is_reasoning_event(row):
+    """Return True when ``row`` represents a reasoning / thinking artifact.
+
+    Two shapes covered:
+      * v3 mapper: event_type == "trace.artifacts" with data.kind="reasoning"
+        OR data.artifacts containing a "thinking" block.
+      * Legacy trajectory: event_type starts with "thinking" / "reasoning"
+        OR the data carries a thinking block at top level.
+    """
+    et = (row.get("event_type") or "").lower()
+    if et in _LLM_TIMELINE_REASONING_TYPES:
+        return True
+    if et.startswith("thinking") or et.startswith("reasoning"):
+        return True
+    data = row.get("data") if isinstance(row, dict) else None
+    if isinstance(data, dict):
+        kind = (data.get("kind") or "").lower()
+        if kind in {"reasoning", "thinking"}:
+            return True
+        artifacts = data.get("artifacts")
+        if isinstance(artifacts, list):
+            for a in artifacts:
+                if isinstance(a, dict):
+                    if (a.get("type") or "").lower() in {"thinking", "reasoning"}:
+                        return True
+        msg = data.get("message")
+        if isinstance(msg, dict):
+            content = msg.get("content")
+            if isinstance(content, list):
+                for blk in content:
+                    if isinstance(blk, dict) and blk.get("type") == "thinking":
+                        return True
+    return False
+
+
+def _completion_tokens(row):
+    """Best-effort completion-token count from a model.completed row.
+
+    DuckDB stamps token_count on the row for billing; the v3 mapper also
+    nests usage under data.usage / data.data.usage. Prefer the row total
+    when present.
+    """
+    n = row.get("token_count") or 0
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = 0
+    if n > 0:
+        return n
+    data = row.get("data") if isinstance(row, dict) else None
+    if isinstance(data, dict):
+        for blob in (data.get("usage"), (data.get("data") or {}).get("usage")):
+            if isinstance(blob, dict):
+                v = blob.get("output_tokens") or blob.get("completion_tokens")
+                try:
+                    return int(v or 0)
+                except (TypeError, ValueError):
+                    continue
+    return 0
+
+
+def _build_llm_call_timeline(rows, anchor):
+    """Walk ``rows`` (oldest first) to build a 3- or 5-phase timeline.
+
+    ``anchor`` is the model.completed (or assistant) row the user clicked.
+    We anchor on it (its ts is the END of the call) and walk backwards to
+    find the nearest preceding ``prompt.submitted`` row in the same chain.
+    Between those two anchors we scan for reasoning artifacts to fill in
+    the 5-phase shape; if none, we synthesise the 3-phase shape so every
+    LLM call gets SOMETHING visual.
+    """
+    if not anchor:
+        return None
+    anchor_idx = None
+    for i, r in enumerate(rows):
+        if r.get("id") == anchor.get("id"):
+            anchor_idx = i
+            break
+    if anchor_idx is None:
+        return None
+    completion_ts = _parse_iso_ts(anchor.get("ts"))
+    model = anchor.get("model") or ""
+    if isinstance(anchor.get("data"), dict):
+        model = model or anchor["data"].get("modelId") or ""
+    # Walk backwards to the nearest prompt.submitted (or user role).
+    prompt_row = None
+    reasoning_rows = []
+    for j in range(anchor_idx - 1, -1, -1):
+        r = rows[j]
+        et = (r.get("event_type") or "").lower()
+        if et in {"prompt.submitted", "user"}:
+            prompt_row = r
+            break
+        if _is_reasoning_event(r):
+            reasoning_rows.append(r)
+    # Reverse so reasoning_rows is oldest-first (we walked backwards).
+    reasoning_rows.reverse()
+    prompt_ts = _parse_iso_ts(prompt_row.get("ts")) if prompt_row else None
+    if prompt_ts is None:
+        # No matching prompt — fall back to the anchor ts so the bar still
+        # renders (just shows the completion marker on its own).
+        prompt_ts = completion_ts
+
+    phases = []
+    base = prompt_ts or completion_ts or 0
+
+    def _ms(ts):
+        return max(0, (ts or base) - base)
+
+    phases.append({
+        "phase": "prompt_received",
+        "ts":    prompt_row.get("ts") if prompt_row else anchor.get("ts"),
+        "ms":    0,
+        "model": model,
+    })
+    has_reasoning = bool(reasoning_rows)
+    if has_reasoning:
+        first_r = reasoning_rows[0]
+        last_r = reasoning_rows[-1]
+        phases.append({
+            "phase":  "reasoning_started",
+            "ts":     first_r.get("ts"),
+            "ms":     _ms(_parse_iso_ts(first_r.get("ts"))),
+            "tokens": _completion_tokens(first_r) or None,
+        })
+        phases.append({
+            "phase":  "reasoning_completed",
+            "ts":     last_r.get("ts"),
+            "ms":     _ms(_parse_iso_ts(last_r.get("ts"))),
+            "tokens": sum(_completion_tokens(r) for r in reasoning_rows) or None,
+        })
+    # First-output-token: synthesised marker positioned between the last
+    # known "thinking" event (reasoning_completed when present, else
+    # prompt_received) and completion. Two cases:
+    #   * usage.output_tokens present → estimate generation slice at
+    #     ~80 tok/s, clamp to 10..90% of the post-reasoning span.
+    #   * no usage breakdown → plant at 70% of the post-reasoning span
+    #     so the marker is visible and ordered correctly.
+    # Marked "estimated":True so the UI can render an honest label.
+    span_ms = max(0, (completion_ts or base) - (prompt_ts or base))
+    out_tokens = _completion_tokens(anchor)
+    # Post-reasoning span is what we slice up for generation; without
+    # reasoning the floor is prompt_received (ms=0).
+    post_reasoning_ms = phases[-1]["ms"] if has_reasoning else 0
+    gen_span_ms = max(0, span_ms - post_reasoning_ms)
+    if gen_span_ms > 0:
+        if out_tokens > 0:
+            gen_ms = int(out_tokens * 1000 / 80)
+            gen_ms = max(int(gen_span_ms * 0.10),
+                         min(gen_ms, int(gen_span_ms * 0.90)))
+        else:
+            gen_ms = int(gen_span_ms * 0.30)
+        first_tok_ms = post_reasoning_ms + max(0, gen_span_ms - gen_ms)
+        phases.append({
+            "phase":  "first_output_token",
+            "ts":     None,  # synthesised — no row-level ts
+            "ms":     first_tok_ms,
+            "estimated": True,
+        })
+    phases.append({
+        "phase":  "completion",
+        "ts":     anchor.get("ts"),
+        "ms":     span_ms,
+        "tokens": out_tokens or None,
+        "model":  model,
+    })
+    return {
+        "event_id":      anchor.get("id"),
+        "session_id":    anchor.get("session_id") or "",
+        "model":         model,
+        "reasoning":     has_reasoning,
+        "phase_count":   len(phases),
+        "total_ms":      span_ms,
+        "phases":        phases,
+    }
+
+
+@bp_brain.route("/api/llm-call-timeline/<event_id>")
+def api_llm_call_timeline(event_id):
+    """Return the per-call lifecycle timeline for one LLM call.
+
+    Reads the DuckDB events table (DuckDB-first rule, ``feedback_duckdb_
+    first_rule.md``) — no JSONL fallback. The endpoint is cheap (one
+    indexed read by session_id, capped at 200 rows) so we don't cache.
+
+    Query params:
+        session_id (optional) — when supplied, narrows the search to one
+            session instead of scanning the full local store. The Brain
+            UI always knows the session of the chip it just rendered, so
+            it should pass this on every click.
+    """
+    sid = (request.args.get("session_id") or "").strip()
+    rows = None
+    if sid:
+        rows = _fetch_session_chain(sid)
+    if rows is None and not sid:
+        # Without a session hint, fall back to a broad read. Capped at the
+        # 200-row default so a runaway local store can't blow up the read.
+        try:
+            from routes.local_query import local_store_via_daemon
+            rows = local_store_via_daemon("query_events", limit=200)
+        except Exception:
+            rows = None
+    if rows is None:
+        return jsonify({"error": "local store unavailable", "event_id": event_id}), 503
+    anchor = _find_event_by_id(rows, event_id)
+    if anchor is None and not sid:
+        return jsonify({"error": "event not found", "event_id": event_id}), 404
+    if anchor is None and sid:
+        return jsonify({"error": "event not found in session",
+                        "event_id": event_id, "session_id": sid}), 404
+    # Anchor must be a model-output row to make sense as an LLM call.
+    et = (anchor.get("event_type") or "").lower()
+    if et not in {"model.completed", "assistant", "message"} and not et.startswith("model"):
+        return jsonify({
+            "error":      "event is not an LLM-call anchor",
+            "event_id":   event_id,
+            "event_type": et,
+        }), 400
+    timeline = _build_llm_call_timeline(rows, anchor)
+    if timeline is None:
+        return jsonify({"error": "could not build timeline",
+                        "event_id": event_id}), 500
+    try:
+        import dashboard as _d
+        _d._ext_emit("brain.llm_call_timeline", {
+            "event_id": event_id,
+            "phase_count": timeline["phase_count"],
+            "reasoning": timeline["reasoning"],
+        })
+    except Exception:
+        pass
+    return jsonify(timeline)
 
 
 @bp_brain.route("/api/brain-stream")
@@ -1277,3 +1981,119 @@ def api_brain_stream():
         mimetype="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@bp_brain.route("/api/brain/clusters")
+def api_brain_clusters():
+    """Session behavioral clusters for the Brain tab (issue #1650).
+
+    PostHog Clusters parity, local-first. Groups sessions by dominant tool
+    category, cost tier, error presence, and model family — the same
+    dimensions used by /api/sessions/clusters in routes/usage.py.
+
+    The time window mirrors the /api/brain-history 24h cap: OSS non-Pro
+    users are clamped to the last 24 hours; Pro users can query up to 90
+    days via ?days=<n>.
+
+    Query params:
+      days  int  Look-back window in days, 1–90 (default 30).
+    """
+    import dashboard as _d
+    try:
+        days = max(1, min(90, int(request.args.get("days", 30))))
+    except (TypeError, ValueError):
+        days = 30
+    # No local cap (founder call, 2026-06-23): local dashboards show the full
+    # requested window for free. Mirrors the uncapped /api/brain-history above.
+    if is_local_store_read_enabled():
+        # Late import to avoid circular dependency at module load time.
+        from routes.usage import _try_local_store_sessions_clusters
+        payload = _try_local_store_sessions_clusters(days)
+        if payload is not None:
+            payload["_shape"] = "brain_clusters"
+            payload["capped_at_24h"] = False
+            return jsonify(payload)
+    return jsonify({
+        "clusters": [],
+        "total_sessions": 0,
+        "days": days,
+        "capped_at_24h": False,
+        "_source": "unavailable",
+        "_shape": "brain_clusters",
+    })
+
+
+_WHY_HINT = (
+    "These rows are events from an AI agent session (oldest first). "
+    "The last row is the target assistant turn. "
+    "Explain in exactly 3 sentences why that assistant output happened. "
+    "Lead with the most direct cause (which user message or tool result triggered it). "
+    "If the same tool or query appears 3+ times (loop / anomaly), say so first."
+)
+
+
+@bp_brain.route("/api/brain/why/<session_id>/<event_id>")
+def api_brain_why(session_id, event_id):
+    """Return an LLM-narrated explanation of why a specific assistant turn happened.
+
+    Reads up to 10 preceding events from DuckDB as context, then calls the
+    same synthesis path used by the weekly digest (insights.py). Falls back
+    to a stub message when no LLM key is configured — never a 500.
+
+    Query params: none required (session_id and event_id are path params).
+    """
+    rows = _fetch_session_chain(session_id)
+    if rows is None:
+        return jsonify({"error": "local store unavailable", "event_id": event_id}), 503
+
+    # Find the target event; rows are oldest-first from _fetch_session_chain.
+    target_idx = None
+    for i, r in enumerate(rows):
+        if str(r.get("id") or "") == str(event_id):
+            target_idx = i
+            break
+
+    if target_idx is None:
+        return jsonify({"error": "event not found", "event_id": event_id}), 404
+
+    # Context window: up to 10 preceding events + the target event itself.
+    context = rows[max(0, target_idx - 10): target_idx + 1]
+
+    # Anomaly: any non-conversation event_type that repeats 3+ times in context.
+    from collections import Counter
+    type_counts = Counter(r.get("event_type", "") for r in context)
+    anomaly = any(
+        count >= 3 and et not in ("assistant", "user", "message", "")
+        for et, count in type_counts.items()
+    )
+
+    from clawmetry.insights import _resolve_synthesis_credential, _synthesize_narrative
+    from clawmetry.config import load_config
+
+    cfg = load_config()
+    mode, secret = _resolve_synthesis_credential(cfg)
+
+    if mode == "none":
+        narration = (
+            f"{len(context)} context events. "
+            "Connect to Cloud for AI narration — no key required."
+        )
+        used_model = "none"
+    else:
+        narration, _ = _synthesize_narrative(
+            secret,
+            "Why did this agent turn happen?",
+            _WHY_HINT,
+            context,
+            mode=mode,
+        )
+        used_model = "claude-sonnet-4-6"
+
+    return jsonify({
+        "session_id": session_id,
+        "event_id": event_id,
+        "narration": narration,
+        "anomaly": anomaly,
+        "model": used_model,
+        "_source": "local_store",
+    })

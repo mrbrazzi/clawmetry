@@ -81,12 +81,110 @@ so the dashboard renders NeMo sessions identically to OpenClaw sessions.
 
 from __future__ import annotations
 
+import json
 import logging
+import threading
 import time
 import uuid
+from datetime import date
 from typing import Any, Optional
 
 logger = logging.getLogger("clawmetry.adapters.nemo")
+
+
+# ── Free-tier daily ingest cap (issue #1170) ───────────────────────────────
+#
+# NeMo Agent Toolkit users are the highest-value paid-conversion segment
+# we observe (enterprise GPU buyers). Shipping the adapter under OSS gave
+# the whole NeMo experience away for free, undercutting the sibling
+# ``integrations/nat/`` Cloud-bound variant. The product-P0 fix caps free
+# ingest at ``NEMO_FREE_DAILY_CAP`` events per UTC day; Pro users ingest
+# unlimited. Counter resets at the UTC date boundary.
+#
+# State lives at module scope (not per-adapter) so that two independent
+# NeMoAdapter instances pointing at the same local store share one cap —
+# the cap is a tenant-level economic gate, not a per-instance throttle.
+NEMO_FREE_DAILY_CAP = 1000
+
+# Internal: lock + counter + date-key for the per-day budget.
+_CAP_LOCK = threading.Lock()
+_CAP_STATE: dict[str, Any] = {
+    "date": "",          # UTC YYYY-MM-DD currently being counted
+    "count": 0,          # events ingested today (Pro + Free both count for telemetry)
+    "dropped": 0,        # events dropped today because cap was hit
+    "warned": False,     # only log the cap-hit WARNING once per day
+    "last_drop_ts": "",  # ISO timestamp of most recent drop (for banner staleness)
+}
+
+
+def _today_key() -> str:
+    """UTC date key used to slice the cap counter."""
+    return date.today().isoformat()
+
+
+def _rollover_locked() -> None:
+    """Reset counters when a new UTC day begins. Caller must hold ``_CAP_LOCK``."""
+    today = _today_key()
+    if _CAP_STATE["date"] != today:
+        _CAP_STATE["date"] = today
+        _CAP_STATE["count"] = 0
+        _CAP_STATE["dropped"] = 0
+        _CAP_STATE["warned"] = False
+        _CAP_STATE["last_drop_ts"] = ""
+
+
+def _is_pro() -> bool:
+    """Best-effort Pro check that fails closed (treats unknown as Free).
+
+    Reuses ``dashboard._is_pro_user()`` — the same helper PR #1553 added
+    for auto-pause gating (#1169) and that #1168 uses for Telegram
+    dispatch. Imported lazily so the adapter never hard-requires
+    ``dashboard`` at module load (the adapter ships in the same wheel but
+    standalone usage shouldn't crash if a downstream user vendored only
+    the package directory).
+    """
+    try:
+        import dashboard as _d  # noqa: WPS433
+        return bool(_d._is_pro_user())
+    except Exception:
+        return False
+
+
+def get_nemo_cap_state() -> dict:
+    """Return a snapshot of the daily cap state for the dashboard banner.
+
+    Shape (stable contract used by ``/api/nemo-cap-status`` and the
+    Brain / Tokens-tab upsell banner)::
+
+        {
+            "cap": 1000,                # int — free-tier daily limit
+            "used": 137,                # int — events ingested today
+            "dropped": 0,               # int — events dropped today (free-tier only)
+            "is_pro": False,            # bool — caller is on Cloud-Pro
+            "cap_hit": False,           # bool — free-tier cap reached today
+            "date": "2026-05-17",       # UTC date key for the current bucket
+        }
+    """
+    with _CAP_LOCK:
+        _rollover_locked()
+        return {
+            "cap": NEMO_FREE_DAILY_CAP,
+            "used": int(_CAP_STATE["count"]),
+            "dropped": int(_CAP_STATE["dropped"]),
+            "is_pro": _is_pro(),
+            "cap_hit": (not _is_pro()) and int(_CAP_STATE["count"]) >= NEMO_FREE_DAILY_CAP,
+            "date": _CAP_STATE["date"] or _today_key(),
+        }
+
+
+def _reset_cap_state_for_tests() -> None:
+    """Test-only hook — wipe cap counters between cases."""
+    with _CAP_LOCK:
+        _CAP_STATE["date"] = ""
+        _CAP_STATE["count"] = 0
+        _CAP_STATE["dropped"] = 0
+        _CAP_STATE["warned"] = False
+        _CAP_STATE["last_drop_ts"] = ""
 
 
 # NeMo event-type → ClawMetry dot.separated event_type.
@@ -297,14 +395,40 @@ class NeMoAdapter:
         required fields, …). Never raises — internal errors are logged
         at ``WARNING`` and swallowed, because losing one telemetry event
         should never crash the host agent.
+
+        Issue #1170: free-tier callers are capped at ``NEMO_FREE_DAILY_CAP``
+        events per UTC day. Once the cap is hit we drop subsequent events
+        and surface a banner via ``/api/nemo-cap-status``. Pro users
+        bypass the cap entirely.
         """
         try:
             row = self.map_event(event)
         except Exception as exc:
-            logger.warning("nemo adapter: map_event raised %r — dropping", exc)
+            logger.warning("nemo adapter: map_event raised %r - dropping", exc)
             return None
         if row is None:
             return None
+        # Free-tier daily cap (#1170). Performed AFTER map_event so we
+        # don't even map events that will be dropped, but BEFORE ingest
+        # so we don't pollute DuckDB beyond the cap.
+        with _CAP_LOCK:
+            _rollover_locked()
+            if not _is_pro() and _CAP_STATE["count"] >= NEMO_FREE_DAILY_CAP:
+                _CAP_STATE["dropped"] = int(_CAP_STATE["dropped"]) + 1
+                _CAP_STATE["last_drop_ts"] = _now_iso()
+                if not _CAP_STATE["warned"]:
+                    _CAP_STATE["warned"] = True
+                    logger.warning(
+                        "nemo adapter: free-tier daily cap reached "
+                        "(%d/%d events today). Further NeMo events are "
+                        "dropped until UTC midnight. Upgrade to Cloud-Pro "
+                        "for unlimited ingest: "
+                        "https://app.clawmetry.com/upgrade?source=nemo_cap",
+                        NEMO_FREE_DAILY_CAP,
+                        NEMO_FREE_DAILY_CAP,
+                    )
+                return None
+            _CAP_STATE["count"] = int(_CAP_STATE["count"]) + 1
         try:
             self._store.ingest(row)
         except Exception as exc:
@@ -507,4 +631,555 @@ class NeMoAdapter:
         return row
 
 
-__all__ = ["NeMoAdapter", "MAPPED_EVENT_TYPES"]
+# ── NemoClaw RUNTIME read-side AgentAdapter ─────────────────────────────────────────
+#
+# NemoClaw is a Free runtime alongside OpenClaw (FREE_RUNTIMES in
+# clawmetry/entitlements.py contains {"openclaw", "nemoclaw"}). It is the
+# NVIDIA-flavored wrapper of OpenClaw that ingests events tagged with
+# ``agent_type='nemoclaw'`` (filesystem source or in-process). This facade
+# exposes those events through the standard :class:`AgentAdapter` shape so
+# the multi-agent UI chip bar + /api/agents + the runtime switcher all see
+# NemoClaw alongside OpenClaw.
+#
+# Distinct from the push-mode ``NeMoAdapter`` above, which receives NeMo
+# Guardrails (governance) callback events tagged ``agent_type='nemo'``.
+# Guardrails is a Free *feature* (``nemo_governance``), not a runtime.
+#
+# Renamed from ``NeMoReaderAdapter`` (PR #2339, OSS 0.12.370) which
+# incorrectly used ``name='nemo'`` and queried governance events. The
+# canonical runtime id per /api/runtimes + FREE_RUNTIMES is ``nemoclaw``;
+# this rename aligns /api/agents with the rest of the runtime catalogue.
+from .base import AgentAdapter, Capability, DetectResult, Event, Session
+
+
+def _extract_skill_names(raw: dict) -> list:
+    names = []
+    for entry in raw.get("skills", []):
+        if isinstance(entry, str):
+            names.append(entry)
+        elif isinstance(entry, dict):
+            name = entry.get("name") or entry.get("id") or entry.get("skillName", "")
+            if name:
+                names.append(name)
+    return names
+
+
+def _read_nemoclaw_skill_catalog() -> dict:
+    """Read catalog-metadata.json from the nemoclaw skills directory.
+
+    Checks two candidate locations (blueprint dir first, then a flat
+    ~/.nemoclaw/skills/ fallback). Returns a dict of skill_catalog_*
+    keys if the file is found; empty dict otherwise — never raises.
+    """
+    import json
+    from pathlib import Path
+
+    home = Path.home()
+    candidates = [
+        home / ".nemoclaw" / "source" / "nemoclaw-blueprint" / "skills" / "catalog-metadata.json",
+        home / ".nemoclaw" / "skills" / "catalog-metadata.json",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            raw = json.loads(path.read_text())
+            meta = raw.get("metadata", {})
+            return {
+                "skill_catalog_min_version": meta.get("minNemoClawVersion", ""),
+                "skill_catalog_tested_version": meta.get("testedNemoClawVersion", ""),
+                "skill_catalog_schema_version": meta.get("schemaVersion", ""),
+                "skill_catalog_export_sha256": raw.get("exportContentSha256", ""),
+                "skill_catalog_source_commit": raw.get("sourceCommit", meta.get("sourceCommit", "")),
+                "skill_catalog_source_sha256": raw.get("sourceContentSha256", meta.get("sourceContentSha256", "")),
+                "skill_catalog_skill_names": _extract_skill_names(raw),
+            }
+        except Exception as exc:
+            logger.debug("nemoclaw skill catalog read failed (%s): %s", path, exc)
+    return {}
+
+
+_OLLAMA_HOST_DOCKER_INTERNAL = "http://host.docker.internal:11434"
+_OLLAMA_LOCALHOST = "http://127.0.0.1:11434"
+
+
+def _resolve_ollama_host() -> tuple:
+    """Resolve the Ollama base URL and how it was chosen.
+
+    Priority order:
+    1. ``OLLAMA_HOST`` env var (with http:// prefix added if missing)
+    2. Docker internal host when running inside a container
+    3. Loopback (127.0.0.1)
+
+    Returns (url, mode) where mode is "explicit", "docker-internal", or
+    "loopback".  Never raises.
+    """
+    import os
+
+    explicit = (os.environ.get("OLLAMA_HOST") or "").strip()
+    if explicit:
+        if "://" not in explicit:
+            explicit = "http://" + explicit
+        return explicit, "explicit"
+    in_docker = False
+    try:
+        in_docker = os.path.exists("/.dockerenv") or bool(
+            (os.environ.get("OLLAMA_IN_DOCKER") or "").strip()
+        )
+    except Exception:
+        in_docker = False
+    if in_docker:
+        return _OLLAMA_HOST_DOCKER_INTERNAL, "docker-internal"
+    return _OLLAMA_LOCALHOST, "loopback"
+
+
+def _read_nemoclaw_ollama_inference() -> dict:
+    """Surface the local Ollama inference host + available model roster.
+
+    Hits ``<host>/api/tags`` (Ollama's list-models endpoint) with a tight
+    0.6 s timeout so the adapter stays fast when Ollama is absent.  Returns a
+    dict with ``ollama_host``, ``ollama_host_mode``, and (when reachable)
+    ``ollama_local_models`` (sorted list of model-name strings).  Never raises.
+    """
+    import json
+    import urllib.request
+
+    host, mode = _resolve_ollama_host()
+    out: dict = {"ollama_host": host, "ollama_host_mode": mode}
+    try:
+        url = host.rstrip("/") + "/api/tags"
+        with urllib.request.urlopen(url, timeout=0.6) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        models = payload.get("models") if isinstance(payload, dict) else None
+        names: list = []
+        for m in models or []:
+            if isinstance(m, dict):
+                name = m.get("name") or m.get("model")
+                if name:
+                    names.append(str(name))
+        out["ollama_local_models"] = sorted(set(names))
+    except Exception as exc:
+        logger.debug("nemoclaw ollama model roster query failed (%s): %s", host, exc)
+    return out
+
+
+def _read_model_router_model_list() -> dict:
+    """Read the proxy-config YAML written by ``model-router proxy-config --output <path>``.
+
+    Tries several candidate locations in priority order, then falls back to
+    a ``model_name:`` line-regex when PyYAML is not installed. Returns a dict
+    with ``modelRouterModelList`` (list of model-name strings) and
+    ``modelRouterModelCount`` (int) when any config file is found; empty dict
+    otherwise — never raises.
+    """
+    import os
+    import re
+    from pathlib import Path
+
+    home = Path.home()
+    venv = os.environ.get("NEMOCLAW_MODEL_ROUTER_VENV") or str(
+        home / ".nemoclaw" / "model-router-venv"
+    )
+    # Explicit env-var override (harness or user can set this)
+    env_path = os.environ.get("NEMOCLAW_MODEL_ROUTER_CONFIG", "")
+    candidates = [
+        Path(env_path) if env_path else None,
+        home / ".nemoclaw" / "model-router-config.yaml",
+        home / ".nemoclaw" / "proxy-config.yaml",
+        Path(venv) / "proxy-config.yaml",
+    ]
+
+    for path in candidates:
+        if path is None or not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception as exc:
+            logger.debug("nemoclaw model-router config read failed (%s): %s", path, exc)
+            continue
+        try:
+            try:
+                import yaml  # type: ignore[import]
+                data = yaml.safe_load(text) or {}
+                names = [
+                    str(entry.get("model_name", ""))
+                    for entry in data.get("model_list", [])
+                    if isinstance(entry, dict) and entry.get("model_name")
+                ]
+            except ImportError:
+                # PyYAML not installed — regex fallback over raw text
+                names = re.findall(r"model_name:\s*(.+?)(?:\s|$)", text)
+            if names:
+                return {
+                    "modelRouterModelList": names,
+                    "modelRouterModelCount": len(names),
+                }
+        except Exception as exc:
+            logger.debug("nemoclaw model-router config parse failed (%s): %s", path, exc)
+    return {}
+
+
+def _read_nemoclaw_sandbox_lifecycle() -> dict:
+    """Query openshell for sandbox name, phase, and policy (issue #3117).
+
+    Tries ``openshell sandbox list --json`` first; falls back to plain-text
+    parsing of ``openshell sandbox list``.  For each sandbox, attempts
+    ``openshell sandbox get <name>`` (text) to extract the Policy field when
+    it is not already present in the JSON output.  Returns
+    ``{"sandboxes": [{name, phase, policy}, …]}`` or ``{}`` on any failure;
+    never raises.
+    """
+    import os as _os
+    import shutil as _shutil
+    import subprocess as _sub
+    import json as _j
+
+    openshell_bin: str | None = None
+    for _name in ("openshell", "openshell-cli"):
+        _p = _shutil.which(_name)
+        if _p:
+            openshell_bin = _p
+            break
+    if not openshell_bin:
+        for _c in ("/usr/local/bin/openshell", "/opt/openshell/bin/openshell", "/usr/bin/openshell"):
+            if _os.path.isfile(_c):
+                openshell_bin = _c
+                break
+    if not openshell_bin:
+        return {}
+
+    sandboxes: list[dict] = []
+    _json_succeeded = False
+
+    # Try JSON first (structured, preferred)
+    try:
+        out = _sub.check_output(
+            [openshell_bin, "sandbox", "list", "--json"],
+            stderr=_sub.DEVNULL,
+            timeout=10,
+        ).decode()
+        raw = _j.loads(out)
+        _json_succeeded = True
+        for sb in (raw if isinstance(raw, list) else []):
+            sandboxes.append({
+                "name": sb.get("name", ""),
+                "phase": sb.get("phase", sb.get("status", "Unknown")),
+                "policy": sb.get("policy", ""),
+            })
+    except Exception:
+        pass
+
+    # Fall back to text: "<name> <phase>" per line (only when JSON unavailable)
+    if not _json_succeeded:
+        try:
+            out = _sub.check_output(
+                [openshell_bin, "sandbox", "list"],
+                stderr=_sub.DEVNULL,
+                timeout=10,
+            ).decode()
+            for line in out.splitlines():
+                parts = line.split(None, 1)
+                if parts:
+                    sandboxes.append({
+                        "name": parts[0],
+                        "phase": parts[1].strip() if len(parts) > 1 else "Unknown",
+                        "policy": "",
+                    })
+        except Exception:
+            pass
+
+    # Enrich each sandbox with policy via `openshell sandbox get <name>`
+    for sb in sandboxes:
+        if sb.get("policy") or not sb.get("name"):
+            continue
+        try:
+            get_out = _sub.check_output(
+                [openshell_bin, "sandbox", "get", sb["name"]],
+                stderr=_sub.DEVNULL,
+                timeout=5,
+            ).decode()
+            for line in get_out.splitlines():
+                if line.startswith("Policy:"):
+                    sb["policy"] = line[len("Policy:"):].strip()
+                    break
+        except Exception:
+            pass
+
+    if not sandboxes:
+        return {}
+    return {"sandboxes": sandboxes}
+
+
+_NEMOCLAW_TRACE_TIMING_SCHEMA = "nemoclaw.trace_timing.v1"
+
+
+def _read_onboard_trace_timing() -> dict:
+    """Read the NemoClaw onboarding trace-timing artifact (#3651).
+
+    Tries several candidate paths for the JSON artifact written by the harness
+    during onboarding (``src/lib/onboard/tracing``). Validates
+    ``schema_version`` and surfaces:
+    - ``onboardTotalDurationMs`` (int) — total onboarding wall-clock time
+    - ``onboardPhases`` (dict) — per-phase durations keyed by phase name
+
+    Handles both dict-format phases ``{phase_name: duration_ms}`` and
+    list-format phases ``[{name, duration_ms}]``.  Returns ``{}`` when the
+    file is absent, the schema mismatches, or any parse error occurs — never
+    raises.
+    """
+    import os as _os
+    import json as _json
+    from pathlib import Path
+
+    home = Path.home()
+    nemoclaw_dir = home / ".nemoclaw"
+    env_path = _os.environ.get("NEMOCLAW_TRACE_TIMING_PATH", "")
+    candidates = [
+        Path(env_path) if env_path else None,
+        nemoclaw_dir / "onboard-trace-timing.json",
+        nemoclaw_dir / "scorecard" / "trace-timing.json",
+        nemoclaw_dir / "scorecard-trace-timing.json",
+    ]
+
+    for path in candidates:
+        if path is None or not path.exists():
+            continue
+        try:
+            raw = _json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.debug("nemoclaw onboard trace-timing read failed (%s): %s", path, exc)
+            continue
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("schema_version") != _NEMOCLAW_TRACE_TIMING_SCHEMA:
+            logger.debug(
+                "nemoclaw onboard trace-timing schema mismatch (%s): got %r",
+                path,
+                raw.get("schema_version"),
+            )
+            continue
+        out: dict = {}
+        total = raw.get("total_duration_ms")
+        if isinstance(total, (int, float)) and total >= 0:
+            out["onboardTotalDurationMs"] = int(total)
+        phases_raw = raw.get("phases", raw.get("phase_breakdown"))
+        if isinstance(phases_raw, dict):
+            out["onboardPhases"] = {
+                str(k): int(v)
+                for k, v in phases_raw.items()
+                if isinstance(v, (int, float))
+            }
+        elif isinstance(phases_raw, list):
+            phases_dict: dict = {}
+            for entry in phases_raw:
+                if isinstance(entry, dict):
+                    name = entry.get("name") or entry.get("phase")
+                    dur = entry.get("duration_ms") or entry.get("durationMs")
+                    if name and isinstance(dur, (int, float)):
+                        phases_dict[str(name)] = int(dur)
+            if phases_dict:
+                out["onboardPhases"] = phases_dict
+        if out:
+            return out
+    return {}
+
+
+class NemoClawAdapter(AgentAdapter):
+    """Read-side adapter for the NemoClaw Free runtime.
+
+    Reads events tagged ``agent_type='nemoclaw'`` from DuckDB. Detection
+    is "any nemoclaw-tagged events present" so an OSS install with no
+    NemoClaw data does not clutter the chip bar.
+    """
+
+    name = "nemoclaw"
+    display_name = "NemoClaw"
+
+    def detect(self) -> DetectResult:
+        n = 0
+        try:
+            from clawmetry import local_store as _ls
+            store = _ls.get_store(read_only=True)
+            rows = store._fetch(
+                "SELECT COUNT(*) FROM events WHERE agent_type = ?",
+                ["nemoclaw"],
+            )
+            if rows:
+                n = int(rows[0][0])
+        except Exception as exc:
+            logger.debug("nemoclaw detect read failed: %s", exc)
+        meta: dict = {"event_count": n}
+        meta.update(_read_nemoclaw_skill_catalog())
+        meta.update(_read_model_router_model_list())
+        meta.update(_read_nemoclaw_sandbox_lifecycle())
+        meta["ollama_inference"] = _read_nemoclaw_ollama_inference()
+        meta.update(_read_onboard_trace_timing())
+        return DetectResult(
+            name=self.name,
+            display_name=self.display_name,
+            detected=n > 0,
+            running=False,
+            workspace="(DuckDB-backed runtime view)",
+            session_count=0,
+            capabilities=[c.value for c in self.capabilities()],
+            meta=meta,
+        )
+
+    def list_sessions(self, limit: int = 100) -> list[Session]:
+        sessions: list[Session] = []
+        try:
+            from clawmetry import local_store as _ls
+            store = _ls.get_store(read_only=True)
+            rows = store._fetch(
+                "SELECT session_id, MIN(ts) AS started, MAX(ts) AS ended, "
+                "COUNT(*) AS n_events, SUM(token_count) AS tokens, "
+                "SUM(cost_usd) AS cost, ANY_VALUE(runtime_kind) AS runtime_kind "
+                "FROM events "
+                "WHERE agent_type = ? AND session_id IS NOT NULL "
+                "GROUP BY session_id ORDER BY started DESC LIMIT ?",
+                ["nemoclaw", int(limit)],
+            )
+            for r in rows or []:
+                sid = r[0]
+                started = r[1] or 0.0
+                ended = r[2] or 0.0
+                # ts column is VARCHAR (ISO string or epoch-as-string);
+                # coerce to float for the dataclass typed fields.
+                try:
+                    started_f = float(started) if started not in ("", None) else 0.0
+                except (TypeError, ValueError):
+                    started_f = 0.0
+                try:
+                    ended_f = float(ended) if ended not in ("", None) else None
+                except (TypeError, ValueError):
+                    ended_f = None
+                n_ev = int(r[3] or 0)
+                tokens = int(r[4] or 0)
+                cost = float(r[5] or 0.0)
+                rk = str(r[6]) if r[6] else ""
+                extra: dict = {}
+                if rk:
+                    extra["runtimeKind"] = rk
+                sessions.append(Session(
+                    agent=self.name,
+                    id=str(sid),
+                    title=f"NemoClaw session {str(sid)[:8]}",
+                    started_at=started_f,
+                    ended_at=ended_f,
+                    message_count=n_ev,
+                    total_tokens=tokens,
+                    cost_usd=cost,
+                    extra=extra,
+                ))
+        except Exception as exc:
+            logger.debug("nemoclaw list_sessions read failed: %s", exc)
+        return sessions
+
+    def list_events(self, session_id: str, limit: int = 500) -> list[Event]:
+        events: list[Event] = []
+        try:
+            from clawmetry import local_store as _ls
+            store = _ls.get_store(read_only=True)
+            rows = store._fetch(
+                "SELECT id, event_type, ts, model, token_count, data, runtime_kind "
+                "FROM events WHERE agent_type = ? AND session_id = ? "
+                "ORDER BY ts ASC LIMIT ?",
+                ["nemoclaw", str(session_id), int(limit)],
+            )
+            for r in rows or []:
+                ts_raw = r[2]
+                try:
+                    ts_f = float(ts_raw) if ts_raw not in (None, "") else 0.0
+                except (TypeError, ValueError):
+                    ts_f = 0.0
+                extra: dict = {}
+                if r[3]:
+                    extra["model"] = r[3]
+                if r[6]:
+                    extra["runtimeKind"] = str(r[6])
+                raw_data = r[5]
+                if raw_data is not None:
+                    try:
+                        if isinstance(raw_data, (bytes, bytearray)):
+                            raw_data = bytes(raw_data).decode("utf-8", "replace")
+                        obj = (
+                            json.loads(raw_data) if isinstance(raw_data, str) else raw_data
+                        )
+                        if isinstance(obj, dict):
+                            if r[1] == "sandbox.audit_log":
+                                for _field in (
+                                    "class_uid", "type_uid", "activity_name",
+                                    "verdict", "rule_name",
+                                ):
+                                    _val = obj.get(_field)
+                                    if _val is not None:
+                                        extra[_field] = _val
+                                extra["ocsf"] = True
+                            # Advisor-session tool-execution retry/exhaustion
+                            # lifecycle (#3650): tool_execution_start /
+                            # tool_execution_end events carry attempt number,
+                            # per-attempt error flag, and resolved retry outcome
+                            # so the dashboard can distinguish a single clean
+                            # call from fail-then-success or exhaustion.
+                            # isError uses is-not-None (False is meaningful).
+                            _attempt = (
+                                obj.get("attemptNumber")
+                                or obj.get("attempt_number")
+                            )
+                            if _attempt is not None:
+                                try:
+                                    extra["attempt_number"] = int(_attempt)
+                                except (TypeError, ValueError):
+                                    pass
+                            _is_err = obj.get("isError")
+                            if _is_err is None:
+                                _is_err = obj.get("is_error")
+                            if _is_err is not None:
+                                extra["is_error"] = bool(_is_err)
+                            _rr = (
+                                obj.get("retryResponse")
+                                or obj.get("retry_response")
+                            )
+                            if _rr:
+                                extra["retry_response"] = _rr
+                    except Exception:
+                        pass
+                events.append(Event(
+                    agent=self.name,
+                    session_id=str(session_id),
+                    id=str(r[0]),
+                    type=str(r[1] or "event"),
+                    ts=ts_f,
+                    tokens=int(r[4] or 0),
+                    extra=extra,
+                ))
+        except Exception as exc:
+            logger.debug("nemoclaw list_events read failed: %s", exc)
+        return events
+
+    def capabilities(self) -> set[Capability]:
+        return {
+            Capability.SESSIONS,
+            Capability.EVENTS,
+            Capability.BRAIN,
+            Capability.COST,
+            Capability.SKILLS,
+            Capability.LOGS,
+        }
+
+
+# Back-compat alias: the previous (mis-named) class still imports OK so
+# any out-of-tree code that referenced ``NeMoReaderAdapter`` from
+# ``clawmetry.adapters.nemo`` keeps working. Marked for removal once
+# downstream usage is confirmed clean.
+NeMoReaderAdapter = NemoClawAdapter
+
+
+__all__ = [
+    "NeMoAdapter",
+    "NemoClawAdapter",
+    "NeMoReaderAdapter",  # back-compat alias for NemoClawAdapter
+    "MAPPED_EVENT_TYPES",
+    "NEMO_FREE_DAILY_CAP",
+    "get_nemo_cap_state",
+]

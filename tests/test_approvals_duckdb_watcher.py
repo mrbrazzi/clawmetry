@@ -53,6 +53,14 @@ def _ts(seconds_offset: float = 0.0) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
 
 
+def _anchor_watermark(ap, seconds_ago: float = 10.0) -> None:
+    """Prime the in-memory INGEST watermark to 'a moment ago' so rows the
+    test is about to ingest (created_at = now) are all visible, without the
+    first-iteration anchor-to-now racing the ingest."""
+    ap._state["last_ingest_ms"] = int((time.time() - seconds_ago) * 1000)
+    ap._state["seen_recent_ids"] = {}
+
+
 def _msg_event(eid: str, sid: str, ts: str, *,
                agent_type: str = "openclaw",
                role: str = "assistant",
@@ -113,8 +121,8 @@ def watcher(tmp_path, monkeypatch):
     state_path = tmp_path / "sync-state.json"
     monkeypatch.setattr(ap, "_STATE_PATH", state_path)
     # Force the in-memory watermark mirror to re-prime from disk.
-    ap._state["last_check_ts"] = None
-    ap._state["seen_ids_at_boundary"] = set()
+    ap._state["last_ingest_ms"] = None
+    ap._state["seen_recent_ids"] = {}
 
     # Capture every process_tool_call invocation. Replace it on the module
     # and turn off the threading.Thread spawn so assertions are
@@ -188,7 +196,7 @@ def test_watcher_dispatches_three_toolcalls(watcher):
     store = ls.get_store()
 
     # Anchor watermark to "before the test events" so they're all visible.
-    ap._state["last_check_ts"] = _ts(-10)
+    _anchor_watermark(ap)
 
     for i in range(3):
         store.ingest(_msg_event(
@@ -222,10 +230,11 @@ def test_watcher_dispatches_three_toolcalls(watcher):
 
 def test_watcher_does_not_redispatch_on_second_pass(watcher):
     """One event → first watch_iteration fires once → second pass sees
-    nothing new (watermark advanced past the row's ts)."""
+    nothing new (ingest watermark advanced past the row and its id is
+    in the dispatched-id map for the lookback window)."""
     ap, ls, captured, policies, _ = watcher
     store = ls.get_store()
-    ap._state["last_check_ts"] = _ts(-10)
+    _anchor_watermark(ap)
 
     store.ingest(_msg_event(
         eid="ev-once", sid="sess-once", ts=_ts(0),
@@ -251,7 +260,7 @@ def test_watcher_skips_messages_without_toolcall(watcher):
     only the message that carries a toolCall block does."""
     ap, ls, captured, policies, _ = watcher
     store = ls.get_store()
-    ap._state["last_check_ts"] = _ts(-10)
+    _anchor_watermark(ap)
 
     # No-toolCall: just a text block.
     store.ingest(_msg_event(
@@ -280,7 +289,7 @@ def test_watcher_processes_non_openclaw_adapter(watcher):
     PRD acceptance: the watcher is adapter-agnostic now."""
     ap, ls, captured, policies, _ = watcher
     store = ls.get_store()
-    ap._state["last_check_ts"] = _ts(-10)
+    _anchor_watermark(ap)
 
     store.ingest(_msg_event(
         eid="ev-hermes", sid="sess-hermes", ts=_ts(0),
@@ -311,7 +320,7 @@ def test_watermark_survives_daemon_restart(watcher, monkeypatch):
     and skip the already-processed event — no double-fire."""
     ap, ls, captured, policies, state_path = watcher
     store = ls.get_store()
-    ap._state["last_check_ts"] = _ts(-10)
+    _anchor_watermark(ap)
 
     store.ingest(_msg_event(
         eid="ev-pre-restart", sid="sess-X", ts=_ts(0),
@@ -327,8 +336,8 @@ def test_watermark_survives_daemon_restart(watcher, monkeypatch):
     # store + on-disk watermark intact. The next iteration must reload the
     # watermark from disk and NOT re-fire on the same event.
     captured.clear()
-    ap._state["last_check_ts"] = None
-    ap._state["seen_ids_at_boundary"] = set()
+    ap._state["last_ingest_ms"] = None
+    ap._state["seen_recent_ids"] = {}
 
     n2 = ap.watch_iteration("k", "n", policies=policies)
     assert n2 == 0, "post-restart pass must not redispatch the already-seen event"
@@ -339,4 +348,140 @@ def test_watermark_survives_daemon_restart(watcher, monkeypatch):
     with state_path.open() as fh:
         blob = _j.load(fh)
     assert blob.get(ap._STATE_KEY) is not None
-    assert ap._state["last_check_ts"] == blob[ap._STATE_KEY]
+    assert ap._state["last_ingest_ms"] == blob[ap._STATE_KEY]
+
+
+# ── 6. BUG 2 GUARD: late-ingested events (2026-07-02 watermark race) ──────
+
+
+def test_late_ingested_event_with_stale_ts_still_evaluated(watcher):
+    """An event whose INGESTION lags its ``ts`` beyond the watermark must
+    still be evaluated exactly once.
+
+    Live repro 2026-07-02: family adapters ingested a brand-new project dir
+    ~4 minutes after its events' timestamps; newer events had already
+    advanced the (then ts-based) watermark past them, so those tool calls
+    were NEVER evaluated and approval-gated actions sailed through. The
+    watcher now cursors on ``events.created_at`` (the ingest stamp), so a
+    stale-``ts`` row is picked up the moment it lands.
+
+    Revert-proof: on the pre-fix ts-watermark code, step 2's row (ts far
+    behind the watermark) is never fetched and the assertion goes RED."""
+    ap, ls, captured, policies, _ = watcher
+    store = ls.get_store()
+    _anchor_watermark(ap)
+
+    # 1. A live event advances the watermark.
+    store.ingest(_msg_event(
+        eid="ev-live", sid="sess-live", ts=_ts(1000),
+        content=[_toolcall_block("bash", {"cmd": "echo live"},
+                                 blk_id="tc-live")],
+    ))
+    store._flush_now()
+    assert ap.watch_iteration("k", "n", policies=policies) == 1
+    assert captured[-1]["tool_call_id"] == "tc-live"
+
+    # 2. NOW a session is ingested whose event ts is far BEHIND the
+    # already-advanced watermark (the minutes-late family ingest). It must
+    # still be dispatched.
+    store.ingest(_msg_event(
+        eid="ev-late", sid="claude_code:sess-late", ts=_ts(0),
+        agent_type="claude_code",
+        content=[_toolcall_block("bash", {"cmd": "rm -rf /tmp/x"},
+                                 blk_id="tc-late")],
+    ))
+    store._flush_now()
+    n = ap.watch_iteration("k", "n", policies=policies)
+    assert n == 1, ("late-ingested event with a stale ts must still be "
+                    "evaluated (pre-fix ts-watermark skipped it forever)")
+    assert captured[-1]["tool_call_id"] == "tc-late"
+    assert captured[-1]["session_id"] == "claude_code:sess-late"
+
+    # 3. Exactly once: further passes must not re-dispatch either row.
+    assert ap.watch_iteration("k", "n", policies=policies) == 0
+    assert len(captured) == 2
+
+    # 4. ... including across a daemon restart (the dedup map is persisted
+    # with the watermark, and the late row is still inside the lookback
+    # window).
+    ap._state["last_ingest_ms"] = None
+    ap._state["seen_recent_ids"] = {}
+    assert ap.watch_iteration("k", "n", policies=policies) == 0
+    assert len(captured) == 2
+
+
+# ── 7. page-cap cursor resumes past 2,000 rows (#3558) ───────────────────
+
+
+def test_page_cap_cursor_resumes_past_2000_rows(watcher, monkeypatch):
+    """When more than _MAX_PAGES_PER_ITERATION * 500 rows exist in the
+    lookback window, subsequent iterations must resume from the saved keyset
+    cursor rather than restarting from the window start.
+
+    Pre-fix: every poll refetched the same first 2,000 rows, all of which hit
+    seen_recent_ids and were skipped, so the watcher never advanced to row
+    2,001+.  Any approval-gated tool call in the starved suffix was silently
+    dropped forever.  Regression guard for vivekchand/clawmetry#3558.
+    """
+    ap, ls, captured, policies, _ = watcher
+
+    n_rows = ap._MAX_PAGES_PER_ITERATION * 500 + 1  # 2,001 rows
+    now_ms = 2_000_000_000_000
+
+    # All rows share the same created_at; the keyset (created_at, id) drives
+    # ordering.  The toolCall block lives only in the final row (index 2000)
+    # so we can prove the watcher eventually reaches it.
+    rows = []
+    for i in range(n_rows):
+        content = []
+        if i == n_rows - 1:
+            content = [_toolcall_block("bash", {"cmd": "rm -rf /"},
+                                       blk_id="tc-starved")]
+        rows.append({
+            "id": f"e{i:04d}",
+            "session_id": "sess-pagecap",
+            "event_type": "message",
+            "created_at": now_ms,
+            "data": {
+                "type": "message",
+                "message": {"role": "assistant", "content": content},
+            },
+        })
+
+    def _stub_query(created_after, after_id, limit):
+        eligible = [
+            r for r in rows
+            if r["created_at"] > created_after
+            or (r["created_at"] == created_after
+                and (after_id is None or r["id"] > after_id))
+        ]
+        return eligible[:limit]
+
+    monkeypatch.setattr(ap, "_query_new_events", _stub_query)
+    monkeypatch.setattr(ap, "_persist_watermark", lambda *_: None)
+
+    # Prime watermark so the lookback window covers all rows.
+    ap._state["last_ingest_ms"] = now_ms - 1
+    ap._state["seen_recent_ids"] = {}
+    ap._state["resume_cursor"] = None
+
+    # Iteration 1: consumes the first 2,000 rows (4 full pages).  The
+    # toolCall at index 2,000 has not been reached yet.
+    ap.watch_iteration("k", "n", policies=policies)
+    assert ap._state.get("resume_cursor") is not None, (
+        "page cap must store a resume cursor so the next iteration continues"
+    )
+    assert len(captured) == 0, "toolCall is beyond the page cap — not yet dispatched"
+
+    # Iteration 2: resumes from the saved cursor and reaches the final row.
+    ap.watch_iteration("k", "n", policies=policies)
+    assert len(captured) == 1, "toolCall in the starved row must be dispatched exactly once"
+    assert captured[0]["tool_call_id"] == "tc-starved"
+    assert ap._state.get("resume_cursor") is None, (
+        "cursor must be cleared after a short final page"
+    )
+
+    # Iteration 3: idempotent — nothing new dispatched.
+    captured.clear()
+    ap.watch_iteration("k", "n", policies=policies)
+    assert len(captured) == 0, "already-seen rows must not be re-dispatched"

@@ -27,7 +27,6 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from typing import Optional
 
 log = logging.getLogger(__name__)
 
@@ -48,10 +47,12 @@ _CAPABILITIES = [
     "query.aggregates",
     "query.transcript",
     "query.health",
+    "query.spans",    # Issue #1013
+    "query.traces",   # Issue #1013
 ]
 
 
-def start_relay_thread(config: dict, version: str = "unknown") -> Optional[threading.Thread]:
+def start_relay_thread(config: dict, version: str = "unknown") -> threading.Thread | None:
     """No-op since 2026-05-13. See module docstring.
 
     Returns ``None`` unconditionally so callers' ``if t:`` guards stay

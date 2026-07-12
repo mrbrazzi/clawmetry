@@ -1,8 +1,25 @@
+<!-- Desk device launch pill (dismissable, centered) -->
+<div id="cm-device-pill" style="display:none; justify-content:center; align-items:center; padding:8px 16px; background:#0b0d12; border-bottom:1px solid rgba(124,140,255,0.18);">
+  <a href="https://clawmetry.com/device" target="_blank" rel="noopener" style="display:inline-flex; align-items:center; gap:8px; padding:6px 15px; border-radius:999px; background:rgba(124,140,255,0.12); border:1px solid rgba(124,140,255,0.4); color:#a5b4ff; font-size:13px; font-weight:600; text-decoration:none;">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+    New: the ClawMetry desk device, $49 launch →
+  </a>
+  <button onclick="dismissDevicePill()" title="Dismiss" aria-label="Dismiss" style="background:transparent; border:none; color:#6b7280; cursor:pointer; margin-left:10px; font-size:18px; line-height:1; padding:0 4px;">×</button>
+</div>
+<script>
+function dismissDevicePill(){ try{ localStorage.setItem('cm_device_pill_dismissed','1'); }catch(e){} var p=document.getElementById('cm-device-pill'); if(p) p.style.display='none'; }
+(function(){ try{ if(!localStorage.getItem('cm_device_pill_dismissed')){ var p=document.getElementById('cm-device-pill'); if(p) p.style.display='flex'; } }catch(e){} })();
+</script>
+
 <!-- Update Available Banner -->
 <div id="update-banner" style="display:none; padding:10px 16px; background:linear-gradient(90deg,#0f3d0f 0%,#1a1a2e 100%); border-bottom:2px solid #22c55e; color:#86efac; font-size:13px; font-weight:600; align-items:center; gap:10px;">
-  <span style="font-size:18px;">&#128640;</span>
+  <span style="font-size:18px;">🚀</span>
   <span id="update-banner-msg" style="flex:1;"></span>
-  <a id="update-banner-changelog" href="https://github.com/vivekchand/clawmetry/blob/main/CHANGELOG.md" target="_blank" style="
+  <label id="update-banner-auto" title="When on, future releases install automatically as soon as they're published." style="display:none; align-items:center; gap:6px; font-size:12px; color:#86efac; cursor:pointer; user-select:none; white-space:nowrap;">
+    <input type="checkbox" id="update-banner-auto-toggle" onchange="toggleAutoUpdate(this.checked)" style="cursor:pointer; accent-color:#16a34a; width:14px; height:14px;">
+    <span id="update-banner-auto-label">Auto-update</span>
+  </label>
+  <button id="update-banner-update-btn" onclick="updateFromBanner()" style="
     background:#16a34a;
     color:#fff;
     border:none;
@@ -11,8 +28,18 @@
     font-size:12px;
     cursor:pointer;
     font-weight:600;
+    ">Update now</button>
+  <a id="update-banner-changelog" href="https://github.com/vivekchand/clawmetry/blob/main/CHANGELOG.md" target="_blank" style="
+    background:transparent;
+    color:#86efac;
+    border:1px solid #22c55e80;
+    border-radius:6px;
+    padding:4px 12px;
+    font-size:12px;
+    cursor:pointer;
+    font-weight:600;
     text-decoration:none;
-    ">View Changelog</a>
+    " data-i18n="banners.changelog">Changelog</a>
   <button onclick="dismissUpdateBanner()" style="
     background:transparent;
     color:#86efac;
@@ -21,7 +48,7 @@
     padding:4px 10px;
     font-size:11px;
     cursor:pointer;
-    ">Dismiss</button>
+    " data-i18n="common.dismiss">Dismiss</button>
 </div>
 
 <!-- Alert Banner -->
@@ -37,7 +64,7 @@
   align-items:center;
   gap:10px;
   ">
-  <span style="font-size:18px;">&#9888;&#65039;</span>
+  <span style="font-size:18px;">⚠️</span>
   <span id="alert-banner-msg" style="flex:1;"></span>
   <button onclick="ackAllAlerts()" style="
     background:var(--text-error);
@@ -48,7 +75,7 @@
     font-size:12px;
     cursor:pointer;
     font-weight:600;
-    ">Dismiss</button>
+    " data-i18n="common.dismiss">Dismiss</button>
   <button id="alert-resume-btn" onclick="resumeGateway()" style="
     display:none;
     background:#16a34a;
@@ -59,7 +86,7 @@
     font-size:12px;
     cursor:pointer;
     font-weight:600;
-    ">Resume Gateway</button>
+    " data-i18n="banners.resume_gateway">Resume Gateway</button>
 </div>
 
 <!-- Auto-Pause Banner -->
@@ -85,7 +112,7 @@
     font-size:12px;
     cursor:pointer;
     font-weight:600;
-    ">Dismiss</button>
+    " data-i18n="common.dismiss">Dismiss</button>
 </div>
 
 <!-- Upgrade Impact Banner -->
@@ -100,7 +127,7 @@
   align-items:center;
   gap:10px;
   ">
-  <span style="font-size:16px;">&#128640;</span>
+  <span style="font-size:16px;">🚀</span>
   <span id="upgrade-banner-msg" style="flex:1;"></span>
   <button onclick="switchTab('version-impact')" style="
     background:#3b82f6;
@@ -111,7 +138,7 @@
     font-size:12px;
     cursor:pointer;
     font-weight:600;
-    ">View Details</button>
+    " data-i18n="banners.view_details">View Details</button>
   <button onclick="dismissUpgradeBanner()" style="
     background:transparent;
     color:#93c5fd;
@@ -120,8 +147,91 @@
     padding:4px 10px;
     font-size:11px;
     cursor:pointer;
-    ">Dismiss</button>
+    " data-i18n="common.dismiss">Dismiss</button>
 </div>
+
+<!-- No-Agent-Detected Empty-State Banner -->
+<!-- Shown when ClawMetry is installed but NEITHER OpenClaw nor NVIDIA -->
+<!-- NemoClaw is detected on this machine, AND the local store has zero -->
+<!-- events. Distinct from the first-heartbeat-race banner below: -->
+<!--   * this one is persistent (until the user installs an agent) -->
+<!--   * the first-heartbeat one is transient (~30s after install) -->
+<!-- Mutual-exclusion is enforced in app.js so we never show both. -->
+<div id="no-agent-banner" style="
+  display:none;
+  padding:14px 18px;
+  border-bottom:2px solid #f59e0b;
+  font-size:13px;
+  font-weight:600;
+  align-items:center;
+  gap:14px;
+  background:linear-gradient(90deg,#3f2a06 0%,#1a1a2e 100%);
+  color:#fbbf24;
+  flex-wrap:wrap;
+  ">
+  <span style="font-size:18px;">⚠️</span>
+  <span id="no-agent-banner-msg" style="flex:1;min-width:240px;" data-i18n="banners.no_agent_msg">
+    No OpenClaw or NVIDIA NemoClaw detected. Install one to start seeing data.
+  </span>
+  <a href="https://openclaw.ai/" target="_blank" rel="noopener" style="
+    background:#16a34a;
+    color:#fff;
+    border:none;
+    border-radius:6px;
+    padding:6px 14px;
+    font-size:12px;
+    cursor:pointer;
+    font-weight:600;
+    text-decoration:none;
+    white-space:nowrap;
+    " data-i18n="banners.install_openclaw">Install OpenClaw</a>
+  <a href="https://www.nvidia.com/en-us/ai/nemoclaw/" target="_blank" rel="noopener" style="
+    background:#76b900;
+    color:#000;
+    border:none;
+    border-radius:6px;
+    padding:6px 14px;
+    font-size:12px;
+    cursor:pointer;
+    font-weight:600;
+    text-decoration:none;
+    white-space:nowrap;
+    " data-i18n="banners.install_nemoclaw">Install NVIDIA NemoClaw</a>
+</div>
+
+<!-- Onboarding / First-Heartbeat Banner (closes #1604) -->
+<!-- Shown on fresh signup until the first heartbeat lands. Auto-refreshes -->
+<!-- every 5s. After 90s with no heartbeat we switch to an actionable error -->
+<!-- so a stuck daemon doesn't masquerade as "loading forever". -->
+<div id="onboarding-banner" style="
+  display:none;
+  padding:12px 16px;
+  border-bottom:2px solid #3b82f6;
+  font-size:13px;
+  font-weight:600;
+  align-items:center;
+  gap:12px;
+  background:linear-gradient(90deg,#0c1d3a 0%,#1a1a2e 100%);
+  color:#93c5fd;
+  ">
+  <span id="onboarding-banner-spinner" style="
+    display:inline-block;
+    width:14px;
+    height:14px;
+    border:2px solid #3b82f680;
+    border-top-color:#60a5fa;
+    border-radius:50%;
+    animation:onboarding-spin 0.9s linear infinite;
+    flex-shrink:0;
+    "></span>
+  <span id="onboarding-banner-msg" style="flex:1;">Setting up your node. First check-in usually arrives in about 30 seconds.</span>
+  <span id="onboarding-banner-eta" style="font-size:11px;font-weight:400;color:#60a5fa;opacity:0.85;"></span>
+</div>
+<style>
+@keyframes onboarding-spin {
+  to { transform: rotate(360deg); }
+}
+</style>
 
 <!-- Heartbeat Gap Banner -->
 <div id="heartbeat-banner" style="
@@ -135,7 +245,7 @@
   background:#451a03;
   color:#fbbf24;
   ">
-  <span style="font-size:18px;">&#x1F494;</span>
+  <span style="font-size:18px;">💔</span>
   <span id="heartbeat-banner-msg" style="flex:1;"></span>
   <button onclick="document.getElementById('heartbeat-banner').style.display='none'" style="
     background:#92400e;
@@ -146,7 +256,7 @@
     font-size:12px;
     cursor:pointer;
     font-weight:600;
-    ">Dismiss</button>
+    " data-i18n="common.dismiss">Dismiss</button>
 </div>
 
 <!-- Stuck Session Banner -->
@@ -161,7 +271,7 @@
   background:#450a0a;
   color:#fca5a5;
   ">
-  <span style="font-size:18px;">&#9203;</span>
+  <span style="font-size:18px;">⏳</span>
   <span id="stuck-session-banner-msg" style="flex:1;"></span>
   <a id="stuck-session-banner-link" href="#" onclick="switchTab('overview');document.getElementById('stuck-session-banner').style.display='none';_stuckCount=0;_updateStuckBadge();" style="
     background:#991b1b;
@@ -173,7 +283,7 @@
     cursor:pointer;
     font-weight:600;
     text-decoration:none;
-    ">View Session</a>
+    " data-i18n="banners.view_session">View Session</a>
   <button onclick="(typeof dismissStuckBanner==='function')?dismissStuckBanner():(function(){document.getElementById('stuck-session-banner').style.display='none';_stuckCount=0;_updateStuckBadge();})();" style="
     background:#7f1d1d;
     color:#fecaca;
@@ -182,7 +292,7 @@
     padding:4px 10px;
     font-size:11px;
     cursor:pointer;
-    ">Dismiss</button>
+    " data-i18n="common.dismiss">Dismiss</button>
 </div>
 
 <!-- Budget Cap Banner -->
@@ -197,7 +307,7 @@
   background:#3f2a06;
   color:#fbbf24;
   ">
-  <span style="font-size:18px;">&#9888;&#65039;</span>
+  <span style="font-size:18px;">⚠️</span>
   <span id="budget-cap-banner-msg" style="flex:1;"></span>
   <button onclick="document.getElementById('budget-cap-banner').style.display='none'" style="
     background:#92400e;
@@ -208,5 +318,32 @@
     font-size:12px;
     cursor:pointer;
     font-weight:600;
-    ">Dismiss</button>
+    " data-i18n="common.dismiss">Dismiss</button>
 </div>
+
+<!-- Sync Status Banner (PRD-sync-status.md) — first-install transparency.
+     Hidden by default; cm_sync_init() decides whether to show based on
+     /api/local/health.event_count (cold install) or /api/sync-progress.status. -->
+<div id="sync-status-banner" style="display:none;padding:12px 18px;background:linear-gradient(90deg,#1a2342 0%,#0f1422 100%);border-bottom:1px solid #334074;color:#cbd5e1;font-size:13px;font-family:Inter,system-ui,sans-serif;">
+  <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+    <span aria-hidden="true" style="display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:50%;background:rgba(99,102,241,0.18);">
+      <span id="sync-status-icon" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#6366f1;animation:cm-sync-pulse 1.4s ease-in-out infinite;"></span>
+    </span>
+    <div style="flex:1;min-width:220px;">
+      <div id="sync-status-title" style="font-weight:600;color:#e2e8f0;">Syncing your OpenClaw workspace</div>
+      <div id="sync-status-subtitle" style="font-size:11px;color:#94a3b8;margin-top:2px;">Discovering sessions and indexing events. Your data will appear shortly.</div>
+    </div>
+    <div id="sync-status-stepper" style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;"></div>
+    <button id="sync-status-toggle" type="button" onclick="cmSyncToggleDetails()" aria-expanded="false" style="background:transparent;border:1px solid #334074;color:#94a3b8;border-radius:6px;padding:4px 12px;font-size:11px;cursor:pointer;">Show details</button>
+    <button id="sync-status-hide" type="button" onclick="_cmSyncDismiss()" data-i18n-title="banners.hide_banner" title="Hide this banner" data-i18n-aria-label="banners.hide_sync_banner" aria-label="Hide sync banner" style="background:transparent;border:1px solid #334074;color:#94a3b8;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;" data-i18n="banners.hide">Hide</button>
+  </div>
+  <div id="sync-status-details" style="display:none;margin-top:10px;padding:8px 12px;background:rgba(15,23,42,0.6);border:1px solid #1e293b;border-radius:6px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:#94a3b8;max-height:180px;overflow:auto;"></div>
+  <div id="sync-status-error" style="display:none;margin-top:10px;padding:10px 12px;background:rgba(127,29,29,0.25);border:1px solid #7f1d1d;border-radius:6px;font-size:12px;color:#fecaca;"></div>
+</div>
+<style>
+  @keyframes cm-sync-pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.4 } }
+  .cm-sync-step { display:inline-flex; align-items:center; gap:5px; padding:3px 9px; border-radius:14px; font-size:11px; font-weight:500; background:rgba(30,41,59,0.5); color:#64748b; border:1px solid rgba(51,64,116,0.5); white-space:nowrap; }
+  .cm-sync-step[data-state="done"]   { color:#86efac; border-color:#16a34a55; background:rgba(20,83,45,0.25); }
+  .cm-sync-step[data-state="active"] { color:#a5b4fc; border-color:#6366f1aa; background:rgba(67,56,202,0.25); }
+  .cm-sync-step[data-state="error"]  { color:#fecaca; border-color:#7f1d1d; background:rgba(127,29,29,0.35); }
+</style>

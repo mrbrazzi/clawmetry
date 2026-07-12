@@ -42,10 +42,11 @@ def test_openclaw_shape_extracts_model_and_tokens():
     assert model == "claude-opus-4-7"
     assert tokens == 1234
     # Cost is derived from input/output split + provider + model via pricing
-    # table. anthropic/claude-opus-4 → (15.00, 75.00) per 1M tokens.
-    # = 1000/1M * 15 + 234/1M * 75 = 0.015 + 0.01755 = 0.03255
+    # table. opus-4-7 is the new gen → (5.00, 25.00) per 1M tokens (verified
+    # against LiteLLM/ccusage; was wrongly $15/$75 before the 2026-06-08 fix).
+    # = 1000/1M * 5 + 234/1M * 25 = 0.005 + 0.00585 = 0.01085
     assert cost is not None
-    assert abs(cost - 0.03255) < 1e-6
+    assert abs(cost - 0.01085) < 1e-6
 
 
 def test_openclaw_total_only_leaves_cost_none():
@@ -85,8 +86,64 @@ def test_anthropic_shape_sums_input_and_output_tokens():
     cost, tokens, model = _extract_event_metrics(ev)
     assert model == "claude-3-5-sonnet-latest"
     assert tokens == 150
-    # No provider in payload → cost stays None even though tokens are split.
-    assert cost is None
+    # Provider is now inferred from the model (no explicit provider needed) so
+    # the split IS priced — previously this left cost None, which surfaced as
+    # $0 for real spend. The provider-required gate was the bug, not a feature.
+    from clawmetry.providers_pricing import estimate_event_cost_usd
+    expect = estimate_event_cost_usd(
+        "claude-3-5-sonnet-latest", input_tokens=100, output_tokens=50)
+    assert expect > 0
+    assert cost is not None and abs(cost - expect) < 1e-9
+
+
+def test_claude_code_extra_split_derives_cost_with_inferred_provider():
+    """Claude Code / Codex shape: ``token_count`` pre-set (the lumped total)
+    with the input/output split under ``data.extra`` and NO provider. This
+    used to leave cost NULL — the ``$0 for a 100k-token session`` bug — because
+    the split-extraction blocks were gated on ``tokens is None`` and the cost
+    derivation required an explicit provider. Now the split is recovered from
+    ``data.extra`` and the provider is inferred from the model."""
+    ev = {
+        "id": "cc1",
+        "node_id": "n",
+        "event_type": "message",
+        "ts": "2026-05-25T00:00:00Z",
+        "model": "claude-opus-4-7",
+        "token_count": 3212,
+        "data": {"role": "assistant",
+                 "extra": {"inputTokens": 3166, "outputTokens": 46}},
+    }
+    cost, tokens, model = _extract_event_metrics(ev)
+    assert tokens == 3212
+    assert model == "claude-opus-4-7"
+    from clawmetry.providers_pricing import estimate_event_cost_usd
+    expect = estimate_event_cost_usd(
+        "claude-opus-4-7", input_tokens=3166, output_tokens=46)
+    assert expect > 0, "pricing assumption broke"
+    assert cost is not None and abs(cost - expect) < 1e-9
+
+
+def test_claude_code_extra_cache_tokens_are_priced():
+    """Prompt-cache tokens under ``data.extra`` are priced (Anthropic cache
+    multipliers) so a cache-heavy Claude Code turn isn't undercounted — cache
+    creation dominates cost on these turns."""
+    base = {
+        "id": "cc2", "node_id": "n", "event_type": "message",
+        "ts": "2026-05-25T00:00:00Z",
+        "model": "claude-opus-4-7", "token_count": 3212,
+    }
+    no_cache = dict(base, data={
+        "role": "assistant",
+        "extra": {"inputTokens": 3166, "outputTokens": 46}})
+    with_cache = dict(base, data={
+        "role": "assistant",
+        "extra": {"inputTokens": 3166, "outputTokens": 46,
+                  "cacheReadInputTokens": 10319,
+                  "cacheCreationInputTokens": 12078}})
+    c0, _, _ = _extract_event_metrics(no_cache)
+    c1, _, _ = _extract_event_metrics(with_cache)
+    assert c0 is not None and c1 is not None
+    assert c1 > c0, "cache tokens must add cost"
 
 
 def test_top_level_already_extracted_values_are_preserved():
@@ -167,3 +224,47 @@ def test_openclaw_message_shape_with_priced_cost():
     assert tokens == 280
     # The pre-priced value wins, not the re-derivation.
     assert cost == 0.0123
+
+
+def test_local_model_event_cost_is_zero_not_none():
+    """Local/self-hosted model (e.g. ollama) with real token counts must produce
+    cost=0.0, NOT None. None renders as 'no data' in the Cost tab; 0.0 renders
+    as '$0 — local model, no API cost'. The derivation gate was `if est:` which
+    silently dropped 0.0; it must be `if est is not None:` (#2576)."""
+    ev = {
+        "id": "local1",
+        "node_id": "n",
+        "event_type": "message",
+        "ts": "2026-06-04T00:00:00Z",
+        "model": "ollama/llama3.2:3b",
+        "data": {"extra": {"inputTokens": 100, "outputTokens": 50}},
+    }
+    cost, tokens, model = _extract_event_metrics(ev)
+    assert model == "ollama/llama3.2:3b"
+    assert cost == 0.0, (
+        "local model cost must be 0.0 (not None) so the UI can label it "
+        "'local model — no API cost' rather than 'no data'"
+    )
+
+
+def test_unknown_provider_event_derives_conservative_nonzero_cost():
+    """Events whose model is completely unknown must get a non-zero conservative
+    cost (1.0/3.0 per-1M default), not None. This guards the 'Hermes drops
+    unknown-priced models' regression claim from #2576."""
+    ev = {
+        "id": "unk1",
+        "node_id": "n",
+        "event_type": "message",
+        "ts": "2026-06-04T00:00:00Z",
+        "data": {
+            "modelId": "totally-unknown-model-xyz",
+            "provider": "nobody",
+            "promptCache": {"lastCallUsage": {"input": 500, "output": 100}},
+        },
+    }
+    cost, tokens, model = _extract_event_metrics(ev)
+    assert model == "totally-unknown-model-xyz"
+    assert tokens == 600
+    assert cost is not None and cost > 0, (
+        "unknown provider must use conservative non-zero default, not be dropped"
+    )

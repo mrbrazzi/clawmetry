@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -43,23 +44,115 @@ REQUEST_TIMEOUT_SEC = 30
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 
+def _read_anthropic_key_from_openclaw_config() -> str | None:
+    """Best-effort scan of OpenClaw's config + insights store for an
+    Anthropic API key the operator has already set up.
+
+    We only look in well-known dashboard-managed JSON files; we never
+    parse arbitrary user config blobs. Order is most-specific to most-
+    general so a per-feature key (insights) wins over a global plugin
+    key.
+
+    Returns the raw key string or ``None`` if nothing usable is found.
+    The key never leaves the process via /api/* responses (the only
+    caller is the LLM dispatcher).
+    """
+    home = os.environ.get("OPENCLAW_HOME") or os.path.expanduser("~/.openclaw")
+    candidates: list[str] = []
+
+    # 1. Insights config -- the user may have pasted a key here already.
+    try:
+        ins_path = os.path.join(home, ".clawmetry", "insights_config.json")
+        if os.path.isfile(ins_path):
+            with open(ins_path) as f:
+                cfg = json.load(f)
+            k = (cfg.get("anthropic_api_key") or "").strip()
+            if k:
+                candidates.append(k)
+    except Exception:
+        pass
+
+    # 2. OpenClaw root config -- gateway-pooled key paths used by the
+    # anthropic plugin. We probe a small, conservative set of paths
+    # rather than walking the whole tree; new ones can be added as we
+    # discover them across installs.
+    try:
+        oc_path = os.path.join(home, "openclaw.json")
+        if os.path.isfile(oc_path):
+            with open(oc_path) as f:
+                oc = json.load(f)
+            probes = (
+                ((oc.get("plugins") or {}).get("entries") or {}).get("anthropic") or {},
+                ((oc.get("providers") or {}).get("anthropic") or {}),
+                ((oc.get("auth") or {}).get("profiles") or {}).get("anthropic:api-key") or {},
+            )
+            for blob in probes:
+                if not isinstance(blob, dict):
+                    continue
+                for field in ("apiKey", "api_key", "key", "token"):
+                    v = blob.get(field)
+                    if isinstance(v, str) and v.strip().startswith("sk-"):
+                        candidates.append(v.strip())
+    except Exception:
+        pass
+
+    # 3. Gateway service-env shell file -- launchd / systemd installs put
+    # provider creds here so the gateway sees them. Issue #1721: zero-config
+    # principle says any key on disk should "just work" -- we already
+    # auto-detect the gateway token here, the Anthropic key sits in the
+    # same file family. Parse with a strict regex so we never execute the
+    # shell or pick up unrelated lines.
+    try:
+        env_path = os.path.join(home, "service-env", "ai.openclaw.gateway.env")
+        if os.path.isfile(env_path):
+            with open(env_path) as f:
+                txt = f.read()
+            for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_API_KEY"):
+                m = re.search(
+                    r"^\s*(?:export\s+)?" + re.escape(name) + r"\s*=\s*['\"]?(sk-[A-Za-z0-9\-_]+)",
+                    txt,
+                    re.MULTILINE,
+                )
+                if m:
+                    candidates.append(m.group(1))
+    except Exception:
+        pass
+
+    return candidates[0] if candidates else None
+
+
 def _load_anthropic_auth() -> tuple[str | None, str | None]:
     """Return (mode, credential).
 
     mode is one of:
-      - "api_key"     : direct /v1/messages call with ANTHROPIC_API_KEY
+      - "api_key"     : direct /v1/messages call with an Anthropic API key
+                        (from ANTHROPIC_API_KEY, the Insights config, or
+                        an OpenClaw plugin/provider config)
       - "claude_cli"  : shell out to `claude -p`; uses whatever OpenClaw's
                         claude-cli profile is already authenticated with
                         (works for OAuth users with no extra config)
-      - None          : nothing configured; UI stays hidden
+      - None          : nothing configured; UI shows a single-line hint
+                        instead of a blocking modal
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if api_key:
-        return "api_key", api_key
+    # 1. Explicit env var wins -- operator-controlled, easy to override.
+    # Issue #1721: also honour the alternate names Claude CLI / Anthropic
+    # SDKs read so users who exported one of the well-known aliases don't
+    # have to set a second env var to make Self-Evolve work.
+    for env_name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_API_KEY"):
+        api_key = os.environ.get(env_name, "").strip()
+        if api_key:
+            return "api_key", api_key
 
-    # `claude` CLI usually bundles an OAuth token after the user runs
-    # `/login` once. Detect the binary presence -- actual auth is
-    # validated at call time and we surface any error to the UI.
+    # 2. Auto-detect a key the user already configured in OpenClaw / the
+    # dashboard's Insights tab. This is the "show some magic" path: a
+    # fresh dashboard user who already has OpenClaw running with a key
+    # gets Self-Evolve / Advisor working with zero extra input.
+    auto_key = _read_anthropic_key_from_openclaw_config()
+    if auto_key:
+        return "api_key", auto_key
+
+    # 3. claude CLI OAuth fallback. The binary uses whatever profile the
+    # user already authenticated, so OAuth-only users still work.
     claude_bin = shutil.which("claude")
     if claude_bin:
         profile_path = os.path.expanduser(
@@ -140,6 +233,16 @@ def _try_local_store_advisor_context(limit_events: int = MAX_CONTEXT_EVENTS) -> 
     today_str = time.strftime("%Y-%m-%d")
     today_tokens = 0
 
+    # Issue #1451: dedupe sibling-doubled billable turns before counting
+    # tokens. On real OpenClaw v3 installs each LLM turn emits BOTH an
+    # ``assistant`` and a sibling ``model.completed`` row ~100 ms apart,
+    # both stamped with the same ``token_count`` value. Without dedup
+    # per-session totals + today_tokens come out 2× reality and the
+    # advisor's recommendations are based on inflated numbers. Shared
+    # helper in ``routes/_dedupe.py``.
+    from routes._dedupe import build_sibling_bucket_max, is_sibling_dup
+    _bucket_max = build_sibling_bucket_max(rows)
+
     for r in rows:
         t = (r.get("ts") or "")[:19]
         typ = r.get("event_type") or "?"
@@ -161,6 +264,11 @@ def _try_local_store_advisor_context(limit_events: int = MAX_CONTEXT_EVENTS) -> 
         events.append(f"[{t}] {sid[:12]} {typ}: {detail}")
 
         sid_key = r.get("session_id") or ""
+        # Issue #1451: skip token + cost accumulation when this row is the
+        # slim sibling of a richer envelope we already counted. We still
+        # populate sessions_seen metadata (model, started_at) since those
+        # are tag-set not totals.
+        _is_dup = is_sibling_dup(r, _bucket_max)
         if sid_key:
             entry = sessions_seen.setdefault(sid_key, {
                 "session_id": sid_key[:8],
@@ -169,16 +277,17 @@ def _try_local_store_advisor_context(limit_events: int = MAX_CONTEXT_EVENTS) -> 
                 "cost_usd": 0.0,
                 "started_at": t,
             })
-            entry["tokens"] += int(r.get("token_count") or 0)
-            try:
-                entry["cost_usd"] = round(entry["cost_usd"] + float(r.get("cost_usd") or 0), 4)
-            except Exception:
-                pass
+            if not _is_dup:
+                entry["tokens"] += int(r.get("token_count") or 0)
+                try:
+                    entry["cost_usd"] = round(entry["cost_usd"] + float(r.get("cost_usd") or 0), 4)
+                except Exception:
+                    pass
             if r.get("model") and not entry["model"]:
                 entry["model"] = r["model"]
             if t and (not entry["started_at"] or t < entry["started_at"]):
                 entry["started_at"] = t
-        if t.startswith(today_str):
+        if t.startswith(today_str) and not _is_dup:
             today_tokens += int(r.get("token_count") or 0)
 
     return {

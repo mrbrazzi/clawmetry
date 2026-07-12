@@ -24,6 +24,22 @@ def client(tmp_path, monkeypatch):
     import routes.local_query as lq
     importlib.reload(lq)
 
+    # Issue #1538: isolate fixture from any running clawmetry daemon
+    # on the contributor's machine. Without this, _dispatch tries
+    # _proxy_dispatch first; that reads ~/.clawmetry/local_query.json
+    # and POSTs to the daemon, which then queries ITS production DuckDB
+    # (~/.clawmetry/clawmetry.duckdb) instead of this test's tmp_path
+    # fixture. CI never had a daemon so CI passed; laptops with the
+    # daemon running silently failed 11/16. Force direct-mode always.
+    monkeypatch.setattr(lq, "_read_discovery", lambda: None)
+
+    # Pre-#1448 events tests seed historical timestamps that fall outside
+    # the OSS 24h retention cap. Default the fixture to Pro so those
+    # assertions still pass; the cap tests below monkeypatch
+    # ``_is_pro_user`` explicitly. Mirrors PR #1445's fixture pattern.
+    import dashboard as _d
+    monkeypatch.setattr(_d, "_is_pro_user", lambda: True)
+
     app = Flask(__name__)
     app.register_blueprint(lq.bp_local_query)
     # Trigger store init + flusher start.
@@ -109,6 +125,90 @@ def test_sessions_endpoint(client):
     by_sid = {s["session_id"]: s for s in body["rows"]}
     assert by_sid["X"]["event_count"] == 2
     assert round(by_sid["X"]["cost_usd"], 4) == 0.30
+
+
+def test_aggregates_endpoint_dedupes_v3_sibling_pairs(client):
+    """Same dedupe contract as ``test_sessions_endpoint_dedupes_v3_sibling_pairs``,
+    one level up at the daily-aggregate layer. Issue: ``query_aggregates``
+    used to SUM(cost_usd) + SUM(token_count) over the raw events table,
+    doubling every billable turn on real v3 installs. The SQL CTE now
+    drops the slim sibling ONLY when an assistant/message rank-2 row
+    exists in the same (session_id, ts_sec) bucket.
+
+    ``event_count`` stays RAW so debug surfaces see all the rows.
+    """
+    c, ls = client
+    store = ls.get_store()
+    ts = "2026-05-16T10:00:00Z"
+    # Sibling pair = 1 deduped turn @ 150 tokens / $0.005
+    store.ingest(_ev(id="agg-assist", session_id="sess-pair",
+                     event_type="assistant", ts=ts,
+                     cost_usd=0.005, token_count=150))
+    store.ingest(_ev(id="agg-mc", session_id="sess-pair",
+                     event_type="model.completed", ts=ts,
+                     cost_usd=0.005, token_count=150))
+    # Two tool_calls sharing ts_sec are NOT siblings - both count
+    store.ingest(_ev(id="agg-t1", session_id="sess-tools",
+                     event_type="tool_call", ts=ts,
+                     cost_usd=0.10, token_count=12))
+    store.ingest(_ev(id="agg-t2", session_id="sess-tools",
+                     event_type="tool_call", ts=ts,
+                     cost_usd=0.20, token_count=33))
+    _wait(store)
+    r = c.get("/api/local/aggregates")
+    body = r.get_json()
+    by_day = {row["day"]: row for row in body["rows"]}
+    row = by_day["2026-05-16"]
+    assert row["event_count"] == 4, "raw event_count should report all 4 rows"
+    assert row["token_count"] == 195, (
+        f"dedupe wrong: expected 150 (deduped sibling) + 12 + 33 = 195 tokens, "
+        f"got {row['token_count']}"
+    )
+    assert round(row["cost_usd"], 4) == 0.305, (
+        f"dedupe wrong: expected $0.005 (deduped sibling) + $0.10 + $0.20 = $0.305, "
+        f"got {round(row['cost_usd'], 4)}"
+    )
+
+
+def test_sessions_endpoint_dedupes_v3_sibling_pairs(client):
+    """Issue #1460: on real OpenClaw v3 installs each LLM turn emits BOTH
+    an ``assistant`` row AND a sibling ``model.completed`` row ~100 ms
+    apart, both stamped with the same ``token_count`` + ``cost_usd``.
+    The SQL fix in ``query_sessions`` must dedupe at the SQL layer so all
+    consumers (cluster aggregator, anomaly detector, this endpoint, etc.)
+    return the single billable turn — not 2× of it.
+
+    ``event_count`` stays RAW (it is the row-count, not the turn-count) so
+    debug surfaces can still tell you both rows did arrive.
+    """
+    c, ls = client
+    store = ls.get_store()
+    store.ingest(_ev(
+        id="assist-1", session_id="sess-pair",
+        event_type="assistant",
+        ts="2026-05-16T10:00:00Z",
+        cost_usd=0.005, token_count=150,
+    ))
+    store.ingest(_ev(
+        id="mc-1", session_id="sess-pair",
+        event_type="model.completed",
+        ts="2026-05-16T10:00:00Z",
+        cost_usd=0.005, token_count=150,
+    ))
+    _wait(store)
+    r = c.get("/api/local/sessions")
+    body = r.get_json()
+    by_sid = {s["session_id"]: s for s in body["rows"]}
+    row = by_sid["sess-pair"]
+    assert row["event_count"] == 2, "raw event_count should still report both rows"
+    assert row["token_count"] == 150, (
+        f"sibling pair must dedupe to 1 turn = 150 tokens, got "
+        f"{row['token_count']} (regression: SQL layer not deduping)"
+    )
+    assert round(row["cost_usd"], 4) == 0.005, (
+        f"sibling pair must dedupe to 1 turn = $0.005, got "
+        f"{round(row['cost_usd'], 4)}"
+    )
 
 
 def test_aggregates_endpoint(client):
@@ -204,3 +304,53 @@ def test_relay_dispatch_rejects_unknown_shape():
     import routes.local_query as lq
     body = lq.relay_dispatch("nope", {})
     assert "error" in body
+
+
+# ── Retention cap (issue #1448 surface 4) ──────────────────────────────────
+#
+# OSS / Cloud-Free users get clamped to the last 24h of raw events on
+# /api/local/events. Cloud-Pro users (gated by ``dashboard._is_pro_user``)
+# bypass the cap. The response always carries ``capped_at_24h`` so the UI
+# can surface an upgrade CTA when the cap kicks in. Mirrors PR #1445's
+# pattern for /api/flow/runs.
+
+
+def _seed_old_and_recent(store):
+    """One ancient event (8 days old) + one fresh event (now)."""
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    old_ts = (now - _dt.timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    new_ts = (now - _dt.timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    store.ingest(_ev(id="cap-old", session_id="sess-cap", ts=old_ts))
+    store.ingest(_ev(id="cap-new", session_id="sess-cap", ts=new_ts))
+    _wait(store)
+
+
+def test_api_local_events_caps_24h_for_free(client, monkeypatch):
+    c, ls = client
+    _seed_old_and_recent(ls.get_store())
+    # Force OSS (non-Pro) path.
+    import dashboard as _d
+    monkeypatch.setattr(_d, "_is_pro_user", lambda: False)
+
+    r = c.get("/api/local/events?session_id=sess-cap&limit=10")
+    assert r.status_code == 200, r.get_data(as_text=True)[:300]
+    body = r.get_json()
+    assert body["capped_at_24h"] is True
+    ids = {row["id"] for row in body["rows"]}
+    # The 8-day-old event must be excluded; only the fresh one shows.
+    assert ids == {"cap-new"}
+
+
+def test_api_local_events_no_cap_for_pro(client, monkeypatch):
+    c, ls = client
+    _seed_old_and_recent(ls.get_store())
+    import dashboard as _d
+    monkeypatch.setattr(_d, "_is_pro_user", lambda: True)
+
+    r = c.get("/api/local/events?session_id=sess-cap&limit=10")
+    body = r.get_json()
+    assert body["capped_at_24h"] is False
+    ids = {row["id"] for row in body["rows"]}
+    # Pro users see the full history including the 8-day-old event.
+    assert ids == {"cap-old", "cap-new"}

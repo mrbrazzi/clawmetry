@@ -7,7 +7,6 @@ Currently used for type hints and documentation. dashboard.py globals remain unc
 from __future__ import annotations
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
 
 
 # ── DuckDB local-store fast-path feature gate ──────────────────────────────
@@ -41,6 +40,98 @@ def is_local_store_read_enabled() -> bool:
         not in _LOCAL_STORE_DISABLE_VALUES
 
 
+# ── ClawMetry-internal session filter ──────────────────────────────────────
+# Sessions ClawMetry itself spawns to drive OpenClaw (Self-Evolve, Fix-with-AI,
+# memory probes, …) all use a "clawmetry-" session-id prefix. They are our own
+# plumbing, not the user's agent activity, so user-facing views (transcripts,
+# brain feed, stuck-session alerts) hide them by default. Set
+# CLAWMETRY_SHOW_INTERNAL_SESSIONS=1 to surface them (debugging ClawMetry itself).
+CLAWMETRY_INTERNAL_SESSION_PREFIX = "clawmetry-"
+_SHOW_INTERNAL_ENABLE_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def is_clawmetry_internal_session(session_id) -> bool:
+    """True for sessions ClawMetry spawns to invoke OpenClaw (clawmetry-fix,
+    clawmetry-selfevolve, clawmetry-mem-probe, …).
+
+    Matches both the bare id (``clawmetry-fix``) and the full OpenClaw
+    session-id form (``agent:main:explicit:clawmetry-fix``), where the base id
+    is the last ``:``-delimited segment. Without the segment check the full
+    form leaked into user-facing views: the cloud Embodied list showed it as a
+    ghost session with an empty transcript (cloud-side fix landed in #1063),
+    and ``_check_stuck_sessions`` fired nuisance stuck-session alerts for the
+    helpers themselves (#1954).
+    """
+    if not session_id:
+        return False
+    sid = str(session_id)
+    return sid.startswith(CLAWMETRY_INTERNAL_SESSION_PREFIX) or (
+        ":" + CLAWMETRY_INTERNAL_SESSION_PREFIX
+    ) in sid
+
+
+def hide_clawmetry_session(session_id) -> bool:
+    """Whether to hide ``session_id`` from user-facing views because it's
+    ClawMetry's own plumbing. Override with CLAWMETRY_SHOW_INTERNAL_SESSIONS=1."""
+    if not is_clawmetry_internal_session(session_id):
+        return False
+    return os.environ.get("CLAWMETRY_SHOW_INTERNAL_SESSIONS", "").strip().lower() \
+        not in _SHOW_INTERNAL_ENABLE_VALUES
+
+
+# ── Local-only mode (cloud sync opt-out) ───────────────────────────────────
+# Persistent opt-out from cloud sync. Two equivalent triggers — either one
+# turns it on; both survive updates:
+#   * CLAWMETRY_NO_CLOUD=1 (env)
+#   * ~/.clawmetry/nocloud  (marker file written by `clawmetry disconnect`)
+# When set, the sync daemon STILL ingests OpenClaw events into the local
+# DuckDB store (so the localhost dashboard keeps showing fresh data), but
+# skips every cloud-side call: no heartbeat, no encrypted snapshot push,
+# no cache_push, no /ingest/* POSTs, no `clawmetry connect` auto-prompt.
+# Background: GitHub #1937 — users want a real "local only, never phone
+# home" mode that updates can't silently re-enable.
+NOCLOUD_MARKER_PATH = os.path.expanduser("~/.clawmetry/nocloud")
+_NO_CLOUD_ENABLE_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def is_cloud_disabled() -> bool:
+    """True when the user has opted out of cloud sync via env or marker file.
+
+    Either CLAWMETRY_NO_CLOUD=1 (1/true/yes/on, case-insensitive) or the
+    presence of ``~/.clawmetry/nocloud`` flips the daemon into local-only
+    mode. The marker file is the persistent path (survives updates and
+    daemon restarts); the env var is for one-off / containerised use.
+    """
+    env = os.environ.get("CLAWMETRY_NO_CLOUD", "").strip().lower()
+    if env in _NO_CLOUD_ENABLE_VALUES:
+        return True
+    try:
+        return os.path.isfile(NOCLOUD_MARKER_PATH)
+    except Exception:
+        return False
+
+
+def enable_cloud() -> bool:
+    """Clear the local-only marker so the daemon resumes cloud sync.
+
+    A local-only install (or `clawmetry disconnect`) writes the
+    ``~/.clawmetry/nocloud`` marker, which `is_cloud_disabled()` honours. Any
+    explicit opt-in to cloud (the dashboard "Enable Cloud Sync" CTA,
+    `clawmetry connect`) MUST call this, or the connect silently no-ops: the
+    token is written but the daemon keeps running local-only and never pushes.
+    Returns True if a marker was present and removed. Note: this does NOT
+    override the env var ``CLAWMETRY_NO_CLOUD`` (that is an explicit per-run
+    opt-out the operator set on purpose).
+    """
+    try:
+        if os.path.isfile(NOCLOUD_MARKER_PATH):
+            os.remove(NOCLOUD_MARKER_PATH)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 @dataclass
 class ClawMetryConfig:
     """
@@ -66,13 +157,13 @@ class ClawMetryConfig:
     # Runtime
     model: str = ""
     provider: str = ""
-    channels: List[str] = field(default_factory=list)
+    channels: list[str] = field(default_factory=list)
     host: str = "127.0.0.1"
     port: int = 8900
     debug: bool = False
 
     # Auth
-    auth_token: Optional[str] = None
+    auth_token: str | None = None
 
     def from_globals(self, _dashboard_module=None) -> "ClawMetryConfig":
         """

@@ -2,8 +2,9 @@
 
 Synthetic ground-truth verifiers for ClawMetry features. **Tokens** was the
 proof-of-concept (PR #1395); **approvals** is the second harness;
-**alerts** is the third, and the same shape extends to channels / crons
-next.
+**alerts** is the third; **all.py** is the meta-runner skeleton that wraps
+every sub-harness and produces ONE scoreboard. The same shape extends to
+channels / crons next.
 
 ## Why
 
@@ -38,6 +39,16 @@ threshold. Steps 1/3/4/5/6 stay identical — that's the harness shape.
 ## Running it
 
 ```bash
+# Meta-runner: shell out to every sub-harness, aggregate scoreboard.
+python3 scripts/accuracy_harness/all.py
+
+# Subset.
+python3 scripts/accuracy_harness/all.py --harnesses tokens,alerts
+
+# Smoke-test the runner without touching OpenClaw / spending LLM budget.
+python3 scripts/accuracy_harness/all.py --dry-run --no-issue
+
+# Or run individual harnesses ─────────────────────────────────────────
 # Tokens: default 3 messages, auto-detect dashboard on 8900/8903/8905
 python3 scripts/accuracy_harness/tokens.py
 
@@ -60,6 +71,79 @@ python3 scripts/accuracy_harness/tokens.py --file-issues
 python3 scripts/accuracy_harness/approvals.py --file-issues
 CLAWMETRY_HARNESS_HOOKS=1 python3 scripts/accuracy_harness/alerts.py --file-issues
 ```
+
+### Meta-runner (`all.py`)
+
+`all.py` is a thin runner: it shells out to each registered sub-harness
+(`tokens.py`, `approvals.py`, `alerts.py`) with a 180s per-harness
+timeout, parses each one's `summary: N pass / N drift` line, prints a
+single scoreboard, and exits with the worst observed status. **It does
+not re-implement any harness logic** — sub-harnesses already own
+ground-truth driving and per-endpoint assertions.
+
+| flag | meaning |
+|---|---|
+| `--harnesses tokens,approvals,alerts` | comma-separated subset (default: all registered) |
+| `--no-issue` | skip the (future) consolidated drift-issue filer |
+| `--dry-run` | short-circuit before shelling out — proves the runner skeleton without spending LLM budget. **Not passed through**: sub-harnesses don't yet support `--dry-run`. |
+
+Exit codes:
+
+| code | meaning |
+|---:|---|
+| 0 | every sub-harness PASS-ed |
+| 1 | at least one drift, no errors |
+| 2 | at least one harness errored or timed out |
+
+The consolidated GitHub-issue filer is implemented in `_lib.py`
+(`file_consolidated_issue`). When the meta detects drift or harness
+errors, it files **ONE** issue per UTC date with the
+`accuracy-meta` label, titled `[accuracy-audit YYYY-MM-DD] meta-run: N
+drifts across M harnesses`. The body includes the scoreboard, a
+reproducer command per harness, and the last 60 lines of each drifted
+harness's stdout. **Idempotent per UTC date** — re-runs EDIT today's
+issue in place rather than open a duplicate.
+
+Skip with `--no-issue` for local debugging; PASS-runs (overall exit
+code = 0) never file.
+
+### Continuous loop (closed-loop drift → fix)
+
+The intended deployment is a recurring schedule that closes the loop:
+
+```
+   ┌─────────────────────────────────────────────────────────────────┐
+   │  every N hours                                                  │
+   │   ▼                                                             │
+   │  scripts/accuracy_harness/all.py                                │
+   │   │  (drives ground truth → asserts dashboard → exit 0/1/2)     │
+   │   ▼                                                             │
+   │  drift detected → file_consolidated_issue() → GitHub issue      │
+   │   │  (label: accuracy-meta, idempotent per UTC date)            │
+   │   ▼                                                             │
+   │  cloud auto-fixer cron `trig_01XaWFNf9ZH7uWu2hxSXQAuW`          │
+   │   │  picks up open accuracy-meta issues every N hours,          │
+   │   │  reads body (scoreboard + tail + reproducer), opens a fix   │
+   │   │  PR (or comments "needs human" if it can't)                 │
+   │   ▼                                                             │
+   │  merged fix → release-on-merge → next harness run goes green    │
+   │   │  (exit 0 → no new issue filed → loop closes)                │
+   └─────────────────────────────────────────────────────────────────┘
+```
+
+Local cron / launchd example (every 6h):
+
+```cron
+0 */6 * * * cd ~/projects/clawmetry && \
+  python3 scripts/accuracy_harness/all.py >> ~/.clawmetry/meta.log 2>&1
+```
+
+Cloud cron (driven by `trig_01XaWFNf9ZH7uWu2hxSXQAuW` — the auto-fixer
+trigger we wired earlier) reads OPEN issues with the `accuracy-meta`
+label, parses the per-harness reproducer block out of the body, runs
+that reproducer, drafts a fix PR. When the fix lands and the next meta
+run goes green, the issue can be closed (manually or by the auto-fixer
+once a green run confirms the same harness now passes).
 
 ### Prerequisites
 
@@ -86,6 +170,50 @@ per full run** on opus-4-7.
 | 0 | every check passed within tolerance |
 | 1 | one or more drifts (issue filed if `--file-issues`) |
 | 2 | harness itself failed (dashboard down, no openclaw, etc.) |
+
+## CI gate (closes #1396)
+
+`.github/workflows/release-on-merge.yml` runs the meta-harness as a
+**hard gate** on every `[RELEASE]`-titled PR merge, _before_ the PyPI
+publish step. The gate is the `Accuracy meta-harness — structural gate`
+step in the `release` job, inserted between dependency-install and
+version-bump. Any non-zero exit aborts the job, so the wheel never
+builds, twine never uploads, and no GitHub release tag is created.
+
+The CI runner has no `openclaw` binary, no LLM API key, and no live
+sync daemon, so the gate runs in two **structural** modes (not live):
+
+| mode | what it catches |
+|---|---|
+| `import` every registered sub-harness (`_lib`, `tokens`, `approvals`, `alerts`) by file path | sub-harness rename / deletion, top-level `import` errors, `dataclass` field-type regressions, `all.py`'s `_lib.file_consolidated_issue` import drifting |
+| `python3 all.py --dry-run --no-issue` | `all.py` skeleton crashes, scoreboard formatting bugs, exit-code path regressions |
+| HARNESSES-registry cross-check vs. CI's expected list | `all.py` silently dropping a sub-harness (regression of #1394's silent-zero class) |
+
+The CI step writes a PASS/FAIL block to `$GITHUB_STEP_SUMMARY` so the
+PR author sees the scoreboard on the run page without expanding logs.
+
+### Why not live ground-truth runs in CI?
+
+Sub-harnesses drive REAL `openclaw agent` turns (~$0.05 of LLM spend
+per run) against a REAL sync daemon writing to DuckDB. Wiring a
+synthetic OpenClaw + daemon stub into the runner matrix is tracked
+against #1396's follow-up: once the consolidated GitHub-issue filer
+in `all.py` is wired against staging, a periodic cloud cron will run
+the full harness nightly against a real cluster and file drift issues
+with the `accuracy-meta` label. Until then, the structural gate covers
+the failure class that previously let #1394's 85K-token `cache_read`
+drift ship silently (sub-harness present in repo but never invoked).
+
+### Reproducing the gate locally
+
+```bash
+# Exactly what CI runs (no env required):
+python3 scripts/accuracy_harness/all.py --dry-run --no-issue
+```
+
+If the gate fails on your `[RELEASE]` PR, the workflow's
+`Accuracy meta-harness — structural gate` step prints the full
+stderr; re-run locally with the same command to reproduce.
 
 ## What's covered today
 
@@ -239,7 +367,8 @@ scripts/accuracy_harness/
 ├── _lib.py         # shared discovery + HTTP + drift-issue helpers
 ├── tokens.py       # tokens harness (PR #1395)
 ├── approvals.py    # approvals queue harness (PR #1397)
-└── alerts.py       # alert-rule round-trip harness (this PR)
+├── alerts.py       # alert-rule round-trip harness (PR #1399)
+└── all.py          # meta-runner skeleton — sub-runs + aggregate scoreboard
 ```
 
 Shared shims live in `_lib.py` (`discover_dashboard_url`,

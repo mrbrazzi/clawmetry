@@ -9,6 +9,7 @@ Owns the 5 routes registered on ``bp_components``:
   GET  /api/component/machine      — machine/host hardware info (CPU, GPU, load)
   GET  /api/component/gateway      — gateway routing events + stats
   GET  /api/component/brain        — LLM API call details (tokens, cost, duration)
+  GET  /api/component/mcp          — MCP server aggregates (call counts, error rates, top tools)
 
 Module-level helpers (``SESSIONS_DIR``, ``LOG_DIR``, ``_get_log_dirs``,
 ``_grep_log_file``, ``_record_heartbeat``, ``_provider_from_model``,
@@ -34,9 +35,20 @@ bp_components = Blueprint('components', __name__)
 _api_tool_cache = {}
 _api_tool_cache_time = {}
 
+# Per-MCP response cache (15s TTL) — used by api_component_mcp
+_api_mcp_cache: dict = {}
+_api_mcp_cache_time: float = 0.0
+
 
 # Map tool key to tool names in transcripts (also used by the local-store
 # fast path so the fast path stays in lock-step with the legacy parser).
+#
+# Coverage for both OpenClaw-native tool ids (``exec`` / ``web_search`` /
+# ``web_fetch``) and the claude-cli runner's canonical PascalCase ids
+# (``Bash`` / ``WebSearch`` / ``WebFetch`` / ``Grep``). The keystone E2E
+# silent-zero probe in ``scripts/accuracy_harness/keystone_e2e.py`` flags
+# any new on-the-wire tool name that isn't surfaced under one of these
+# families — keep the two in lock-step.
 _TOOL_MAP = {
     "session": [
         "sessions_spawn",
@@ -44,34 +56,73 @@ _TOOL_MAP = {
         "sessions_list",
         "sessions_poll",
     ],
-    "exec": ["exec", "process"],
-    "browser": ["browser", "web_fetch"],
-    "search": ["web_search"],
+    "exec": ["exec", "process", "Bash", "bash"],
+    "browser": ["browser", "web_fetch", "WebFetch", "webfetch"],
+    "search": ["web_search", "WebSearch", "websearch", "Grep", "grep"],
     "cron": ["cron"],
     "tts": ["tts"],
     "memory": ["Read", "read", "Write", "write", "Edit", "edit"],
 }
 
 
+def _mcp_server_from_tool_name(name: str):
+    """Return the MCP server slug from ``mcp__<server>__<tool>``, or None."""
+    parts = name.split("__", 2)
+    if len(parts) >= 3 and parts[0] == "mcp" and parts[1]:
+        return parts[1]
+    return None
+
+
 def _iter_tool_call_blocks(row: dict):
     """Yield ``(tool_name, arguments, status)`` for every tool-call block
     embedded in a DuckDB ``events`` row.
 
-    OpenClaw's transcript shape (verified 2026-05-13 against
-    ``~/.openclaw/agents/main/sessions/*.jsonl``) wraps tool calls inside
-    ``message`` events with ``message.content`` being a list of blocks.
-    A tool call is a block whose ``type`` is ``toolCall`` (current) or
-    ``tool_use`` (Anthropic-style legacy from older transcripts).
+    Three shapes are handled (silent-zero bug-class fix — see
+    ``feedback_synthetic_tests_missed_real_event_shape.md``):
+
+    1. Legacy trajectory ``message`` event — ``data.message.content[]``
+       carries ``toolCall`` (current) or ``tool_use`` (Anthropic-style
+       legacy) blocks.
+    2. v3 daemon-normalised ``model.completed`` event with the nested
+       message preserved — same ``data.message.content[]`` walk as (1).
+    3. v3 daemon-normalised ``model.completed`` event with ONLY
+       ``data.toolMetas[]`` (the post-#1135 normalised shape, where the
+       inner ``message`` block has been stripped). Each toolMeta carries
+       ``{id, name, input}``.
 
     Audit P0 #4: the previous implementation queried for
     ``event_type='tool_call'`` rows that the daemon never writes — every
     row in DuckDB has the raw OpenClaw type (``message`` / ``assistant``
-    / ``user`` / …). All 10 component-tool endpoints fell through to the
-    legacy JSONL parser as a result.
+    / ``model.completed`` / …). All 10 component-tool endpoints fell
+    through to the legacy JSONL parser as a result. Today's silent-zero
+    fix (5th instance) extends that fix to cover model.completed.
     """
     data = row.get("data") if isinstance(row, dict) else None
     if not isinstance(data, dict):
         return
+
+    # Shape 3 — v3 normalised ``toolMetas[]`` on model.completed. Surface
+    # these FIRST so installs with only-normalised events still light up.
+    tool_metas = data.get("toolMetas")
+    if isinstance(tool_metas, list):
+        for meta in tool_metas:
+            if not isinstance(meta, dict):
+                continue
+            tname = meta.get("name") or meta.get("tool") or ""
+            args = meta.get("input") or meta.get("arguments") or {}
+            if not isinstance(args, dict):
+                args = {"_raw": str(args)[:200]}
+            # toolMetas have no error flag — daemon strips it. We default
+            # to ok; if a paired tool.result event later carries
+            # is_error=true, the legacy parser's toolResult branch will
+            # surface that. Fast path keeps the simpler "ok" default.
+            if tname:
+                yield tname, args, "ok"
+
+    # Shapes 1 + 2 — both walk data.message.content[]. May coexist with
+    # toolMetas on a model.completed row; dedupe by tool name+args is
+    # left to the caller (counts are per-block, which matches the legacy
+    # parser).
     msg = data.get("message")
     if not isinstance(msg, dict):
         return
@@ -121,10 +172,33 @@ def _try_local_store_component_tool(name: str):
     # exclusive DuckDB lock (per memory `reference_duckdb_process_lock.md`),
     # forcing the call to error out → fall through to the slow JSONL
     # walker → 7s p95 the latency probe (#1287) surfaced.
+    #
+    # 2026-05-18 silent-zero bug-class fix (5th instance today): also
+    # query ``model.completed`` — the daemon-normalised v3 assistant
+    # event (per memory `reference_openclaw_v3_event_types.md`). Real
+    # user installs in the wild have 0 ``message`` rows + only
+    # ``model.completed`` rows, so the prior two-shape query silently
+    # returned an empty events[] and the caller fell through to the 8s+
+    # JSONL walker → modal stuck on "Loading...".
+    #
+    # ``subagent:assistant`` is included alongside ``message`` / ``assistant``
+    # because OpenClaw v3's sub-agent turns carry the bulk of tool_use
+    # blocks on real installs (per the keystone E2E silent-zero probe in
+    # ``scripts/accuracy_harness/keystone_e2e.py`` and memory
+    # ``feedback_synthetic_tests_missed_real_event_shape.md``). Without it,
+    # WebSearch / WebFetch / Bash / Grep invocations from sub-agents
+    # disappeared from /api/component/tool/<family> even though the
+    # daemon's ``query_tool_call_invocations`` index found them.
     rows: list = []
+    _TOOL_HOST_EVENT_TYPES = (
+        "message",
+        "assistant",
+        "model.completed",      # from #1663 — daemon-normalised v3 assistant event
+        "subagent:assistant",   # from #1682 — sub-agent tool_use blocks
+    )
     try:
         from routes.local_query import local_store_via_daemon
-        for et in ("message", "assistant"):
+        for et in _TOOL_HOST_EVENT_TYPES:
             try:
                 got = local_store_via_daemon("query_events", event_type=et, limit=2000)
                 if got:
@@ -141,7 +215,7 @@ def _try_local_store_component_tool(name: str):
         try:
             from clawmetry import local_store
             store = local_store.get_store(read_only=True)
-            for et in ("message", "assistant"):
+            for et in _TOOL_HOST_EVENT_TYPES:
                 try:
                     rows.extend(store.query_events(event_type=et, limit=2000))
                 except Exception:
@@ -272,8 +346,30 @@ def api_component_tool(name):
     today_calls = 0
     today_errors = 0
 
+    # Hard 5s wall-clock cap on the legacy JSONL walker (silent-zero
+    # bug-class fix, 2026-05-18). With a healthy DuckDB fast path the
+    # walker should never fire, but installs without the daemon — or
+    # with months of accumulated sessions/*.jsonl files — used to hang
+    # the Sessions modal for 8s+ when the fast path missed (eg
+    # model.completed-only stores before today's fix). Better to return
+    # what we have within budget than to leave the UI stuck on
+    # "Loading...".
+    _jsonl_deadline = _time.time() + 5.0
+
     if os.path.isdir(sessions_dir):
-        for fname in os.listdir(sessions_dir):
+        try:
+            _files = os.listdir(sessions_dir)
+        except OSError:
+            _files = []
+        # Bail entirely if there are too many candidate files — opening
+        # + stat-ing 500+ jsonl files in one request blows the 5s budget
+        # before any parsing happens. Return an empty shell so the UI
+        # renders "no recent activity" instead of hanging.
+        if len(_files) > 200:
+            _files = []
+        for fname in _files:
+            if _time.time() > _jsonl_deadline:
+                break  # 5s cap reached → return what we have so far
             if not fname.endswith(".jsonl"):
                 continue
             fpath = os.path.join(sessions_dir, fname)
@@ -547,10 +643,85 @@ def api_component_tool(name):
     return jsonify(result)
 
 
+def _try_local_store_component_runtime():
+    """Tier-1 DuckDB fast path for /api/component/runtime.
+
+    Reads the latest system snapshot from DuckDB (written each sync cycle by
+    the daemon). The daemon enriches the ``infra`` blob with python_version,
+    os_name, os_release, arch, node_version, openclaw_version alongside the
+    existing disk/RAM/uptime rows. Returns ``None`` to defer to the live-probe
+    fallback if the snapshot is absent or pre-dates the new infra fields.
+    """
+    try:
+        from routes.local_query import local_store_via_daemon
+        snaps = local_store_via_daemon("query_system_snapshots", kind="system", limit=1)
+        if snaps is None:
+            from clawmetry import local_store
+            store = local_store.get_store(read_only=True)
+            snaps = store.query_system_snapshots(kind="system", limit=1)
+    except Exception:
+        return None
+    if not snaps:
+        return None
+
+    snap = snaps[0]
+    infra = snap.get("infra") or {}
+    py_ver = infra.get("python_version") or ""
+    if not py_ver:
+        # Snapshot predates the infra-enrichment change — fall through to live probe.
+        return None
+
+    items = []
+    items.append({"label": "Python", "value": py_ver, "status": "ok"})
+
+    os_name = infra.get("os_name") or ""
+    os_rel = infra.get("os_release") or ""
+    if os_name:
+        items.append({"label": "OS", "value": f"{os_name} {os_rel}".strip(), "status": "ok"})
+
+    arch = infra.get("arch") or ""
+    if arch:
+        items.append({"label": "Architecture", "value": arch, "status": "ok"})
+
+    oc_ver = infra.get("openclaw_version") or ""
+    items.append({
+        "label": "OpenClaw",
+        "value": oc_ver or "unknown",
+        "status": "ok" if oc_ver else "warning",
+    })
+
+    # Disk, RAM, Uptime rows are already probed by the daemon each cycle.
+    color_map = {"green": "ok", "yellow": "warning", "red": "critical", "": "ok"}
+    label_remap = {"RAM": "Memory"}
+    for row in (snap.get("rows") or []):
+        if not (isinstance(row, list) and len(row) >= 2):
+            continue
+        label = row[0]
+        if label not in ("Disk /", "RAM", "Uptime"):
+            continue
+        status = color_map.get(row[2] if len(row) > 2 else "", "ok")
+        items.append({
+            "label": label_remap.get(label, label),
+            "value": row[1],
+            "status": status,
+        })
+
+    node_ver = infra.get("node_version") or ""
+    if node_ver:
+        items.append({"label": "Node.js", "value": node_ver, "status": "ok"})
+
+    return {"items": items, "_source": "local_store"}
+
+
 @bp_components.route("/api/component/runtime")
 def api_component_runtime():
     """Return runtime environment info."""
     import platform
+
+    if is_local_store_read_enabled():
+        fast = _try_local_store_component_runtime()
+        if fast is not None:
+            return jsonify(fast)
 
     items = []
     items.append(
@@ -871,6 +1042,207 @@ def api_component_network():
     return jsonify({"items": items})
 
 
+def _try_local_store_component_gateway(limit: int, offset: int):
+    """Tier-1 DuckDB fast path for /api/component/gateway (refs #1565).
+
+    Sources the routing-event list and the four "today_*" counters
+    (messages / heartbeats / crons / errors) from the daemon-ingested
+    ``events`` table instead of re-parsing today's ``gateway.log``.
+
+    Row → route shape mapping (real OpenClaw v3 names per
+    ``reference_openclaw_v3_event_types.md``; legacy aliases included so
+    pre-v3 / non-OpenClaw installs still light up the panel):
+
+      * ``prompt.submitted`` / ``user`` (data.role=user)  → message in
+      * ``model.completed`` / ``assistant``               → message out
+        (``message`` event whose ``data.message.role`` says ``assistant``
+        is also accepted — that's the Anthropic-SDK envelope shape the
+        daemon writes for v2 sessions.)
+      * ``cron.run.*``                                    → cron
+      * ``heartbeat.*`` / ``gateway.metric``              → heartbeat
+      * any row whose data carries ``errorCode`` / ``error``/
+        ``is_error`` / event_type endswith ``.error``    → bumps errors
+
+    Returns ``None`` (defer to legacy log parser) when the local store
+    isn't reachable, holds zero rows, or holds rows but NONE of them
+    map to a gateway-flow lane (covers the "store present for unrelated
+    agent type" case so legacy gateway.log still drives the panel).
+
+    Side-channel fields (``active_sessions``, ``config``, ``uptime``,
+    ``restarts``) come from live OS / FS state — exempt from the
+    DuckDB-first rule per ``feedback_duckdb_first_rule.md`` (live OS
+    snapshot is exempt; only historical TREND must persist).
+    """
+    # Late imports avoid pulling DuckDB / routes.sessions on Flask boot
+    # for users who never hit the gateway component panel.
+    try:
+        from routes.sessions import _ls_call  # daemon-proxy wrapper
+    except Exception:
+        return None
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    rows = _ls_call("query_events", since=today, limit=2000) or []
+    if not rows:
+        return None
+
+    # Map daemon-normalised v3 names + legacy aliases to one of the four
+    # routing categories. Unknown event_types are skipped so the panel
+    # doesn't fill with telemetry noise.
+    _MSG_IN = {"prompt.submitted", "user"}
+    _MSG_OUT = {"model.completed", "assistant"}
+    _CRON = {"cron.run.started", "cron.run.completed", "cron.run.failed"}
+    _HEARTBEAT = {"heartbeat", "heartbeat.tick", "gateway.metric"}
+
+    def _classify(et: str, data: dict):
+        """Return (route_type, stat_bucket) or (None, None) to skip."""
+        if et in _MSG_IN:
+            return "message", "today_messages"
+        if et in _MSG_OUT:
+            return "message", "today_messages"
+        if et == "message" and isinstance(data, dict):  # v3-shape-gate: allow (reason: defensive — v3 names already handled above via _MSG_IN/_MSG_OUT, this is the legacy fallback in the same classifier)
+            inner = data.get("message") if isinstance(data.get("message"), dict) else data
+            role = (inner or {}).get("role") if isinstance(inner, dict) else None
+            if role in ("user", "assistant"):
+                return "message", "today_messages"
+        if et in _CRON or et.startswith("cron."):
+            return "cron", "today_crons"
+        if et in _HEARTBEAT or et.startswith("heartbeat"):
+            return "heartbeat", "today_heartbeats"
+        return None, None
+
+    def _is_error_row(et: str, data: dict) -> bool:
+        if et.endswith(".error") or et.endswith(".failed"):
+            return True
+        if not isinstance(data, dict):
+            return False
+        for k in ("errorCode", "error", "is_error"):
+            v = data.get(k)
+            if v not in (None, False, "", 0):
+                return True
+        return False
+
+    def _extract_channel(data: dict) -> str:
+        """Pull a channel hint mirroring the legacy parser's ``from`` slot."""
+        if not isinstance(data, dict):
+            return ""
+        for key in ("channel", "messageChannel", "provider", "origin"):
+            v = data.get(key)
+            if isinstance(v, str) and v:
+                return v
+        return ""
+
+    def _extract_model(data: dict) -> str:
+        if not isinstance(data, dict):
+            return ""
+        for key in ("model", "modelId"):
+            v = data.get(key)
+            if isinstance(v, str) and v:
+                return v
+        inner = data.get("message") if isinstance(data.get("message"), dict) else None
+        if isinstance(inner, dict):
+            v = inner.get("model")
+            if isinstance(v, str) and v:
+                return v
+        return ""
+
+    routes_out: list = []
+    stats = {
+        "today_messages":   0,
+        "today_heartbeats": 0,
+        "today_crons":      0,
+        "today_errors":     0,
+    }
+
+    for r in rows:
+        ts = r.get("ts") or ""
+        if not ts.startswith(today):
+            continue
+        et = (r.get("event_type") or "").strip()
+        data = r.get("data") if isinstance(r.get("data"), dict) else {}
+        rtype, bucket = _classify(et, data)
+        if rtype is None:
+            continue
+        sid = (r.get("session_id") or "")[:12]
+        is_err = _is_error_row(et, data)
+        if is_err:
+            stats["today_errors"] += 1
+        if bucket:
+            stats[bucket] = stats.get(bucket, 0) + 1
+        # Subagent annotation matches the legacy parser's heuristic.
+        if "subagent" in sid.lower() or "subagent" in (r.get("agent_id") or "").lower():
+            rtype = "subagent"
+        routes_out.append({
+            "timestamp": ts,
+            "from":      _extract_channel(data),
+            "to":        _extract_model(data),
+            "session":   sid,
+            "type":      rtype,
+            "status":    "error" if is_err else "ok",
+        })
+
+    # If the store HAS rows but NONE were gateway-shape, defer so the
+    # legacy parser handles the gateway.log surface (non-OpenClaw agents
+    # whose events live in DuckDB without touching the gateway flow).
+    if not routes_out:
+        return None
+
+    routes_out.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+    total = len(routes_out)
+    page = routes_out[offset: offset + limit]
+
+    # --- Side-channel snapshot fields (live OS state — exempt from
+    # DuckDB-first per feedback_duckdb_first_rule.md). Best-effort; any
+    # failure leaves the field empty so the panel still renders.
+
+    import dashboard as _d
+    active_sessions = 0
+    try:
+        sess_file = os.path.join(
+            _d.SESSIONS_DIR or os.path.expanduser("~/.openclaw/agents/main/sessions"),
+            "sessions.json",
+        )
+        with open(sess_file) as f:
+            sess_data = json.load(f)
+        now_ts = time.time() * 1000
+        for sid, sinfo in sess_data.items():
+            updated = sinfo.get("updatedAt", 0)
+            if now_ts - updated < 3600_000:
+                active_sessions += 1
+    except Exception:
+        pass
+
+    config_summary: dict = {}
+    for cf in (
+        os.path.expanduser("~/.clawdbot/openclaw.json"),
+        os.path.expanduser("~/.openclaw/openclaw.json"),
+    ):
+        try:
+            with open(cf) as f:
+                cfg = json.load(f)
+            plugins = cfg.get("plugins", {}).get("entries", {})
+            config_summary["channels"] = [k for k, v in plugins.items() if v.get("enabled")]
+            ad = cfg.get("agents", {}).get("defaults", {})
+            config_summary["max_concurrent"] = ad.get("maxConcurrent", "?")
+            config_summary["max_subagents"] = ad.get("subagents", {}).get("maxConcurrent", "?")
+            config_summary["heartbeat"] = ad.get("heartbeat", {}).get("every", "?")
+            config_summary["workspace"] = ad.get("workspace", "?")
+            break
+        except Exception:
+            continue
+
+    stats["active_sessions"] = active_sessions
+    stats["config"]          = config_summary
+    stats["uptime"]          = ""       # filled by legacy path; snapshot-only here
+    stats["restarts"]        = []       # ditto
+
+    return {
+        "routes":  page,
+        "stats":   stats,
+        "total":   total,
+        "_source": "local_store",
+    }
+
+
 @bp_components.route("/api/component/gateway")
 def api_component_gateway():
     """Parse gateway routing events from today's log file.
@@ -880,16 +1252,39 @@ def api_component_gateway():
       2. Current rolling plain-text: gateway.log (OpenClaw 2026.4+)
          Format: "ISO-TS [tag] message", e.g.
            2026-04-15T09:36:55.977+02:00 [ws] ⇄ res ✗ cron.list 0ms errorCode=...
+
+    Tier-1 DuckDB fast path (refs #1565): when
+    ``CLAWMETRY_LOCAL_STORE_READ=1`` and the daemon-ingested ``events``
+    table holds rows that map to a gateway-flow lane, serve the panel
+    from DuckDB instead of re-parsing today's gateway.log. Falls through
+    to the legacy parser on empty store / unreachable daemon / any
+    error — never crashes the panel.
     """
     import dashboard as _d
     import re
 
     limit = int(request.args.get("limit", 50))
     offset = int(request.args.get("offset", 0))
+
+    if is_local_store_read_enabled():
+        try:
+            fast = _try_local_store_component_gateway(limit, offset)
+        except Exception:
+            fast = None
+        if fast is not None:
+            return jsonify(fast)
     today = datetime.now().strftime("%Y-%m-%d")
     log_dirs = [d for d in [_d.LOG_DIR, *_d._get_log_dirs()] if d]
     log_dirs = list(dict.fromkeys(log_dirs))
     candidates = []
+    # Robust resolver first — prefers ~/.openclaw/logs/gateway.log, else the
+    # newest /tmp/openclaw/openclaw-*.log (OpenClaw 2026.5.28+ writes here,
+    # NOT ~/.openclaw/logs/). Shared with routes/infra.py so both surfaces
+    # agree on which file is the live gateway log.
+    from routes.infra import resolve_gateway_log_path  # late import
+    resolved = resolve_gateway_log_path()
+    if resolved:
+        candidates.append(resolved)
     for d in log_dirs:
         candidates.extend([
             os.path.join(d, f"openclaw-{today}.log"),
@@ -910,7 +1305,73 @@ def api_component_gateway():
     if not log_path:
         return jsonify({"routes": [], "stats": stats, "total": 0})
 
+    # Detect format by content, not just filename. Three shapes exist:
+    #   * plaintext "ISO-TS [tag] message"   (some 2026.4+ gateway.log builds)
+    #   * structured JSON, one object/line   (OpenClaw 2026.5.28+, the new
+    #       default at /tmp/openclaw/openclaw-YYYY-MM-DD.log)
+    #   * legacy JSON-per-line               (older openclaw-{today}.log)
+    # The 2026.5.28 JSON object reconstructs the OLD plaintext body in its
+    # `message` field and carries the subsystem inside `["0"]` as a JSON
+    # string (e.g. '{"subsystem":"gateway/ws"}'); the last path segment ("ws")
+    # is the tag the plaintext parser already understands. We sniff the first
+    # non-empty line and pick a branch.
     is_plaintext = os.path.basename(log_path) == "gateway.log"
+    is_structured_json = False
+    if not is_plaintext:
+        try:
+            with open(log_path, "r") as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if not _line:
+                        continue
+                    if re.match(r"^\d{4}-\d{2}-\d{2}T[\d:.+\-]+\s+\[", _line):
+                        is_plaintext = True
+                    elif _line.startswith("{"):
+                        try:
+                            _o = json.loads(_line)
+                        except (ValueError, TypeError):
+                            _o = None
+                        # 2026.5.28 lines carry a top-level "message" key AND
+                        # "time"; the legacy JSON schema keyed routing off "1"
+                        # ("embedded run start:", "Delivery failed", …) with no
+                        # standalone "message". Prefer the structured branch
+                        # only when "message" + "time" are present so we don't
+                        # hijack the legacy parser below.
+                        if isinstance(_o, dict) and "message" in _o and "time" in _o:
+                            is_structured_json = True
+                    break
+        except Exception:
+            pass
+
+    def _reconstruct_structured_line(o):
+        """Reconstruct the legacy plaintext "TS [tag] body" line from a
+        2026.5.28 structured-JSON log object so the existing
+        ``_parse_plaintext_line`` categorizer can be reused verbatim.
+
+        Returns the reconstructed string, or ``None`` when the object lacks a
+        usable timestamp / body (caller skips it). Never raises.
+        """
+        try:
+            ts = o.get("time") or ""
+            body = o.get("message", "") or ""
+            if not ts or not body:
+                return None
+            # Subsystem lives in o["0"] as a JSON string like
+            # '{"subsystem":"gateway/ws"}'. Decode it and take the last path
+            # segment ("gateway/ws" -> "ws") as the tag. Fall back to
+            # "gateway" when "0" is a plain string (e.g. fatal error lines).
+            tag = "gateway"
+            zero = o.get("0")
+            if isinstance(zero, str) and zero.startswith("{"):
+                try:
+                    sub = json.loads(zero).get("subsystem") or ""
+                    if sub:
+                        tag = sub.rsplit("/", 1)[-1]
+                except (ValueError, TypeError):
+                    pass
+            return f"{ts} [{tag}] {body}"
+        except Exception:
+            return None
 
     def _parse_plaintext_line(line):
         """Parse one '[TS] [tag] message' line from gateway.log.
@@ -978,6 +1439,24 @@ def api_component_gateway():
                 # Plain-text branch for OpenClaw 2026.4+ rolling gateway.log
                 if is_plaintext:
                     route, cat = _parse_plaintext_line(line)
+                    if route is not None:
+                        if cat:
+                            stats[cat] = stats.get(cat, 0) + 1
+                        routes.append(route)
+                    continue
+                # Structured-JSON branch for OpenClaw 2026.5.28+. Reconstruct
+                # the legacy "TS [tag] body" line and reuse the plaintext
+                # categorizer so res ✓/✗, connected, crons, heartbeats and
+                # the `today` date filter all behave identically.
+                if is_structured_json:
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    recon = _reconstruct_structured_line(obj)
+                    if not recon:
+                        continue
+                    route, cat = _parse_plaintext_line(recon)
                     if route is not None:
                         if cat:
                             stats[cat] = stats.get(cat, 0) + 1
@@ -1373,7 +1852,7 @@ def api_component_brain():
 
                         if obj.get("type") != "message":
                             # Track user message timestamps for duration calc
-                            if obj.get("type") == "message" or (
+                            if obj.get("type") == "message" or (  # v3-shape-gate: allow (reason: JSONL on-disk walker; iterates per-line obj from .jsonl file)
                                 isinstance(obj.get("message"), dict)
                                 and obj["message"].get("role") == "user"
                             ):
@@ -1533,3 +2012,127 @@ def api_component_brain():
         "total": total,
     }
     return jsonify(result)
+
+
+def _try_local_store_component_mcp():
+    """DuckDB fast path for /api/component/mcp.
+
+    Walks the same event shapes as _try_local_store_component_tool, extracts
+    every tool call whose name matches ``mcp__<server>__<tool>``, and groups
+    them by server: call count, error count, error_rate, top-5 tools, last_seen.
+
+    Returns None on any unexpected failure so the caller can surface an empty
+    response rather than 500-ing.
+    """
+    from collections import defaultdict
+
+    _HOST_EVENT_TYPES = (
+        "message",
+        "assistant",
+        "model.completed",
+        "subagent:assistant",
+    )
+    rows: list = []
+    try:
+        from routes.local_query import local_store_via_daemon
+        for et in _HOST_EVENT_TYPES:
+            try:
+                got = local_store_via_daemon("query_events", event_type=et, limit=2000)
+                if got:
+                    rows.extend(got)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    if not rows:
+        try:
+            from clawmetry import local_store
+            store = local_store.get_store(read_only=True)
+            for et in _HOST_EVENT_TYPES:
+                try:
+                    rows.extend(store.query_events(event_type=et, limit=2000))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    server_calls: dict = defaultdict(int)
+    server_errors: dict = defaultdict(int)
+    server_tools: dict = defaultdict(lambda: defaultdict(int))
+    server_tool_errors: dict = defaultdict(lambda: defaultdict(int))
+    server_last_seen: dict = {}
+
+    for r in rows:
+        ts = r.get("ts") or ""
+        for tool_name, _args, status in _iter_tool_call_blocks(r):
+            server = _mcp_server_from_tool_name(tool_name)
+            if server is None:
+                continue
+            bare_tool = tool_name.split("__", 2)[2] if tool_name.count("__") >= 2 else tool_name
+            server_calls[server] += 1
+            server_tools[server][bare_tool] += 1
+            if status == "error":
+                server_errors[server] += 1
+                server_tool_errors[server][bare_tool] += 1
+            if ts and (server not in server_last_seen or ts > server_last_seen[server]):
+                server_last_seen[server] = ts
+
+    servers = []
+    for server in sorted(server_calls.keys()):
+        calls = server_calls[server]
+        errors = server_errors[server]
+        tools_sorted = sorted(
+            server_tools[server].items(), key=lambda x: x[1], reverse=True
+        )
+        top_tools = [
+            {
+                "tool": tool,
+                "calls": cnt,
+                "errors": server_tool_errors[server].get(tool, 0),
+            }
+            for tool, cnt in tools_sorted[:5]
+        ]
+        servers.append({
+            "server": server,
+            "calls": calls,
+            "errors": errors,
+            "error_rate": round(errors / calls, 3) if calls else 0.0,
+            "top_tools": top_tools,
+            "last_seen": server_last_seen.get(server, ""),
+        })
+    servers.sort(key=lambda s: s["calls"], reverse=True)
+
+    return {
+        "servers": servers,
+        "total_calls": sum(server_calls.values()),
+        "total_errors": sum(server_errors.values()),
+        "_source": "local_store",
+    }
+
+
+@bp_components.route("/api/component/mcp")
+def api_component_mcp():
+    """Aggregate MCP server usage across all recorded events. Cached 15s."""
+    global _api_mcp_cache_time
+    now = time.time()
+    if _api_mcp_cache and (now - _api_mcp_cache_time) < 15:
+        return jsonify(_api_mcp_cache)
+
+    if is_local_store_read_enabled():
+        try:
+            result = _try_local_store_component_mcp()
+            if result is not None:
+                _api_mcp_cache.clear()
+                _api_mcp_cache.update(result)
+                _api_mcp_cache_time = now
+                return jsonify(result)
+        except Exception:
+            pass
+
+    return jsonify({
+        "servers": [],
+        "total_calls": 0,
+        "total_errors": 0,
+        "_source": "unavailable",
+    })

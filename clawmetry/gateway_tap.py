@@ -48,9 +48,11 @@ Failure modes
 Disable
 -------
 
-Set ``CLAWMETRY_ENABLE_WS_TAP=1`` in the environment to opt in.
-Default is OFF until the upstream OpenClaw server grants the
-required ``operator.read`` scope.
+Default is ON. Set ``CLAWMETRY_ENABLE_WS_TAP=0`` in the environment to
+opt out. When the upstream OpenClaw server has not yet granted the
+required ``operator.read`` scope the tap connects in degraded mode
+(no message bodies, one WARNING logged) — same observable behaviour as
+when the tap is disabled, but future scope grants start working immediately.
 """
 
 from __future__ import annotations
@@ -107,7 +109,7 @@ _BACKOFF_INITIAL_SEC = 2.0
 _BACKOFF_MAX_SEC = 60.0
 
 
-# Enable env var (feature is default-OFF until upstream grants scopes).
+# Opt-out env var (feature is default-ON; set to "0"/"false"/"no" to disable).
 _ENABLE_ENV = "CLAWMETRY_ENABLE_WS_TAP"
 
 
@@ -121,14 +123,21 @@ _ENABLE_ENV = "CLAWMETRY_ENABLE_WS_TAP"
 # Required: provider, ts. Everything else is best-effort with a sane
 # default. Returning ``None`` skips the frame entirely.
 def _normalize_frame(frame: dict) -> dict | None:
-    """Project a gateway WS event frame into a (events, channel_messages)
-    tuple-shaped dict, or ``None`` if the frame is not a chat message.
+    """Project a gateway WS event frame into a ``channel_messages`` row
+    dict, or ``None`` if the frame is not a chat message.
 
     The gateway's own per-channel event names vary
     (``sessions.message``, ``telegram.inbound``, ``channel.message``,
     …). We accept any frame whose ``payload`` carries enough fields to
     pin a channel + a timestamp. Heartbeats / health / status frames
     fall through to ``None`` and the caller drops them.
+
+    The returned dict is passed straight to
+    ``LocalStore.ingest_channel_event`` (issue #1220) which fans it
+    onto BOTH the ``channel_messages`` and ``events`` tables in a
+    single chokepoint — earlier versions of this module hand-rolled
+    a parallel ``events`` row here, which drifted out of contract
+    every time the projection logic was touched.
     """
     if not isinstance(frame, dict):
         return None
@@ -267,26 +276,7 @@ def _normalize_frame(frame: dict) -> dict | None:
         or sender_block.get("name")
     )
 
-    events_row = {
-        "id": eid,
-        "agent_id": "main",
-        "event_type": f"channel.{direction}",
-        "ts": ts,
-        "session_id": None,
-        "workspace_id": None,
-        # Tag the frame's source so brain filters can split WS-tap rows
-        # from log-parser rows when debugging. Stays inside `data` so
-        # it doesn't bloat the events schema.
-        "data": {
-            **payload,
-            "_clawmetry_source": f"channel:{provider}:{direction}",
-            "_clawmetry_event": event_name,
-        },
-        "cost_usd": None,
-        "token_count": None,
-        "model": None,
-    }
-    channel_row = {
+    return {
         "id": eid,
         "agent_id": "main",
         "provider": provider,
@@ -297,13 +287,17 @@ def _normalize_frame(frame: dict) -> dict | None:
         "ts": ts,
         "direction": direction,
         "session_key": payload.get("session_id") or payload.get("session_key"),
+        # raw_blob preserves the full payload + WS-tap source
+        # breadcrumbs. ``ingest_channel_event`` flattens it into the
+        # events-table ``data`` blob so brain filters can split WS-tap
+        # rows from log-parser rows when debugging without us having
+        # to maintain two parallel projections.
         "raw_blob": {
             **payload,
             "_clawmetry_source": "gateway.ws",
             "_clawmetry_event": event_name,
         },
     }
-    return {"events": events_row, "channel": channel_row}
 
 
 # ── The tap loop ────────────────────────────────────────────────────────
@@ -409,8 +403,9 @@ class GatewayTap:
         ).rstrip("/")
         if not ws_url:
             raise RuntimeError("empty gateway URL")
-        if not self.token:
-            raise RuntimeError("missing gateway token")
+        # NOTE: a no-auth gateway (gateway.auth.mode = "none") has no token
+        # and still accepts connections — do NOT abort here. The connect
+        # frame below omits the `auth` block when there's no token.
 
         ws = websocket.create_connection(f"{ws_url}/", timeout=10)
         ws.settimeout(30)
@@ -424,26 +419,34 @@ class GatewayTap:
             pass
         ws.settimeout(30)
 
-        # Connect handshake.
+        # Connect handshake. Negotiate the widest protocol range we know
+        # (3..4): older gateways speak only 3, OpenClaw 2026.5.28+ requires
+        # 4 — sending a 3..3 window makes the newer gateway reject the
+        # handshake with `protocol-mismatch`.
         cid = f"clawmetry-tap-{uuid.uuid4().hex[:8]}"
+        connect_params = {
+            "minProtocol": 3,
+            "maxProtocol": 4,
+            "client": {
+                "id": "cli",
+                "version": "clawmetry-ws-tap",
+                "platform": "python",
+                "mode": "cli",
+                "instanceId": cid,
+            },
+            "role": "operator",
+            "scopes": ["operator.admin", "operator.read"],
+        }
+        # Only send `auth` when we actually have a token — a no-auth
+        # gateway (auth.mode = "none") rejects/ignores an empty token block,
+        # and we must never claim credentials we don't have.
+        if self.token:
+            connect_params["auth"] = {"token": self.token}
         connect_msg = {
             "type": "req",
             "id": cid,
             "method": "connect",
-            "params": {
-                "minProtocol": 3,
-                "maxProtocol": 3,
-                "client": {
-                    "id": "cli",
-                    "version": "clawmetry-ws-tap",
-                    "platform": "python",
-                    "mode": "cli",
-                    "instanceId": cid,
-                },
-                "role": "operator",
-                "scopes": ["operator.admin", "operator.read"],
-                "auth": {"token": self.token},
-            },
+            "params": connect_params,
         }
         ws.send(json.dumps(connect_msg))
 
@@ -553,25 +556,24 @@ class GatewayTap:
             except Exception:
                 pass
 
-        norm = _normalize_frame(frame)
-        if norm is None:
+        channel_msg = _normalize_frame(frame)
+        if channel_msg is None:
             return
 
-        # Stamp node_id + agent_type onto the events row so the
-        # multi-node fleet view can filter correctly.
-        events_row = norm["events"]
-        events_row["node_id"] = self.node_id
-        events_row["agent_type"] = "openclaw"
-
+        # Issue #1220: single chokepoint writes channel_messages +
+        # events atomically. The previous version of this method
+        # called ingest_many() for the events projection and
+        # ingest_channel_message() for the per-channel row — the two
+        # writers drifted out of contract every time the projection
+        # logic was touched on one side and not the other (the
+        # original P0 #1212 bug).
         try:
-            self.store.ingest_many([events_row])
-        except Exception as e:  # noqa: BLE001
-            log.debug("gateway WS tap: events ingest skipped (%s)", e)
-        try:
-            self.store.ingest_channel_message(norm["channel"])
+            self.store.ingest_channel_event(
+                channel_msg, node_id=self.node_id,
+            )
             self.rows_written += 1
         except Exception as e:  # noqa: BLE001
-            log.debug("gateway WS tap: channel_message skipped (%s)", e)
+            log.debug("gateway WS tap: channel_event ingest skipped (%s)", e)
 
 
 # ── Daemon entry point ──────────────────────────────────────────────────
@@ -586,8 +588,9 @@ def start(config: dict) -> GatewayTap | None:
     from the live OpenClaw config (mirroring dashboard's
     ``_detect_gateway_token`` / ``_detect_gateway_port``).
     """
-    if os.environ.get(_ENABLE_ENV, "").strip() not in ("1", "true", "yes"):
-        log.debug("gateway WS tap disabled (set CLAWMETRY_ENABLE_WS_TAP=1 to enable)")
+    if os.environ.get(_ENABLE_ENV, "1").strip().lower() in ("0", "false", "no"):
+        log.debug("gateway WS tap disabled (CLAWMETRY_ENABLE_WS_TAP=%s)",
+                  os.environ.get(_ENABLE_ENV, "1"))
         return None
 
     url, token = _detect_gateway_endpoint()

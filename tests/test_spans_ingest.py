@@ -78,27 +78,31 @@ def _span(**overrides):
 # ── schema / migration ──────────────────────────────────────────────────────
 
 
-def test_schema_version_bumped_to_6(store):
-    """SCHEMA_VERSION must be exactly 6 — issue #1007 bumps 5 → 6
-    (on top of v5 = bootstrap_archive + cron_runs from #1158 / #1160).
+def test_schema_version_stamped_and_idempotent(store):
+    """The current SCHEMA_VERSION must be stamped and re-running
+    _migrate() must not double-stamp.
 
-    Guards against a concurrent migration silently re-bumping us past 6
-    without updating callers / cloud relay that pin schema-aware reads."""
+    Original assertion hardcoded == 6 (#1007); it silently drifted as
+    #1232/#1234/#1626 each bumped the constant without test updates
+    (#1627). Read from the module constant so this assertion auto-
+    tracks future bumps."""
     import clawmetry.local_store as ls
-    assert ls.SCHEMA_VERSION == 6
+    expected = ls.SCHEMA_VERSION
     # And exactly one row stamped — re-running _migrate is idempotent.
     rows = store._fetch(
         "SELECT version FROM schema_version ORDER BY version", []
     )
     versions = [r[0] for r in rows]
-    assert 6 in versions
-    # Re-invoke migrate; the version 6 row must NOT double-up.
+    assert expected in versions
+    # Re-invoke migrate; the current-version row must NOT double-up.
     store._migrate()
     rows2 = store._fetch(
         "SELECT version, COUNT(*) FROM schema_version GROUP BY version", []
     )
     counts = {v: c for v, c in rows2}
-    assert counts.get(6, 0) == 1, f"schema_version row for v6 duplicated: {counts}"
+    assert counts.get(expected, 0) == 1, (
+        f"schema_version row for v{expected} duplicated: {counts}"
+    )
 
 
 def test_spans_table_exists(store):
@@ -332,6 +336,106 @@ def test_otlp_traces_write_through_persists_span(store, monkeypatch):
     assert row["start_ts"] == pytest.approx(1_715_000_000.0)
     assert row["end_ts"] == pytest.approx(1_715_000_001.5)
     assert row["duration_ms"] == pytest.approx(1500.0, abs=1.0)
+
+
+@pytest.mark.skipif(not _HAS_OTEL_PROTO,
+                    reason="opentelemetry-proto not installed (pip install clawmetry[otel])")
+def test_otlp_genai_semconv_v137_mlflow_shape(store, monkeypatch):
+    """Spans in the current OTel GenAI semantic conventions (v1.37) — the shape
+    MLflow's @mlflow/mlflow-openclaw plugin emits — must populate the typed
+    columns. These keys (gen_ai.tool.name, gen_ai.conversation.id,
+    gen_ai.agent.id, gen_ai.provider.name) were NOT mapped before, so an
+    MLflow/OTel tool or sub-agent span landed with empty session/tool/agent."""
+    import dashboard as _d
+    import clawmetry.local_store as ls
+    monkeypatch.setattr(_d, "_HAS_OTEL_PROTO", True, raising=False)
+    monkeypatch.setattr(_d, "trace_service_pb2", trace_service_pb2, raising=False)
+
+    trace_id_hex = "11112222333344445555666677778888"
+    chat_id = "aaaa000000000001"
+    tool_id = "aaaa000000000002"
+    pb = _build_export_request([
+        {   # invoke_agent → chat span (LLM call), token-only, NO cost attr
+            "trace_id": trace_id_hex,
+            "span_id":  chat_id,
+            "name":     "chat claude-opus-4-7",
+            "start_ns": 1_715_000_000_000_000_000,
+            "end_ns":   1_715_000_001_000_000_000,
+            "attributes": {
+                "gen_ai.operation.name": "chat",
+                "gen_ai.provider.name": "anthropic",
+                "gen_ai.request.model": "claude-opus-4-7",
+                "gen_ai.conversation.id": "conv-mlflow-1",
+                "gen_ai.agent.id": "researcher",
+                "gen_ai.usage.input_tokens": 1000,
+                "gen_ai.usage.output_tokens": 200,
+            },
+        },
+        {   # execute_tool span — semconv uses gen_ai.tool.name
+            "trace_id": trace_id_hex,
+            "span_id":  tool_id,
+            "parent_span_id": chat_id,
+            "name":     "execute_tool bash",
+            "start_ns": 1_715_000_000_200_000_000,
+            "end_ns":   1_715_000_000_400_000_000,
+            "attributes": {
+                "gen_ai.operation.name": "execute_tool",
+                "gen_ai.tool.name": "bash",
+                "gen_ai.conversation.id": "conv-mlflow-1",
+            },
+        },
+    ])
+
+    _d._process_otlp_traces(pb)
+    rows = {r["span_id"]: r for r in ls.get_store().query_spans(trace_id=trace_id_hex)}
+    assert set(rows) == {chat_id, tool_id}
+
+    chat = rows[chat_id]
+    assert chat["model"] == "claude-opus-4-7"
+    assert chat["session_id"] == "conv-mlflow-1"      # gen_ai.conversation.id
+    assert chat["agent_id"] == "researcher"            # gen_ai.agent.id
+    assert chat["tokens_input"] == 1000
+    assert chat["tokens_output"] == 200
+    # Cost is NOT an OTel-standard attribute — must be derived from tokens.
+    from clawmetry.providers_pricing import estimate_event_cost_usd
+    expected = estimate_event_cost_usd("claude-opus-4-7", input_tokens=1000,
+                                       output_tokens=200, provider="anthropic")
+    assert expected > 0, "fixture pricing assumption broke"
+    assert chat["cost_usd"] == pytest.approx(expected)
+
+    tool = rows[tool_id]
+    assert tool["tool_name"] == "bash"                 # gen_ai.tool.name
+    assert tool["session_id"] == "conv-mlflow-1"
+    assert tool["parent_span_id"] == chat_id
+
+
+@pytest.mark.skipif(not _HAS_OTEL_PROTO,
+                    reason="opentelemetry-proto not installed (pip install clawmetry[otel])")
+def test_otlp_explicit_cost_is_not_overridden(store, monkeypatch):
+    """When the exporter DID ship a cost, we keep it verbatim and never
+    re-derive (an explicit 0 for a local model must survive)."""
+    import dashboard as _d
+    import clawmetry.local_store as ls
+    monkeypatch.setattr(_d, "_HAS_OTEL_PROTO", True, raising=False)
+    monkeypatch.setattr(_d, "trace_service_pb2", trace_service_pb2, raising=False)
+
+    trace_id_hex = "99998888777766665555444433332222"
+    pb = _build_export_request([{
+        "trace_id": trace_id_hex,
+        "span_id":  "cccc000000000001",
+        "name":     "chat",
+        "start_ns": 1_715_000_000_000_000_000,
+        "end_ns":   1_715_000_000_500_000_000,
+        "attributes": {
+            "gen_ai.request.model": "claude-opus-4-7",
+            "gen_ai.usage.input_tokens": 1000,
+            "gen_ai.usage.output_tokens": 200,
+            "gen_ai.usage.cost_usd": 0.0,   # explicit zero must win
+        },
+    }])
+    _d._process_otlp_traces(pb)
+    row = ls.get_store().query_spans(trace_id=trace_id_hex)[0]
+    assert row["cost_usd"] == pytest.approx(0.0)
 
 
 @pytest.mark.skipif(not _HAS_OTEL_PROTO,

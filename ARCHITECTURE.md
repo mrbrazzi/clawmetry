@@ -28,6 +28,68 @@
 
 ClawMetry is a **read-only observer** that sits alongside your OpenClaw gateway. It never modifies your agents or their data. It reads what OpenClaw already writes to disk and connects to the gateway's WebSocket API for real-time updates.
 
+## Architecture diagrams (C4 model)
+
+Two views of the open-source app. (Mermaid renders on GitHub.) The optional ClawMetry Cloud is shown as a single opaque box: the daemon only ever sends it an end-to-end-encrypted snapshot, which your browser decrypts locally.
+
+### C1: System context
+
+```mermaid
+C4Context
+title C1: ClawMetry (open source) system context
+
+Person(dev, "Developer / Operator", "Runs AI agents; wants to see what they do and what they cost")
+System(clawmetry, "ClawMetry", "Local-first, real-time observability for 12 agent runtimes. Reads what your agents already write; never modifies them.")
+
+System_Ext(runtimes, "AI Agent Runtimes", "OpenClaw + NVIDIA NemoClaw (free in OSS) and, with the optional Pro plugin, Claude Code, Codex, Cursor, Goose, Hermes, Aider, NanoClaw, opencode, PicoClaw, Qwen Code")
+System_Ext(gateway, "OpenClaw Gateway", "WebSocket control plane (JSON-RPC, :18789) for live data + cron RPC")
+System_Ext(llm, "LLM Provider APIs", "Anthropic / OpenAI / Google / OpenRouter ... (the spend ClawMetry meters)")
+System_Ext(cloud, "ClawMetry Cloud (optional)", "Receives an E2E-encrypted snapshot for remote viewing; decrypted in your browser")
+
+Rel(dev, clawmetry, "Installs (pip), watches the local dashboard :8900")
+Rel(clawmetry, runtimes, "Observes (read-only): session files, gateway, OTLP")
+Rel(clawmetry, gateway, "Taps live events + cron RPC", "WebSocket :18789")
+Rel(clawmetry, llm, "Meters cost (interceptor) / optional enforcement proxy")
+Rel(clawmetry, cloud, "Optional: pushes E2E-encrypted snapshot", "HTTPS")
+```
+
+### C2: Containers (open source)
+
+```mermaid
+C4Container
+title C2: ClawMetry (open source) containers
+
+Person(dev, "Developer / Operator", "")
+System_Ext(runtimes, "AI Agent Runtimes", "session files / OTLP")
+System_Ext(gateway, "OpenClaw Gateway", "WS :18789")
+System_Ext(llm, "LLM Provider APIs", "")
+System_Ext(cloud, "ClawMetry Cloud (optional)", "E2E snapshot target; browser decrypts")
+
+System_Boundary(machine, "Your machine") {
+    Container(cli, "clawmetry CLI", "Python (cli.py)", "Entry point: clawmetry / connect / sync / status")
+    Container(daemon, "Sync Daemon", "Python (sync.py)", "Ingests filesystem + gateway + OTLP into DuckDB; owns the writer lock; builds the E2E-encrypted snapshot")
+    ContainerDb(duck, "Local Store", "DuckDB (local_store.py)", "Single data layer; capped threads + TTL-cached rollups (light CPU)")
+    Container(lqs, "Local Query Server", "Python (local_server.py)", "Localhost /__local_query__/* so the dashboard reads DuckDB without the writer lock")
+    Container(dash, "Dashboard", "Flask + waitress :8900", "UI + REST API; per-feature route blueprints; embedded frontend (static/ + templates/)")
+    Container(proxy, "Enforcement Proxy", "Python :4100 (proxy.py)", "Optional: budget limits, loop detection, model routing")
+    Container(intercept, "Cost Interceptor", "Python (interceptor.py)", "Zero-config httpx/requests patch for LLM token/cost")
+    Container(pro, "Pro Adapters", "Optional plugin (clawmetry-pro)", "Closed-source; adds the paid runtime adapters via the clawmetry.extensions entry point")
+}
+
+Rel(dev, cli, "runs")
+Rel(cli, daemon, "starts")
+Rel(cli, dash, "starts")
+Rel(runtimes, daemon, "session files / logs", "filesystem")
+Rel(gateway, daemon, "live events + crons", "WS :18789")
+Rel(daemon, duck, "writes (writer lock)")
+Rel(pro, daemon, "adds runtime adapters")
+Rel(dash, lqs, "reads", "HTTP localhost")
+Rel(lqs, duck, "reads")
+Rel(intercept, llm, "observes calls")
+Rel(proxy, llm, "gates / routes calls")
+Rel(daemon, cloud, "E2E snapshot push", "HTTPS")
+```
+
 ## Claude Code as a Second Data Source
 
 ClawMetry also supports **Claude Code** (`~/.claude/projects/`) as a data source via a dedicated dashboard (`dashboard_claudecode.py`). Claude Code stores session transcripts as JSONL files with a similar schema to OpenClaw sessions.
@@ -209,7 +271,7 @@ Secured with `CLAWMETRY_FLEET_KEY` — nodes must provide the API key to registe
 ## Technical Details
 
 ### Modular Blueprint Architecture
-ClawMetry is a Flask app organised as a small core (`dashboard.py`, ~15,000 lines) plus a `routes/` package of feature-scoped Blueprints (sessions, channels, components, usage, health, brain, infra, overview, crons, meta, alerts, fleet_history, nemoclaw). Shared helpers and the embedded HTML/CSS/JS templates still live in `dashboard.py`; route handlers reach them via a late `import dashboard as _d`.
+ClawMetry is a Flask app organised as a small core (`dashboard.py`, ~19,000 lines) plus a `routes/` package of feature-scoped Blueprints (sessions, channels, components, usage, health, brain, infra, overview, crons, meta, alerts, fleet_history, nemoclaw). Shared helpers live in `dashboard.py`; the live UI is served from `clawmetry/static/` + `clawmetry/templates/`. Route handlers reach shared helpers via a late `import dashboard as _d`.
 
 This layout keeps the install story simple while letting each feature evolve in its own module:
 - Easy to install (`pip install clawmetry`)
@@ -217,12 +279,28 @@ This layout keeps the install story simple while letting each feature evolve in 
 - Easy to deploy (pure-Python, no build step)
 - Portable (runs on a Raspberry Pi)
 
-The HTML/CSS/JS dashboard is embedded as template strings inside `dashboard.py`.
+The HTML/CSS/JS dashboard is served from `clawmetry/static/css/dashboard.css`, `clawmetry/static/js/app.js`, and `clawmetry/templates/tabs/*.html` — not embedded inline in `dashboard.py`.
+
+### Event Data Source Contract
+OSS API routes that serve event-derived dashboard data must tag their JSON
+response with `_source: "local_store"`. This proves the endpoint used the
+local DuckDB store instead of silently falling back to gateway, JSONL, OTLP, or
+cloud-only paths.
+
+`routes/__init__.py` provides two route markers for this contract:
+- `@event_data` marks new event-derived endpoints for the source canary.
+- `@source_exempt(reason="...")` documents intentional exceptions such as
+  gateway pass-throughs or OTLP receivers.
+
+`tests/test_oss_routes_source_canary.py` walks Flask's registered URL map,
+builds canary URLs from endpoint names, and fails with guidance when an
+event-data response omits `_source` or reports anything other than
+`local_store`.
 
 ### Dependencies
 Minimal by design:
 - **Flask** — Web server
-- **No database** — reads OpenClaw's files directly
+- **DuckDB** — local store; the sync daemon ingests all events and owns the writer lock; the dashboard reads through the daemon proxy (`/__local_query__/`)
 - **Optional**: `opentelemetry-proto` for OTLP support
 - **Optional**: `history.py` for time-series storage (SQLite-based)
 
@@ -232,6 +310,22 @@ An optional companion that adds persistent time-series:
 - Enables historical charts (token usage over days/weeks)
 - Session history with cost trends
 - Cron execution history
+
+### LocalStore Durability Contract
+
+`clawmetry/local_store.py` provides the write-side durability guarantee for the sync daemon.
+
+**Ring-buffer → flush → WAL model**:
+1. `LocalStore.ingest(event)` appends the event to an in-memory `deque` (ring buffer, max 10 000 slots).
+2. When the ring reaches `FLUSH_BATCH` entries (default 1 000) **or** the background flusher timer fires (every 2 s), `_flush_now_locked()` writes the batch to DuckDB inside an explicit `BEGIN / COMMIT` transaction.
+3. DuckDB writes the commit to its WAL synchronously before returning. The data is durable: even a `SIGKILL` immediately after `COMMIT` will not lose the row.
+
+**Crash and replay**:
+- Events **in the ring buffer at crash time** (not yet flushed) are lost from DuckDB's perspective.
+- The daemon source (JSONL transcripts) is never mutated — on restart the daemon re-reads from the beginning and re-ingests all events.
+- `INSERT OR IGNORE` on `events.id` (the PRIMARY KEY) makes every re-ingest idempotent: already-committed rows are silently skipped, missing rows are inserted. Final count is always exactly N.
+
+**Invariant asserted in CI**: `tests/test_moat_daemon_crash_recovery.py` — SIGKILL mid-burst + full source replay → `COUNT(*) = COUNT(DISTINCT id) = N`.
 
 ### Performance
 - **Memory**: ~30-80MB typical

@@ -1,388 +1,125 @@
+"""routes/nemoclaw.py: OSS stub after the impl moved to clawmetry-pro.
+
+The real NeMo Guardrails governance + approval-queue implementation ships
+in the closed-source ``clawmetry-pro`` package as
+``clawmetry_pro/routes/nemoclaw.py``. When that package is installed
+(license key or cloud Pro plan), its blueprint registers via
+``clawmetry_pro.register_all()`` -> ``_register_blueprints(app)`` at app
+startup and wins the URL routes.
+
+When clawmetry-pro is NOT installed (vanilla OSS), this stub blueprint
+registers in its place and returns HTTP 402 ``upgrade_required`` on every
+governance endpoint (governance summary, drift ack, daemon status, policy,
+approve, reject, pending-approvals, rule CRUD, guardrail events, metrics).
+
+dashboard.py decides which blueprint to register by inspecting
+``clawmetry_pro.is_loaded()`` so the two never coexist on the URL map.
+
+Mirrors the precedent set by ``routes/runtime_ingest.py`` (custom-runtime
+ingest), ``routes/otel_export.py`` (OTel push), ``routes/selfevolve.py``
+and ``routes/assets.py`` (asset registry) — all OSS 402-stubs whose real
+impls live in clawmetry-pro.
+
+Import-light and never-raise: the blueprint object name (``bp_nemoclaw``)
+and every URL rule match the real impl so swapping the two is transparent.
 """
-routes/nemoclaw.py — NemoClaw governance + approval endpoints.
+from __future__ import annotations
 
-Extracted from dashboard.py as Phase 5.13 (FINAL) of the incremental
-modularisation. Owns the 7 routes registered on ``bp_nemoclaw``:
+import logging
 
-  /api/nemoclaw/governance                     — governance summary
-  /api/nemoclaw/governance/acknowledge-drift   — POST ack
-  /api/nemoclaw/status                         — daemon status
-  /api/nemoclaw/policy                         — active policy
-  /api/nemoclaw/approve                        — approve pending action
-  /api/nemoclaw/reject                         — reject pending action
-  /api/nemoclaw/pending-approvals              — list queue
+from flask import Blueprint, jsonify
 
-Module-level helpers (``_detect_nemoclaw``, ``_parse_network_policies``)
-and module state (``_nemoclaw_policy_hash``, ``_nemoclaw_drift_info``)
-stay in ``dashboard.py`` and are reached via late ``import dashboard as _d``.
+logger = logging.getLogger("clawmetry.routes.nemoclaw")
 
-Pure mechanical move — zero behaviour change.
-
-Phase 4 of epic #1032 adds an opt-in DuckDB fast path
-(``CLAWMETRY_LOCAL_STORE_READ=1``) to ``/api/nemoclaw/pending-approvals``:
-when local DuckDB has rows in the ``approvals`` table, we serve the
-queue from there (tagged ``_source: "local_store"``) instead of shelling
-out to ``openshell draft get``. Sits in front of the legacy CLI path —
-fresh installs or non-NemoClaw users degrade to the same response as
-before.
-"""
-import os
-
-from datetime import datetime, timezone
-
-from flask import Blueprint, jsonify, request
-from clawmetry.config import is_local_store_read_enabled
-
-bp_nemoclaw = Blueprint('nemoclaw', __name__)
+bp_nemoclaw = Blueprint("nemoclaw", __name__)
 
 
-# ── Local DuckDB fast path (epic #1032 Phase 4 — approvals queue) ───────────
-#
-# Opt-in via CLAWMETRY_LOCAL_STORE_READ=1. Mirrors routes/crons.py: a dedicated
-# helper attempts a DuckDB read and returns ``None`` on any error / empty
-# table so the legacy ``openshell draft get`` path runs untouched. The fast
-# path NEVER replaces the legacy code — it sits in front of it, so a fresh
-# install with no local store (or a non-NemoClaw user) sees the same data
-# as before.
-#
-# The local ``approvals`` table is populated by the policy watcher in
-# clawmetry/approvals.py via LocalStore.ingest_approval (Phase 4). Schema:
-#
-#   approvals (
-#     id, owner_hash, requestor_session_id, action, args BLOB, status,
-#     created_at, resolved_at, resolver, decision, decision_reason
-#   )
-#
-# Response shape mirrors the legacy ``/api/nemoclaw/pending-approvals``
-# contract (``{installed, approvals}``) — only adding ``_source:
-# "local_store"`` so tests can assert which path served the response.
+# Shared 402 body so the wire format is identical across every governance
+# route (and matches the ``@gate`` enforce-mode shape used elsewhere).
+_UPGRADE = {
+    "error": "upgrade_required",
+    "feature": "nemo_governance",
+    "hint": (
+        "NeMo governance is a paid feature. Install clawmetry-pro with a "
+        "license key, or use Cloud at clawmetry.com/pricing."
+    ),
+}
 
 
-def _try_local_store_approvals():
-    """Return pending-approvals dict shaped like ``/api/nemoclaw/pending-
-    approvals`` from the local DuckDB.
-
-    Returns ``None`` to defer to the legacy openshell CLI fallback if:
-      - the ``local_store`` module isn't importable
-      - the ``approvals`` table is empty (fresh install / no pending rows)
-      - any unexpected error happens (we'd rather degrade than 500)
-    """
-    # Issue #1282 / memory `feedback_daemon_proxy_pattern.md`: writable
-    # ``get_store`` raced the sync daemon's exclusive DuckDB writer lock
-    # on multi-process installs (launchd/systemd). Try the daemon HTTP
-    # proxy first; fall back to a direct read-only open for single-process
-    # boots (tests, dev mode).
-    try:
-        from routes.local_query import local_store_via_daemon
-        rows = local_store_via_daemon("query_approvals", status="pending", limit=500)
-    except Exception:
-        rows = None
-    if rows is None:
-        try:
-            from clawmetry import local_store
-            store = local_store.get_store(read_only=True)
-            rows = store.query_approvals(status="pending", limit=500)
-        except Exception:
-            return None
-    if not rows:
-        return None
-    approvals = []
-    for r in rows:
-        args = r.get("args") if isinstance(r.get("args"), dict) else {}
-        approvals.append({
-            # Preserve the column names so the cloud + dashboard can address
-            # rows directly by id without translation.
-            "id":                   r.get("id"),
-            # Legacy fields the dashboard JS still reads — derived from the
-            # row when present, kept as None otherwise so the renderer's
-            # `||` fallbacks behave unchanged.
-            "chunk_id":             r.get("id"),
-            "session_id":           r.get("requestor_session_id"),
-            "requestor_session_id": r.get("requestor_session_id"),
-            "action":               r.get("action"),
-            "tool_name":            r.get("action"),
-            "args":                 args,
-            "status":               r.get("status", "pending"),
-            "ts":                   r.get("created_at"),
-            "created_at":           r.get("created_at"),
-        })
-    return {
-        "installed": True,
-        "approvals": approvals,
-        "_source":   "local_store",
-    }
+def _upgrade():
+    return jsonify(_UPGRADE), 402
 
 
-# ── NemoClaw Governance API ───────────────────────────────────────────────────
+# ── NeMo governance summary + drift ─────────────────────────────────────────
 
 
 @bp_nemoclaw.route('/api/nemoclaw/governance')
 def api_nemoclaw_governance():
-    """Return NemoClaw governance status: policy, sandbox state, drift detection."""
-    import dashboard as _d
-    info = _d._detect_nemoclaw()
-    if info is None:
-        return jsonify({'installed': False})
-
-    result = {
-        'installed': True,
-        'sandboxes': [],
-        'policy': None,
-        'network_policies': [],
-        'presets': info.get('presets', []),
-        'drift': None,
-        'config': {},
-    }
-
-    # Config summary (sanitise - remove tokens/keys)
-    cfg = info.get('config', {})
-    if cfg:
-        safe_cfg = {k: v for k, v in cfg.items() if 'token' not in k.lower() and 'key' not in k.lower() and 'secret' not in k.lower()}
-        result['config'] = safe_cfg
-
-    # Sandbox state
-    state = info.get('state', {})
-    if isinstance(state, dict):
-        sandboxes_raw = state.get('sandboxes') or state.get('shells') or {}
-        if isinstance(sandboxes_raw, dict):
-            for name, sb in sandboxes_raw.items():
-                if isinstance(sb, dict):
-                    result['sandboxes'].append({
-                        'name': name,
-                        'status': sb.get('status', 'unknown'),
-                        'pid': sb.get('pid'),
-                        'created': sb.get('created') or sb.get('createdAt'),
-                        'preset': sb.get('preset') or sb.get('policy_preset'),
-                    })
-        elif isinstance(sandboxes_raw, list):
-            for sb in sandboxes_raw:
-                if isinstance(sb, dict):
-                    result['sandboxes'].append({
-                        'name': sb.get('name', 'unknown'),
-                        'status': sb.get('status', 'unknown'),
-                        'pid': sb.get('pid'),
-                        'created': sb.get('created') or sb.get('createdAt'),
-                        'preset': sb.get('preset') or sb.get('policy_preset'),
-                    })
-
-    # Parse sandbox list from CLI output if state didn't give sandboxes
-    if not result['sandboxes'] and info.get('sandbox_list_raw'):
-        for line in info['sandbox_list_raw'].splitlines():
-            line = line.strip()
-            if not line or line.startswith('#') or line.lower().startswith('name'):
-                continue
-            parts = line.split()
-            if parts:
-                status = parts[1] if len(parts) > 1 else 'unknown'
-                result['sandboxes'].append({'name': parts[0], 'status': status, 'pid': None, 'created': None, 'preset': None})
-
-    # Policy summary
-    policy_yaml = info.get('policy_yaml')
-    policy_hash = info.get('policy_hash')
-    if policy_yaml:
-        result['network_policies'] = _d._parse_network_policies(policy_yaml)
-        result['policy'] = {
-            'hash': policy_hash,
-            'lines': len(policy_yaml.splitlines()),
-            'size_bytes': len(policy_yaml.encode()),
-        }
-
-    # Drift detection: compare policy hash vs last seen
-    if policy_hash:
-        if _d._nemoclaw_policy_hash is None:
-            _d._nemoclaw_policy_hash = policy_hash
-        elif _d._nemoclaw_policy_hash != policy_hash:
-            _d._nemoclaw_drift_info = {
-                'detected_at': datetime.utcnow().isoformat() + 'Z',
-                'previous_hash': _d._nemoclaw_policy_hash,
-                'current_hash': policy_hash,
-            }
-            _d._nemoclaw_policy_hash = policy_hash
-
-        if _d._nemoclaw_drift_info:
-            result['drift'] = _d._nemoclaw_drift_info
-
-    return jsonify(result)
+    return _upgrade()
 
 
 @bp_nemoclaw.route('/api/nemoclaw/governance/acknowledge-drift', methods=['POST'])
 def api_nemoclaw_acknowledge_drift():
-    """Clear the drift alert (user acknowledged the policy change)."""
-    import dashboard as _d
-    _d._nemoclaw_drift_info = {}
-    return jsonify({'ok': True})
+    return _upgrade()
 
 
-# ── NemoClaw Governance Routes ───────────────────────────────────────────────
+# ── NeMo status + policy ────────────────────────────────────────────────────
 
 
 @bp_nemoclaw.route('/api/nemoclaw/status')
 def api_nemoclaw_status():
-    """Detect NemoClaw installation and return full status."""
-    import dashboard as _d
-    data = _d._detect_nemoclaw()
-    if not data:
-        return jsonify({"installed": False})
-    # Policy drift detection
-    current_hash = data.get("policy_hash")
-    if current_hash:
-        if _d._nemoclaw_policy_hash is None:
-            _d._nemoclaw_policy_hash = current_hash
-        elif _d._nemoclaw_policy_hash != current_hash:
-            _d._nemoclaw_drift_info = {
-                "old_hash": _d._nemoclaw_policy_hash,
-                "new_hash": current_hash,
-                "detected_at": datetime.now(timezone.utc).isoformat(),
-            }
-            _d._nemoclaw_policy_hash = current_hash
-            data["policy_drifted"] = True
-            data["drift_info"] = _d._nemoclaw_drift_info
-        else:
-            data["policy_drifted"] = False
-    # Parse network policies for structured display
-    if data.get("policy_yaml"):
-        data["network_policies"] = _d._parse_network_policies(data["policy_yaml"])
-    return jsonify(data)
+    return _upgrade()
 
 
 @bp_nemoclaw.route('/api/nemoclaw/policy')
 def api_nemoclaw_policy():
-    """Return full policy YAML + hash + drift status."""
-    import dashboard as _d
-    data = _d._detect_nemoclaw()
-    if not data:
-        return jsonify({"installed": False, "policy_yaml": None})
-    result = {
-        "installed": True,
-        "policy_yaml": data.get("policy_yaml"),
-        "policy_hash": data.get("policy_hash"),
-        "policy_drifted": False,
-        "drift_info": None,
-    }
-    current_hash = data.get("policy_hash")
-    if current_hash:
-        if _d._nemoclaw_policy_hash and _d._nemoclaw_policy_hash != current_hash:
-            result["policy_drifted"] = True
-            result["drift_info"] = _d._nemoclaw_drift_info
-        elif _d._nemoclaw_policy_hash is None:
-            _d._nemoclaw_policy_hash = current_hash
-    if data.get("policy_yaml"):
-        result["network_policies"] = _d._parse_network_policies(data["policy_yaml"])
-    return jsonify(result)
+    return _upgrade()
+
+
+# ── Approval queue actions ──────────────────────────────────────────────────
 
 
 @bp_nemoclaw.route('/api/nemoclaw/approve', methods=['POST'])
 def api_nemoclaw_approve():
-    """Approve a pending NemoClaw egress chunk."""
-    data = request.get_json() or {}
-    sandbox = data.get('sandbox')
-    chunk_id = data.get('chunk_id')
-    if not sandbox or not chunk_id:
-        return jsonify({'error': 'missing sandbox or chunk_id'}), 400
-    import subprocess as _sp
-    r = _sp.run(
-        ['openshell', 'draft', 'approve', sandbox, chunk_id],
-        capture_output=True, text=True, timeout=10
-    )
-    return jsonify({'ok': r.returncode == 0, 'output': r.stdout or r.stderr})
+    return _upgrade()
 
 
 @bp_nemoclaw.route('/api/nemoclaw/reject', methods=['POST'])
 def api_nemoclaw_reject():
-    """Reject a pending NemoClaw egress chunk."""
-    data = request.get_json() or {}
-    sandbox = data.get('sandbox')
-    chunk_id = data.get('chunk_id')
-    reason = data.get('reason', '')
-    if not sandbox or not chunk_id:
-        return jsonify({'error': 'missing sandbox or chunk_id'}), 400
-    import subprocess as _sp
-    cmd = ['openshell', 'draft', 'reject', sandbox, chunk_id]
-    if reason:
-        cmd += ['--reason', reason]
-    r = _sp.run(cmd, capture_output=True, text=True, timeout=10)
-    return jsonify({'ok': r.returncode == 0, 'output': r.stdout or r.stderr})
+    return _upgrade()
 
 
 @bp_nemoclaw.route('/api/nemoclaw/pending-approvals')
 def api_nemoclaw_pending_approvals():
-    """Return pending egress approval requests from openshell.
+    return _upgrade()
 
-    Phase 4 of epic #1032: when ``CLAWMETRY_LOCAL_STORE_READ=1`` AND the
-    local DuckDB ``approvals`` table has pending rows, serve from there
-    and tag ``_source: "local_store"``. Otherwise fall through to the
-    legacy ``openshell draft get`` CLI path (response is unchanged).
-    """
-    if is_local_store_read_enabled():
-        fast = _try_local_store_approvals()
-        if fast is not None:
-            return jsonify(fast)
-    import shutil as _shutil
-    if not _shutil.which('openshell'):
-        return jsonify({'installed': False, 'approvals': []})
-    try:
-        # Get sandbox names
-        import subprocess as _sp
-        r = _sp.run(['nemoclaw', 'list'], capture_output=True, text=True, timeout=5)
-        approvals = []
-        sandboxes = []
-        for line in r.stdout.splitlines():
-            line = line.strip()
-            if not line or line.startswith('#') or line.lower().startswith('name') or line.startswith('-'):
-                continue
-            parts = line.split()
-            if parts:
-                sandboxes.append(parts[0])
-        for sandbox in sandboxes:
-            # Try JSON output first
-            r2 = _sp.run(
-                ['openshell', 'draft', 'get', sandbox, '--status', 'pending', '--json'],
-                capture_output=True, text=True, timeout=5
-            )
-            if r2.returncode == 0 and r2.stdout.strip():
-                try:
-                    import json as _j
-                    chunks = _j.loads(r2.stdout)
-                    if not isinstance(chunks, list):
-                        chunks = [chunks] if isinstance(chunks, dict) else []
-                    for chunk in chunks:
-                        endpoints = chunk.get('proposed_rule', {}).get('endpoints', [{}])
-                        first_ep = endpoints[0] if endpoints else {}
-                        approvals.append({
-                            'sandbox': sandbox,
-                            'chunk_id': chunk.get('id'),
-                            'rule_name': chunk.get('rule_name'),
-                            'host': first_ep.get('host'),
-                            'port': first_ep.get('port'),
-                            'protocol': first_ep.get('protocol'),
-                            'status': 'pending',
-                            'ts': chunk.get('created_at'),
-                        })
-                    continue
-                except (ValueError, KeyError):
-                    pass
-            # Fallback: plain text
-            r3 = _sp.run(
-                ['openshell', 'draft', 'get', sandbox, '--status', 'pending'],
-                capture_output=True, text=True, timeout=5
-            )
-            if r3.returncode == 0:
-                for line in r3.stdout.splitlines():
-                    line = line.strip()
-                    if not line or line.startswith('#') or line.lower().startswith('id'):
-                        continue
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        approvals.append({
-                            'sandbox': sandbox,
-                            'chunk_id': parts[0],
-                            'rule_name': parts[1] if len(parts) > 1 else None,
-                            'host': parts[2] if len(parts) > 2 else None,
-                            'port': parts[3] if len(parts) > 3 else None,
-                            'protocol': None,
-                            'status': 'pending',
-                            'ts': None,
-                        })
-        return jsonify({'installed': True, 'approvals': approvals})
-    except Exception as e:
-        return jsonify({'installed': True, 'approvals': [], 'error': str(e)})
+
+# ── Guardrail events + metrics ──────────────────────────────────────────────
+
+
+@bp_nemoclaw.route('/api/nemoclaw/events')
+def api_nemoclaw_events():
+    return _upgrade()
+
+
+@bp_nemoclaw.route('/api/nemoclaw/metrics')
+def api_nemoclaw_metrics():
+    return _upgrade()
+
+
+# ── Approval policy rule CRUD ───────────────────────────────────────────────
+
+
+@bp_nemoclaw.route('/api/nemoclaw/rules', methods=['GET'])
+def api_nemoclaw_rules_list():
+    return _upgrade()
+
+
+@bp_nemoclaw.route('/api/nemoclaw/rules', methods=['POST'])
+def api_nemoclaw_rules_create():
+    return _upgrade()
+
+
+@bp_nemoclaw.route('/api/nemoclaw/rules/<path:rule_key>', methods=['DELETE'])
+def api_nemoclaw_rules_delete(rule_key):
+    return _upgrade()

@@ -132,57 +132,57 @@ def test_query_approvals_returns_seeded_rows(fast_path_app):
     assert other == []
 
 
-# ── 2. route fast-path: flag on + rows present → _source=local_store ───────
+# ── 2. route: pending-approvals is now a Pro 402 stub ──────────────────────
+#
+# The HTTP endpoint moved to clawmetry-pro; vanilla OSS serves the 402
+# upgrade stub regardless of the local-store fast-path flag or seeded rows.
+# The LocalStore + sync helpers that fed the old route (query_approvals,
+# update_approval_decision, _build_approvals_cache_pushes,
+# _dispatch_pending_queries) stay in OSS and keep their coverage below — the
+# cloud relay still drives the queue through those, the dashboard HTTP route
+# is what's gated.
 
 
-def test_pending_approvals_fast_path_serves_from_duckdb(fast_path_app):
+def _assert_upgrade_required(resp_json):
+    assert resp_json.get("error") == "upgrade_required"
+    assert resp_json.get("feature") == "nemo_governance"
+    assert "hint" in resp_json
+
+
+def test_pending_approvals_returns_402_with_rows(fast_path_app):
     _app, ls, _nm = fast_path_app
     _seed_two_pending(ls.get_store())
 
-    body = _app.test_client().get("/api/nemoclaw/pending-approvals").get_json()
-    assert body.get("_source") == "local_store"
-    assert body.get("installed") is True
-    approvals = body.get("approvals") or []
-    assert len(approvals) == 2
-
-    by_id = {a["id"]: a for a in approvals}
-    assert set(by_id) == {"app-1", "app-2"}
-    # Legacy fields the dashboard JS reads — present + populated.
-    assert by_id["app-1"]["status"] == "pending"
-    assert by_id["app-1"]["action"] == "bash"
-    assert by_id["app-1"]["chunk_id"] == "app-1"
-    assert by_id["app-1"]["session_id"] == "sess-A"
-    assert by_id["app-1"]["args"] == {"cmd": "rm -rf /tmp/x"}
+    resp = _app.test_client().get("/api/nemoclaw/pending-approvals")
+    assert resp.status_code == 402
+    body = resp.get_json()
+    _assert_upgrade_required(body)
+    # The stub never leaks the local-store fast-path tag or the queue rows.
+    assert body.get("_source") != "local_store"
+    assert "approvals" not in body
 
 
-# ── 3. route fast-path: flag off → fast path skipped ───────────────────────
+# ── 3. route: 402 regardless of the local-store read flag ──────────────────
 
 
-def test_pending_approvals_flag_off_skips_fast_path(no_flag_app):
-    """CLAWMETRY_LOCAL_STORE_READ unset: even with DuckDB rows present, the
-    fast path is skipped and the legacy openshell CLI path runs. On a system
-    without `openshell` on PATH the legacy path returns
-    ``{installed: False, approvals: []}`` — and crucially, NO ``_source``."""
+def test_pending_approvals_returns_402_flag_off(no_flag_app):
+    """CLAWMETRY_LOCAL_STORE_READ unset: the route is a Pro stub either way."""
     _app, ls, _nm = no_flag_app
     _seed_two_pending(ls.get_store())
 
-    body = _app.test_client().get("/api/nemoclaw/pending-approvals").get_json()
-    assert body.get("_source") != "local_store"
-    # The legacy path may return installed=False (no openshell binary in CI)
-    # or installed=True with an empty list (binary present but no sandbox).
-    # Either way the response must NOT carry the fast-path tag.
+    resp = _app.test_client().get("/api/nemoclaw/pending-approvals")
+    assert resp.status_code == 402
+    _assert_upgrade_required(resp.get_json())
 
 
-# ── 4. route fast-path: empty store → fast path returns None → legacy ──────
+# ── 4. route: 402 even with an empty store ─────────────────────────────────
 
 
-def test_pending_approvals_empty_store_falls_through(fast_path_app):
-    """Flag on but no rows in DuckDB: ``_try_local_store_approvals`` returns
-    None and the legacy CLI path runs (and degrades to installed=False on a
-    bare CI image)."""
+def test_pending_approvals_returns_402_empty_store(fast_path_app):
     _app, _ls, _nm = fast_path_app
-    body = _app.test_client().get("/api/nemoclaw/pending-approvals").get_json()
-    assert body.get("_source") != "local_store"
+    resp = _app.test_client().get("/api/nemoclaw/pending-approvals")
+    assert resp.status_code == 402
+    _assert_upgrade_required(resp.get_json())
 
 
 # ── 5. update_approval_decision flips status idempotently ──────────────────
@@ -346,6 +346,16 @@ def test_dispatch_pending_queries_applies_approval_decision(fast_path_app):
     assert by_id["app-2"]["status"] == "pending"
 
 
+# ── 9. issue #1328: Cloud-Pro upsell CTA flag on the queue response ────────
+#
+# The ``pro_gated_upsell`` / ``pending_count`` CTA annotation lived on the
+# ``/api/nemoclaw/pending-approvals`` HTTP route, which moved to clawmetry-pro
+# alongside the rest of NeMo governance. In vanilla OSS the route is a 402
+# stub (covered by sections 2-4 above), so the route-level upsell assertions
+# no longer apply here — they live in clawmetry-pro's test suite. The
+# LocalStore + sync queue-relay coverage (sections 1, 5-8) is unaffected.
+
+
 def test_dispatch_pending_queries_approval_decision_missing_id_is_noop(fast_path_app):
     """A malformed approval_decision entry (no id) must NOT crash dispatch
     and must NOT touch the store."""
@@ -370,3 +380,70 @@ def test_dispatch_pending_queries_approval_decision_missing_id_is_noop(fast_path
     # Neither row was touched.
     for r in rows:
         assert r["status"] == "pending"
+
+
+# ── query_session_authority_counts ────────────────────────────────────────────
+
+
+def _seed_authority_violations(store):
+    """Insert two violations for session-A and one for session-B."""
+    for i, (sess, tool) in enumerate([
+        ("session-A", "write_file"),
+        ("session-A", "bash"),
+        ("session-B", "execute_command"),
+    ]):
+        store.ingest_authority_violation({
+            "id":             f"av-{i}",
+            "session_id":     sess,
+            "ts":             f"2026-07-04T10:0{i}:00",
+            "tool":           tool,
+            "violation_type": "tool_not_in_allowed_list",
+            "declared_tools": '["read_file"]',
+            "allowed_tools":  '["read_file"]',
+        })
+
+
+def test_authority_counts_returns_correct_counts(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAWMETRY_LOCAL_STORE_PATH",
+                       str(tmp_path / "events.duckdb"))
+    import clawmetry.local_store as ls
+    importlib.reload(ls)
+    store = ls.get_store()
+    try:
+        _seed_authority_violations(store)
+        counts = store.query_session_authority_counts(["session-A", "session-B"])
+        assert counts["session-A"] == 2
+        assert counts["session-B"] == 1
+    finally:
+        store.stop(flush=True)
+
+
+def test_authority_counts_missing_session_absent(tmp_path, monkeypatch):
+    """Sessions with no violations are absent from the result (callers treat
+    absence as 0 — mirroring the query_event_totals_by_session contract)."""
+    monkeypatch.setenv("CLAWMETRY_LOCAL_STORE_PATH",
+                       str(tmp_path / "events.duckdb"))
+    import clawmetry.local_store as ls
+    importlib.reload(ls)
+    store = ls.get_store()
+    try:
+        _seed_authority_violations(store)
+        counts = store.query_session_authority_counts(
+            ["session-A", "session-C"]  # session-C has no violations
+        )
+        assert counts["session-A"] == 2
+        assert "session-C" not in counts
+    finally:
+        store.stop(flush=True)
+
+
+def test_authority_counts_empty_input(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAWMETRY_LOCAL_STORE_PATH",
+                       str(tmp_path / "events.duckdb"))
+    import clawmetry.local_store as ls
+    importlib.reload(ls)
+    store = ls.get_store()
+    try:
+        assert store.query_session_authority_counts([]) == {}
+    finally:
+        store.stop(flush=True)

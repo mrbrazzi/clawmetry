@@ -534,5 +534,856 @@ console.log('_collapseBodylessOutbound (P1 follow-up to #1205 — collapse outbo
   eq(out8[2].type, 'EXEC', 'EXEC preserved');
 }
 
-console.log('\n' + (failed === 0 ? 'PASS' : 'FAIL') + ' — ' + passed + ' passed, ' + failed + ' failed');
-process.exit(failed === 0 ? 0 : 1);
+// ── Test anon auth-fail funnel-loss ping helpers (issue #1365) ─────────
+// The bootstrap path must fire a ping ONLY when:
+//   - localStorage has no prior token (first-load reject, not session timeout)
+//   - /api/auth/check returned {authRequired:true, valid:false}
+//   - NOT in the needsSetup branch (separate funnel; not our target)
+// And the UA bucketer must squash everything into chrome/safari/firefox/other
+// without leaking version numbers / OS strings into analytics cardinality.
+console.log('anon auth-fail ping helpers (issue #1365)');
+{
+  const sandbox = { Date: Date };
+  vm.createContext(sandbox);
+  const code = extractFunction('_uaClass') + '\n' +
+               extractFunction('_shouldPingAuthFailFirstLoad') + '\n' +
+               'this.api = { _uaClass: _uaClass, _should: _shouldPingAuthFailFirstLoad };';
+  vm.runInContext(code, sandbox);
+  const api = sandbox.api;
+
+  // _uaClass buckets.
+  // Real Chrome UA on Mac:
+  eq(api._uaClass(
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
+    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+  ), 'chrome', 'Mac Chrome → chrome');
+  // Real Safari UA (no "Chrome" token, has "Safari").
+  eq(api._uaClass(
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 ' +
+    '(KHTML, like Gecko) Version/17.4 Safari/605.1.15'
+  ), 'safari', 'Mac Safari → safari');
+  // Real Firefox UA.
+  eq(api._uaClass(
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0'
+  ), 'firefox', 'Mac Firefox → firefox');
+  // Edge embeds Chrome — must bucket as chrome (close enough; we only
+  // want browser-engine cardinality, not vendor).
+  eq(api._uaClass(
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0'
+  ), 'chrome', 'Edge (Chromium) → chrome bucket');
+  // curl / scripts / unknowns.
+  eq(api._uaClass('curl/8.7.1'), 'other', 'curl → other');
+  eq(api._uaClass(''), 'other', 'empty UA → other');
+  eq(api._uaClass(null), 'other', 'null UA → other');
+  eq(api._uaClass(undefined), 'other', 'undefined UA → other');
+
+  // _shouldPingAuthFailFirstLoad gating matrix.
+  const FAIL = { authRequired: true, valid: false };
+  const OK = { authRequired: true, valid: true };
+  const SETUP = { needsSetup: true, authRequired: true, valid: false };
+
+  // True only for: no stored token AND a fresh auth-fail response.
+  eq(api._should(null, FAIL), true, 'no token + auth fail → fire ping');
+  eq(api._should('', FAIL), true, 'empty token + auth fail → fire ping');
+
+  // Stored token = session-timeout or rotated token, NOT a fresh-install
+  // funnel drop. Polluting the signal would defeat the purpose.
+  eq(api._should('cm_abc', FAIL), false,
+     'stored token + auth fail → suppress (session timeout, not first-load)');
+
+  // Successful auth must never trigger a ping.
+  eq(api._should(null, OK), false, 'no token + auth OK → no ping');
+  eq(api._should('cm_abc', OK), false, 'stored token + auth OK → no ping');
+
+  // needsSetup is a separate funnel (gateway not running at all). Don't
+  // mix it into the "valid token rejected" signal we're trying to surface.
+  eq(api._should(null, SETUP), false, 'needsSetup → suppress (separate funnel)');
+
+  // Defensive: malformed authData must never throw.
+  eq(api._should(null, null), false, 'null authData → no ping');
+  eq(api._should(null, {}), false, 'empty authData → no ping');
+  eq(api._should(null, { authRequired: false }), false,
+     'authRequired:false → no ping');
+}
+
+// ── Test auth-bootstrap.js — zero-click localhost auto-login (issue #1356) ──
+//
+// The first IIFE in auth-bootstrap.js owns the "first paint" auth flow:
+//   1. Read clawmetry-token from localStorage.
+//   2. If empty → fetch /api/auth/detected-token; on a token, stash it and
+//      call checkAuth(token).
+//   3. If present → call checkAuth(storedToken) directly.
+//   4. checkAuth calls /api/auth/check?token=…; on valid, hide the overlay;
+//      on invalid, wipe localStorage and show the login overlay.
+//
+// The whole point of #1356 is that step 2 produces a logged-in dashboard
+// without the user typing anything. This test exercises the IIFE in a
+// sandbox with stubs for fetch / localStorage / document, then asserts:
+//   * /api/auth/detected-token is the FIRST fetch on a fresh session.
+//   * Its response token gets persisted to localStorage under
+//     'clawmetry-token' (the exact key the fetch shim below reads).
+//   * checkAuth then calls /api/auth/check?token=… with the just-fetched
+//     value (not the empty stored value), and the login overlay is hidden
+//     when /api/auth/check returns {valid:true}.
+//   * On detected-token 403/404 (non-localhost peer, no token configured),
+//     the bootstrap falls through to the overlay path instead of throwing.
+//   * No `location.reload()` is ever called (see
+//     feedback_no_reload_in_bootstrap_e2e.md — Playwright dies on reload
+//     during page-load bootstrap).
+console.log('auth-bootstrap.js zero-click auto-login (issue #1356)');
+{
+  const BOOTSTRAP_JS = path.join(
+    __dirname, '..', 'clawmetry', 'static', 'js', 'auth-bootstrap.js'
+  );
+  const bootSrc = fs.readFileSync(BOOTSTRAP_JS, 'utf8');
+
+  // Extract just the FIRST IIFE — the one that owns the auto-detect +
+  // checkAuth flow. The file also defines clawmetryLogin / clawmetryLogout
+  // / fetch-shim / version-badge IIFEs after it, none of which are part of
+  // this test's scope.
+  const iifeMatch = bootSrc.match(/^\(function\(\)\{[\s\S]*?\n\}\)\(\);/m);
+  if (!iifeMatch) throw new Error('could not find bootstrap IIFE in auth-bootstrap.js');
+  const iifeSrc = iifeMatch[0];
+
+  // Build a sandbox runner. Each scenario re-builds the sandbox so state
+  // (localStorage, fetch-call log, overlay style) starts clean.
+  function runBootstrap(opts) {
+    const calls = []; // every fetch URL, in order
+    const lsStore = Object.assign({}, opts.initialLocalStorage || {});
+    const ssStore = {};
+    const overlayState = { display: '' };
+    const gwOverlayState = { display: '', dataset: {} };
+    const gwCloseState = { display: '' };
+    const logoutBtnState = { display: 'none' };
+    let reloadCount = 0;
+
+    const elements = {
+      'login-overlay': { style: overlayState },
+      'gw-setup-overlay': { style: gwOverlayState, dataset: gwOverlayState.dataset },
+      'gw-setup-close': { style: gwCloseState },
+      'logout-btn': { style: logoutBtnState },
+    };
+
+    const sandbox = {
+      localStorage: {
+        getItem: function(k) {
+          return Object.prototype.hasOwnProperty.call(lsStore, k) ? lsStore[k] : null;
+        },
+        setItem: function(k, v) { lsStore[k] = String(v); },
+        removeItem: function(k) { delete lsStore[k]; },
+      },
+      sessionStorage: {
+        getItem: function(k) {
+          return Object.prototype.hasOwnProperty.call(ssStore, k) ? ssStore[k] : null;
+        },
+        setItem: function(k, v) { ssStore[k] = String(v); },
+        removeItem: function(k) { delete ssStore[k]; },
+      },
+      document: {
+        getElementById: function(id) { return elements[id] || null; },
+      },
+      window: {
+        location: {
+          // Defensive: any reload attempt during bootstrap is a bug — the
+          // Playwright fixture in tests/e2e/zero-click-auth.mjs crashes
+          // with "Execution context was destroyed". We assert reloadCount
+          // stays 0 in every scenario.
+          reload: function() { reloadCount++; },
+        },
+      },
+      fetch: function(url) {
+        calls.push(url);
+        return Promise.resolve(opts.fetchHandler(url));
+      },
+      // Bare-bones Promise / setTimeout pulled from this realm; vm context
+      // sandboxes don't auto-inherit globals.
+      Promise: Promise,
+      setTimeout: setTimeout,
+    };
+    // `encodeURIComponent` is used inside the IIFE.
+    sandbox.encodeURIComponent = encodeURIComponent;
+
+    vm.createContext(sandbox);
+    vm.runInContext(iifeSrc, sandbox);
+
+    // The IIFE kicks off async work via Promises. Drain the microtask
+    // queue by awaiting a setImmediate-equivalent. Two ticks cover the
+    // detected-token → checkAuth → /api/auth/check chain.
+    return new Promise(function(resolve) {
+      setImmediate(function() {
+        setImmediate(function() {
+          setImmediate(function() {
+            resolve({
+              calls: calls,
+              lsStore: lsStore,
+              ssStore: ssStore,
+              overlayDisplay: overlayState.display,
+              gwOverlayDisplay: gwOverlayState.display,
+              logoutDisplay: logoutBtnState.display,
+              reloadCount: reloadCount,
+            });
+          });
+        });
+      });
+    });
+  }
+
+  // ── Scenario A: fresh tab, server has token, /api/auth/check says valid ──
+  //
+  // This is the happy path that #1356 exists to deliver. The bootstrap
+  // MUST hit /api/auth/detected-token first, stash the token, then call
+  // /api/auth/check?token=…, and hide the overlay.
+  (async function scenarioA() {
+    const DETECTED_TOKEN = 'deadbeef'.repeat(6); // 48 hex chars — same shape as a real openclaw token
+    const result = await runBootstrap({
+      initialLocalStorage: {}, // fresh tab
+      fetchHandler: function(url) {
+        if (url === '/api/auth/detected-token') {
+          return { ok: true, json: function() { return Promise.resolve({ token: DETECTED_TOKEN, source: 'openclaw.json' }); } };
+        }
+        if (url.indexOf('/api/auth/check') === 0) {
+          return { ok: true, json: function() { return Promise.resolve({ authRequired: true, valid: true }); } };
+        }
+        throw new Error('unexpected fetch: ' + url);
+      },
+    });
+
+    truthy(result.calls.length >= 1, 'A: at least one fetch fires on boot');
+    eq(result.calls[0], '/api/auth/detected-token',
+       'A: /api/auth/detected-token is the FIRST fetch on a fresh tab');
+    eq(result.lsStore['clawmetry-token'], DETECTED_TOKEN,
+       'A: detected token persists into localStorage under clawmetry-token');
+    truthy(
+      result.calls[1] && result.calls[1].indexOf('/api/auth/check?token=' + DETECTED_TOKEN) === 0,
+      'A: /api/auth/check is called with the just-fetched token (not empty)'
+    );
+    eq(result.overlayDisplay, 'none',
+       'A: login overlay is hidden after valid auth — zero clicks needed');
+    eq(result.logoutDisplay, '',
+       'A: logout button is revealed after successful auth');
+    eq(result.reloadCount, 0,
+       'A: no location.reload() during bootstrap (E2E-fixture-safe)');
+  })();
+
+  // ── Scenario B: detected-token returns 403 (non-localhost) ──
+  //
+  // The bootstrap MUST NOT throw on a 403. It should fall through and
+  // call /api/auth/check with no token, surface the overlay (since
+  // /api/auth/check then returns {valid:false}).
+  (async function scenarioB() {
+    const result = await runBootstrap({
+      initialLocalStorage: {},
+      fetchHandler: function(url) {
+        if (url === '/api/auth/detected-token') {
+          return { ok: false, status: 403, json: function() { return Promise.resolve({ error: 'localhost only' }); } };
+        }
+        if (url.indexOf('/api/auth/check') === 0) {
+          return { ok: true, json: function() { return Promise.resolve({ authRequired: true, valid: false }); } };
+        }
+        throw new Error('unexpected fetch: ' + url);
+      },
+    });
+
+    eq(result.calls[0], '/api/auth/detected-token',
+       'B: detected-token is still attempted (no token in localStorage)');
+    truthy(!result.lsStore['clawmetry-token'],
+       'B: no token persisted when detected-token returns 403');
+    truthy(
+      result.calls[1] === '/api/auth/check',
+      'B: checkAuth falls through with no token (no ?token= query)'
+    );
+    eq(result.overlayDisplay, 'flex',
+       'B: login overlay is shown when no token can be auto-detected');
+    eq(result.reloadCount, 0,
+       'B: no location.reload() during bootstrap (E2E-fixture-safe)');
+  })();
+
+  // ── Scenario C: detected-token returns 404 (server has no GATEWAY_TOKEN) ──
+  //
+  // Same as B but exercising the "no token detected" branch. Server should
+  // surface needsSetup via /api/auth/check, and the bootstrap must promote
+  // the gateway-setup overlay (not the login overlay).
+  (async function scenarioC() {
+    const result = await runBootstrap({
+      initialLocalStorage: {},
+      fetchHandler: function(url) {
+        if (url === '/api/auth/detected-token') {
+          return { ok: false, status: 404, json: function() { return Promise.resolve({ error: 'no token detected' }); } };
+        }
+        if (url.indexOf('/api/auth/check') === 0) {
+          return { ok: true, json: function() { return Promise.resolve({ needsSetup: true, authRequired: true, valid: false }); } };
+        }
+        throw new Error('unexpected fetch: ' + url);
+      },
+    });
+
+    eq(result.calls[0], '/api/auth/detected-token',
+       'C: detected-token attempted even when server has no token');
+    eq(result.overlayDisplay, 'none',
+       'C: login overlay is hidden (gateway-setup overlay takes over)');
+    eq(result.gwOverlayDisplay, 'flex',
+       'C: gateway-setup overlay is shown when needsSetup=true');
+    eq(result.reloadCount, 0,
+       'C: no location.reload() during bootstrap (E2E-fixture-safe)');
+  })();
+
+  // ── Scenario D: stored token already in localStorage — skip auto-detect ──
+  //
+  // If a token was persisted on a prior visit, bootstrap MUST NOT hit
+  // /api/auth/detected-token at all — straight to /api/auth/check.
+  // Validates the `if(!stored)` guard.
+  (async function scenarioD() {
+    const STORED = 'cafebabe'.repeat(6);
+    const result = await runBootstrap({
+      initialLocalStorage: { 'clawmetry-token': STORED },
+      fetchHandler: function(url) {
+        if (url.indexOf('/api/auth/check') === 0) {
+          return { ok: true, json: function() { return Promise.resolve({ authRequired: true, valid: true }); } };
+        }
+        // detected-token would be a regression — fail loud.
+        return { ok: false, status: 500, json: function() { return Promise.resolve({}); } };
+      },
+    });
+
+    eq(result.calls[0], '/api/auth/check?token=' + STORED,
+       'D: stored token short-circuits detected-token fetch entirely');
+    truthy(
+      result.calls.indexOf('/api/auth/detected-token') === -1,
+      'D: /api/auth/detected-token is NEVER called when localStorage has a token'
+    );
+    eq(result.overlayDisplay, 'none',
+       'D: overlay hidden after stored-token auth succeeds');
+    eq(result.reloadCount, 0,
+       'D: no location.reload() during bootstrap (E2E-fixture-safe)');
+  })();
+
+  // ── Scenario E: detected-token fetch rejects (network error) ──
+  //
+  // catch() branch must run checkAuth(null), not throw. Same end-state
+  // as scenario B from the user's perspective (overlay shows).
+  (async function scenarioE() {
+    const result = await runBootstrap({
+      initialLocalStorage: {},
+      fetchHandler: function(url) {
+        if (url === '/api/auth/detected-token') {
+          return Promise.reject(new Error('network down'));
+        }
+        if (url.indexOf('/api/auth/check') === 0) {
+          return { ok: true, json: function() { return Promise.resolve({ authRequired: true, valid: false }); } };
+        }
+        throw new Error('unexpected fetch: ' + url);
+      },
+    });
+
+    eq(result.calls[0], '/api/auth/detected-token',
+       'E: detected-token attempted even when fetch will reject');
+    truthy(!result.lsStore['clawmetry-token'],
+       'E: no token persisted on fetch rejection');
+    eq(result.overlayDisplay, 'flex',
+       'E: overlay shown when network error prevents auto-detect');
+    eq(result.reloadCount, 0,
+       'E: no location.reload() during bootstrap (E2E-fixture-safe)');
+  })();
+}
+
+// ── Per-LLM-call Timeline renderer (issue #568) ─────────────────────────
+//
+// Pure-function check: renderLlmCallTimeline takes the
+// /api/llm-call-timeline payload and returns HTML. We extract the function
+// + its two phase dictionaries from app.js, run it through node's vm with
+// a stub escHtml, and assert structural properties of the output. No DOM,
+// no fetch — just shape.
+console.log('renderLlmCallTimeline (issue #568 — per-LLM-call lifecycle bar)');
+{
+  const sandbox = { Date: Date, console: console };
+  const lines = src.split('\n');
+  const startMarker = 'var _llmTimelinePhaseColors';
+  const endMarker = 'function loadLlmCallTimeline(';
+  const startIdx = lines.findIndex(function(l) { return l.indexOf(startMarker) === 0; });
+  if (startIdx < 0) throw new Error('start marker not found in app.js');
+  const endIdx = lines.findIndex(function(l, i) { return i > startIdx && l.indexOf(endMarker) === 0; });
+  if (endIdx < 0) throw new Error('end marker not found in app.js');
+  // Slice covers _llmTimelinePhaseColors → _llmTimelinePhaseLabels →
+  // _formatTimelineMs → renderLlmCallTimeline. Stops before
+  // loadLlmCallTimeline (which uses fetch — we don't need it for this test).
+  let code = lines.slice(startIdx, endIdx).join('\n') + '\n';
+  // Stub escHtml — the real one lives elsewhere in app.js; pull it in.
+  code += extractFunction('escHtml') + '\n';
+  code += '\nthis.api = {' +
+          '  renderLlmCallTimeline: renderLlmCallTimeline,' +
+          '  _formatTimelineMs: _formatTimelineMs,' +
+          '  _llmTimelinePhaseColors: _llmTimelinePhaseColors,' +
+          '  _llmTimelinePhaseLabels: _llmTimelinePhaseLabels,' +
+          '};';
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+  const api = sandbox.api;
+
+  // (1) _formatTimelineMs covers ms / s / mNNs branches.
+  eq(api._formatTimelineMs(0), '0ms', 'format 0 → "0ms"');
+  eq(api._formatTimelineMs(150), '150ms', 'format 150 → "150ms"');
+  eq(api._formatTimelineMs(4200), '4.2s', 'format 4200 → "4.2s"');
+  eq(api._formatTimelineMs(72500), '1m12s', 'format 72500 → "1m12s"');
+  eq(api._formatTimelineMs(null), '', 'format null → "" (safe)');
+
+  // (2) 5-phase reasoning payload renders 5 markers + legend.
+  const reasoningPayload = {
+    event_id: 'ev-1',
+    session_id: 'sess-r',
+    model: 'claude-opus-4-7',
+    reasoning: true,
+    phase_count: 5,
+    total_ms: 6750,
+    phases: [
+      { phase: 'prompt_received',     ts: '2026-05-13T12:00:00Z', ms: 0 },
+      { phase: 'reasoning_started',   ts: '2026-05-13T12:00:00.150Z', ms: 150 },
+      { phase: 'reasoning_completed', ts: '2026-05-13T12:00:04.350Z', ms: 4350 },
+      { phase: 'first_output_token',  ts: null, ms: 5550, estimated: true },
+      { phase: 'completion',          ts: '2026-05-13T12:00:06.750Z', ms: 6750, tokens: 240 },
+    ],
+  };
+  const html = api.renderLlmCallTimeline(reasoningPayload);
+  truthy(html.indexOf('llm-call-timeline') >= 0, 'wrapper class rendered');
+  truthy(html.indexOf('llm-call-timeline-bar') >= 0, 'bar rendered');
+  // One marker per phase
+  const markerCount = (html.match(/llm-call-timeline-marker/g) || []).length;
+  eq(markerCount, 5, '5 markers rendered for reasoning payload');
+  // Model + reasoning + total span in the header
+  truthy(html.indexOf('claude-opus-4-7') >= 0, 'model name in header');
+  truthy(html.indexOf('6.8s') >= 0 || html.indexOf('6.7s') >= 0, 'total span in header');
+  truthy(html.indexOf('reasoning') >= 0, 'reasoning flag in header');
+  // Estimated marker carries the "*" footnote
+  truthy(html.indexOf('*') >= 0, 'estimated phase carries footnote marker');
+  truthy(html.indexOf('estimated') >= 0, 'footnote line explains "estimated"');
+
+  // (3) 3-phase non-reasoning payload renders 3 markers and "no reasoning".
+  const flatPayload = {
+    event_id: 'ev-2',
+    session_id: 'sess-nr',
+    model: 'claude-haiku-3-5',
+    reasoning: false,
+    phase_count: 3,
+    total_ms: 1200,
+    phases: [
+      { phase: 'prompt_received',    ts: '2026-05-13T12:10:00Z', ms: 0 },
+      { phase: 'first_output_token', ts: null, ms: 840, estimated: true },
+      { phase: 'completion',         ts: '2026-05-13T12:10:01.200Z', ms: 1200, tokens: 8 },
+    ],
+  };
+  const html2 = api.renderLlmCallTimeline(flatPayload);
+  const markerCount2 = (html2.match(/llm-call-timeline-marker/g) || []).length;
+  eq(markerCount2, 3, '3 markers rendered for non-reasoning payload');
+  truthy(html2.indexOf('no reasoning') >= 0, '"no reasoning" label in header');
+  truthy(html2.indexOf('1.2s') >= 0, 'total span 1.2s in header');
+
+  // (4) Empty / malformed payload → graceful fallback (no throw).
+  eq(api.renderLlmCallTimeline(null).indexOf('No timeline data') >= 0, true,
+     'null payload → "No timeline data."');
+  eq(api.renderLlmCallTimeline({phases: []}).indexOf('No timeline data') >= 0, true,
+     'empty phases → "No timeline data."');
+
+  // (5) Marker left% values are positioned proportionally to total_ms.
+  // Marker 0 (prompt_received, ms=0) → "left:calc(0.00% - 5px)".
+  // Marker 4 (completion, ms=6750) → "left:calc(100.00% - 5px)".
+  truthy(html.indexOf('left:calc(0.00% - 5px)') >= 0,
+         'first marker positioned at 0%');
+  truthy(html.indexOf('left:calc(100.00% - 5px)') >= 0,
+         'last marker positioned at 100%');
+}
+
+// ── Issue #1616 — Alternatives-considered toggle ──────────────────────
+//
+// Verifies the alternatives renderer + toggle handler:
+//   1. real alternatives payload → renders "Chose X over Y, Z" with
+//      no em-dashes (memory: feedback_no_em_dashes_in_user_facing_copy).
+//   2. empty alternatives → paints the honest "not available" hint with
+//      the #1616 tracking link.
+//   3. toggleToolAlternatives wires the data-ta attribute through and
+//      flips container.dataset.loaded for re-click collapse.
+console.log('tool alternatives toggle (issue #1616)');
+{
+  // Pull both renderers plus escHtml. The toggle handler is window-scoped
+  // and uses document.getElementById, so we stub a minimal DOM.
+  const sandbox = {
+    Date: Date,
+    JSON: JSON,
+    console: console,
+    document: null,
+    window: {},
+  };
+  let code = extractFunction('escHtml') + '\n';
+  code += extractFunction('_renderToolAlternativesPanel') + '\n';
+  code += extractFunction('_renderToolAlternativesUnavailable') + '\n';
+  // Pull the window.toggleToolAlternatives assignment by line range.
+  const lines = src.split('\n');
+  const startIdx = lines.findIndex(function(l) {
+    return l.indexOf('window.toggleToolAlternatives = function') >= 0;
+  });
+  if (startIdx < 0) throw new Error('toggleToolAlternatives not found in app.js');
+  // The function is short — closing "};" is within the next 20 lines.
+  let endIdx = startIdx;
+  for (let j = startIdx; j < startIdx + 25; j++) {
+    if (lines[j] && lines[j].trim() === '};') { endIdx = j; break; }
+  }
+  code += lines.slice(startIdx, endIdx + 1).join('\n') + '\n';
+  code += '\nthis.api = {' +
+          '  panel: _renderToolAlternativesPanel,' +
+          '  unavailable: _renderToolAlternativesUnavailable,' +
+          '  toggle: window.toggleToolAlternatives,' +
+          '};';
+
+  // Minimal stub DOM — single container, ids match what the toggle reads.
+  const containers = {};
+  sandbox.document = {
+    getElementById: function(id) {
+      if (!containers[id]) {
+        containers[id] = {
+          dataset: {},
+          innerHTML: '',
+        };
+      }
+      return containers[id];
+    },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+  const api = sandbox.api;
+
+  // (1) Real alternatives payload renders chosen-over-rejected line.
+  const payload = {
+    chosen: 'create_event',
+    chosen_score: 0.89,
+    source: 'logprobs',
+    alternatives: [
+      { name: 'send_email', score: 0.05 },
+      { name: 'ask_clarification', score: 0.06 },
+    ],
+  };
+  const html = api.panel(payload);
+  truthy(html.indexOf('create_event') !== -1, 'panel includes chosen tool name');
+  truthy(html.indexOf('send_email') !== -1, 'panel includes rejected alternative');
+  truthy(html.indexOf('over') !== -1, 'panel uses "over" phrasing (no em-dash)');
+  // Memory: no em-dashes in user-facing copy.
+  truthy(html.indexOf('—') === -1, 'panel contains NO em-dash');
+  truthy(html.indexOf('logprobs') !== -1, 'panel shows source attribution');
+
+  // (2) Empty alternatives → honest unavailable hint with tracking link.
+  const empty = api.unavailable();
+  truthy(empty.indexOf('not available') !== -1, 'unavailable hint shown');
+  truthy(empty.indexOf('1616') !== -1, 'links to tracking issue #1616');
+  truthy(empty.indexOf('—') === -1, 'unavailable hint contains NO em-dash');
+
+  // (3) toggleToolAlternatives reads data-ta attribute and flips loaded.
+  const fakeBtn = {
+    _attrs: { 'data-ta': JSON.stringify(payload) },
+    getAttribute: function(k) { return this._attrs[k] || null; },
+  };
+  api.toggle(fakeBtn, 'ta-test-1');
+  const c = containers['ta-test-1'];
+  eq(c.dataset.loaded, '1', 'first toggle → loaded=1');
+  truthy(c.innerHTML.indexOf('create_event') !== -1,
+         'first toggle → container shows chosen tool');
+  // Second click collapses (clears innerHTML, dataset.loaded=0).
+  api.toggle(fakeBtn, 'ta-test-1');
+  eq(c.dataset.loaded, '0', 'second toggle → loaded=0');
+  eq(c.innerHTML, '', 'second toggle → container cleared');
+
+  // (4) Toggle with null payload → renders unavailable hint, not crash.
+  const nullBtn = {
+    _attrs: { 'data-ta': 'null' },
+    getAttribute: function(k) { return this._attrs[k] || null; },
+  };
+  api.toggle(nullBtn, 'ta-test-2');
+  const c2 = containers['ta-test-2'];
+  truthy(c2.innerHTML.indexOf('not available') !== -1,
+         'null payload → unavailable hint rendered');
+}
+
+// ── Runtime filter: _cmRuntimeOf derivation (session-id prefix = runtime) ──
+console.log('_cmRuntimeOf (runtime from session-id prefix)');
+{
+  // Pull the runtime-label map, the prefix set, the OTLP registry + helpers,
+  // and the deriver. _cmRuntimeOf references _CM_RT_PREFIXES + _CM_OTLP_RT, so
+  // eval them together.
+  const labelSrc = src.match(/var _CM_RT_LABEL = \{[\s\S]*?\};/)[0];
+  const prefixSrc = src.match(/var _CM_RT_PREFIXES = \{[\s\S]*?\};/)[0];
+  const otlpSrc = src.match(/var _CM_OTLP_RT = \{\};/)[0];
+  const regFn = extractFunction('_cmRegisterOtlpRuntime');
+  const isOtlpFn = extractFunction('_cmIsOtlpRuntime');
+  const fnSrc = extractFunction('_cmRuntimeOf');
+  const sandbox = {};
+  vm.createContext(sandbox);
+  vm.runInContext(labelSrc + '\n' + prefixSrc + '\n' + otlpSrc + '\n'
+    + regFn + '\n' + isOtlpFn + '\n' + fnSrc
+    + '\nthis._f = _cmRuntimeOf; this._reg = _cmRegisterOtlpRuntime; this._isOtlp = _cmIsOtlpRuntime;', sandbox);
+  const rt = sandbox._f;
+  eq(rt({ id: 'qwen_code:f9f7f80f-c858' }), 'qwen_code', 'qwen_code: prefix → qwen_code');
+  eq(rt({ id: 'claude_code:bfb6be7d' }), 'claude_code', 'claude_code: prefix → claude_code');
+  eq(rt({ id: 'codex:019e28c2' }), 'codex', 'codex: prefix → codex');
+  eq(rt({ id: 'openclaw:abc' }), 'openclaw', 'openclaw: prefix → openclaw');
+  eq(rt({ id: '625c0ad9-71af-4a56' }), 'openclaw', 'bare uuid → openclaw (default)');
+  eq(rt({ id: 'clawmetry-selfevolve' }), 'openclaw', 'internal session → openclaw');
+  eq(rt({ trace_id: 'qwen_code:x' }), 'openclaw', 'trace_id is NOT read (only id/sessionId/session_id/key)');
+  eq(rt({ sessionId: 'goose:20260525_3' }), 'goose', 'sessionId field honoured');
+
+  // ── Foreign OTLP apps (no session prefix; agent_type filter) ──────────────
+  // Before registration, an unknown agent_type does NOT bucket to a phantom
+  // runtime; it stays openclaw (the default) — never mis-bucketed.
+  eq(rt({ session_id: 's1', agent_type: 'my_app' }), 'openclaw',
+     'unregistered OTLP agent_type → openclaw (no phantom)');
+  // Register the OTLP app (as the daemon's inventory/runtimeSummary would), then
+  // the deriver honours its agent_type, and ONLY its own data matches.
+  sandbox._reg('my_app', 'My App (OTel)');
+  truthy(sandbox._isOtlp('my_app'), 'registered app is recognised as OTLP');
+  eq(rt({ agent_type: 'my_app' }), 'my_app', 'registered OTLP app → matches its agent_type');
+  eq(rt({ runtime: 'my_app' }), 'my_app', 'OTLP app via runtime field');
+  // No leak: a native session id never resolves to the OTLP app, and the OTLP
+  // app id never resolves to a native runtime.
+  eq(rt({ id: 'claude_code:abc', agent_type: 'my_app' }), 'claude_code',
+     'native prefix wins over agent_type (no OTLP leak into native)');
+  eq(rt({ id: '625c0ad9-71af', agent_type: 'openclaw' }), 'openclaw',
+     'openclaw stays openclaw');
+  // Registering must never shadow a native runtime key.
+  sandbox._reg('claude_code', 'should-not-apply');
+  truthy(!sandbox._isOtlp('claude_code'), 'register cannot turn a native runtime into OTLP');
+}
+
+// ── Runtime filter: _cmApplyRuntimeScopeNote picks the right scope ─────────
+console.log('_cmApplyRuntimeScopeNote (honest note on aggregate / node-wide tabs)');
+{
+  const maps = src.match(/var _CM_RT_AGGREGATE = \{[\s\S]*?\};/)[0]
+    + '\n' + src.match(/var _CM_RT_NODEWIDE = \{[\s\S]*?\};/)[0]
+    + '\n' + src.match(/var _CM_RT_LABEL = \{[\s\S]*?\};/)[0];
+  const fnSrc = extractFunction('_cmApplyRuntimeScopeNote');
+  let filterVal = 'qwen_code';
+  function makePage() {
+    let kids = [];
+    const page = {
+      _html: '',
+      querySelector: function(sel) { return this._note || null; },
+      insertAdjacentHTML: function(pos, html) { this._html = html; this._note = { outerHTML: html, parentNode: this }; },
+    };
+    return page;
+  }
+  let thePage = null;
+  const sandbox = {
+    document: { getElementById: function(id) { return id === 'page-models' || id === 'page-crons' || id === 'page-tracing' ? (thePage = thePage || makePage()) : null; } },
+    escHtml: function(s) { return String(s); },
+    _cmRuntimeFilter: function() { return filterVal; },
+    _cmRuntimeLabel: function(rt) { return ({ qwen_code: 'Qwen Code' })[rt] || rt; },
+    // The scope note now short-circuits for OTLP runtimes; this suite tests the
+    // native-runtime branches, so report "not OTLP" for them.
+    _cmIsOtlpRuntime: function() { return false; },
+    // Multi-runtime node so the aggregate-note suppression (single-runtime
+    // installs hide the note) does not fire.
+    _cmGlobalRtCounts: { openclaw: 3, qwen_code: 2 },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(maps + '\n' + fnSrc + '\nthis._note = _cmApplyRuntimeScopeNote;', sandbox);
+
+  // aggregate tab (LLM Context) → "all runtimes" note mentioning the runtime.
+  // (usage/Cost moved to real per-runtime filtering; LLM Context is the
+  // remaining aggregate tab in _CM_RT_AGGREGATE.)
+  thePage = null; sandbox.document.getElementById = function(id) { return id === 'page-context' ? (thePage = thePage || makePage()) : null; };
+  sandbox._note('context');
+  truthy(thePage && thePage._html.indexOf('all runtimes') !== -1, 'aggregate tab → "all runtimes" note');
+  truthy(thePage._html.indexOf('Qwen Code') !== -1, 'aggregate note names the selected runtime');
+
+  // models is NO LONGER aggregate (it filters for real now) → no note
+  thePage = null; sandbox.document.getElementById = function(id) { return id === 'page-models' ? (thePage = thePage || makePage()) : null; };
+  sandbox._note('models');
+  truthy(thePage && thePage._html === '', 'models tab → no note (filters for real now)');
+
+  // node-wide tab (crons) → "node-wide" note
+  thePage = null; sandbox.document.getElementById = function(id) { return id === 'page-crons' ? (thePage = thePage || makePage()) : null; };
+  sandbox._note('crons');
+  truthy(thePage && thePage._html.indexOf('node-wide') !== -1, 'node-wide tab → "node-wide" note');
+
+  // filterable tab (tracing) → NO note (it filters itself)
+  thePage = null; sandbox.document.getElementById = function(id) { return id === 'page-tracing' ? (thePage = thePage || makePage()) : null; };
+  sandbox._note('tracing');
+  truthy(thePage && thePage._html === '', 'filterable tab → no scope note');
+
+  // filter === 'all' → never a note even on aggregate tab
+  filterVal = 'all'; thePage = null;
+  sandbox.document.getElementById = function(id) { return id === 'page-models' ? (thePage = thePage || makePage()) : null; };
+  sandbox._note('models');
+  truthy(thePage && thePage._html === '', 'all-runtimes selected → no note');
+}
+
+// ── Runtime filter: density chart honours _cmRuntimeFilter (image #14 bug) ─
+console.log('renderBrainChart + renderBrainStream apply the runtime filter');
+{
+  // Static guard against the class of bug that hit the Brain tab: the list
+  // (renderBrainStream) filtered by _cmRuntimeOf but the density chart
+  // (renderBrainChart) did NOT — so picking "Claude Code" showed an empty
+  // list AND a full bar chart from other runtimes. Both functions MUST apply
+  // the same runtime filter; if either drops the call, this test fails and
+  // future edits can't reintroduce the leak.
+  const stream = extractFunction('renderBrainStream');
+  const chart  = extractFunction('renderBrainChart');
+  truthy(/_cmRuntimeFilter\s*\(/.test(stream),
+         'renderBrainStream calls _cmRuntimeFilter()');
+  truthy(/_cmRuntimeOf\(\s*ev\s*\)/.test(stream),
+         'renderBrainStream filters events by _cmRuntimeOf(ev)');
+  truthy(/_cmRuntimeFilter\s*\(/.test(chart),
+         'renderBrainChart calls _cmRuntimeFilter() (image #14 leak guard)');
+  truthy(/_cmRuntimeOf\(\s*ev\s*\)/.test(chart),
+         'renderBrainChart filters events by _cmRuntimeOf(ev) (image #14 leak guard)');
+  // Channel filter should be mirrored too — otherwise the chart and list
+  // disagree when a channel pill is active.
+  truthy(/_brainChannelFilter/.test(chart),
+         'renderBrainChart honours the channel pill (mirrors the list)');
+}
+
+// ── Issue #3004 — Flow "Active Tools" backfill honours the runtime filter ─
+//
+// _backfillFlowFromBrain consumes node-wide /api/brain-history events to seed
+// the Flow tab's Active Tools row. Under a single-runtime switcher it must NOT
+// light up from OTHER runtimes' brain events. This test both (a) statically
+// guards the filter is present, and (b) actually runs the function with a
+// stubbed fetch returning a mix of claude_code + openclaw events and asserts
+// only the selected runtime's tool lights up flowStats.activeTools.
+console.log('_backfillFlowFromBrain scopes Active Tools by runtime (#3004)');
+{
+  const backfill = extractFunction('_backfillFlowFromBrain');
+  // (a) Static leak guard: the same client filter the Brain tab uses.
+  truthy(/_cmRuntimeFilter\s*\(/.test(backfill),
+         '_backfillFlowFromBrain calls _cmRuntimeFilter()');
+  truthy(/_cmClientFilterRt\s*\(/.test(backfill),
+         '_backfillFlowFromBrain collapses OTLP via _cmClientFilterRt()');
+  truthy(/_cmRuntimeOf\(\s*ev\s*\)/.test(backfill),
+         '_backfillFlowFromBrain filters events by _cmRuntimeOf(ev)');
+
+  // (b) Behavioural: run the real function under a stubbed environment.
+  // Two recent tool events, one per runtime (session-id prefix). With the
+  // switcher pinned to claude_code, only its tool must be marked active.
+  const now = new Date();
+  const recentIso = new Date(now.getTime() - 60 * 1000).toISOString(); // 1 min ago
+  const events = [
+    { id: 'claude_code:s1', type: 'EXEC', time: recentIso, tool: 'bash' },
+    { id: 'openclaw:s2',    type: 'READ', time: recentIso, tool: 'read' },
+  ];
+
+  function runBackfill(selectedRuntime) {
+    const activeTools = {};
+    const sandbox = {
+      Date: Date,
+      setTimeout: function() {},   // never expire within the test
+      console: console,
+      // brain-type → flow-tool: map EXEC→exec, READ→read so both events count.
+      _brainTypeToFlowTool: function(t) {
+        if (t === 'EXEC') return 'exec';
+        if (t === 'READ') return 'read';
+        return null;
+      },
+      // The two client-filter helpers + the prefix resolver, mirroring app.js.
+      _cmRuntimeFilter: function() { return selectedRuntime; },
+      _cmClientFilterRt: function(rt) { return rt; }, // no OTLP in this test
+      _cmRuntimeOf: function(o) {
+        const id = (o && (o.id || o.sessionId || o.session_id || o.key)) || '';
+        const i = id.indexOf(':');
+        return i > 0 ? id.slice(0, i).toLowerCase() : 'openclaw';
+      },
+      flowStats: { activeTools: activeTools },
+      updateFlowStats: function() {},
+      fetch: function() {
+        return Promise.resolve({ json: function() {
+          return Promise.resolve({ events: events });
+        } });
+      },
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(backfill + '\n_backfillFlowFromBrain();', sandbox);
+    return new Promise(function(resolve) {
+      setImmediate(function() { setImmediate(function() {
+        resolve(activeTools);
+      }); });
+    });
+  }
+
+  (async function() {
+    const ccOnly = await runBackfill('claude_code');
+    truthy(ccOnly['exec'] === true,
+           'claude_code selected → its EXEC tool lights up');
+    truthy(ccOnly['read'] === undefined,
+           'claude_code selected → openclaw READ tool does NOT light up (#3004)');
+
+    const all = await runBackfill('all');
+    truthy(all['exec'] === true && all['read'] === true,
+           'all runtimes selected → both tools light up (no filter)');
+
+    const ocOnly = await runBackfill('openclaw');
+    truthy(ocOnly['read'] === true,
+           'openclaw selected → its READ tool lights up');
+    truthy(ocOnly['exec'] === undefined,
+           'openclaw selected → claude_code EXEC tool does NOT light up');
+  })();
+}
+
+// ── Runtime pixel-logo helper (runtime-logos.js) ───────────────────────
+// cmRuntimeIcon(id,...) must return a <use href="#rt-<id>"> for a known id and
+// fall back to #rt-generic for an unknown id, never throwing. Evaluate the
+// actual shipped IIFE in a stubbed window/document sandbox.
+console.log('\ncmRuntimeIcon (runtime pixel logos, runtime-logos.js)');
+{
+  const RL_JS = path.join(__dirname, '..', 'clawmetry', 'static', 'js', 'runtime-logos.js');
+  const rlSrc = fs.readFileSync(RL_JS, 'utf8');
+  const win = {};
+  const sandbox = {
+    window: win,
+    document: {
+      readyState: 'complete',
+      getElementById: function () { return null; },
+      createElement: function () { return { style: {}, setAttribute: function () {}, set innerHTML(v) { this._h = v; }, get innerHTML() { return this._h; }, get firstChild() { return null; }, appendChild: function () {} }; },
+      addEventListener: function () {},
+      currentScript: null,
+      body: { appendChild: function () {} },
+      documentElement: { appendChild: function () {} }
+    },
+    fetch: function () { return Promise.resolve({ ok: false, text: function () { return Promise.resolve(''); } }); },
+    Number: Number, String: String, Math: Math, Object: Object, Promise: Promise
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(rlSrc, sandbox);
+
+  truthy(typeof win.cmRuntimeIcon === 'function', 'cmRuntimeIcon is defined');
+
+  const known = win.cmRuntimeIcon('claude_code', 16);
+  truthy(/href="#rt-claude_code"/.test(known), 'known id (claude_code) -> #rt-claude_code use');
+  truthy(/<svg/.test(known) && /<\/svg>/.test(known), 'known id returns a complete <svg>');
+
+  const chip = win.cmRuntimeIcon('openclaw', 18, { chip: true });
+  truthy(/href="#rt-openclaw-chip"/.test(chip), 'chip variant -> #rt-openclaw-chip use');
+
+  const unknown = win.cmRuntimeIcon('totally_made_up_runtime', 16);
+  truthy(/href="#rt-generic"/.test(unknown), 'unknown id -> #rt-generic fallback');
+
+  // Never throws on junk / empty / undefined input.
+  let threw = false;
+  try { win.cmRuntimeIcon(undefined); win.cmRuntimeIcon(''); win.cmRuntimeIcon(null, 0); } catch (e) { threw = true; }
+  truthy(!threw, 'cmRuntimeIcon never throws on undefined/empty/null');
+  truthy(/href="#rt-generic"/.test(win.cmRuntimeIcon(undefined)), 'undefined id -> #rt-generic');
+
+  truthy(win.cmRuntimeBrand('claude_code') === '#d97757', 'cmRuntimeBrand(claude_code) -> manifest hex');
+  truthy(win.cmRuntimeBrand('nope') === '#8b97ad', 'cmRuntimeBrand(unknown) -> neutral fallback hue');
+  truthy(win.cmRuntimeKnown('codex') === true && win.cmRuntimeKnown('nope') === false, 'cmRuntimeKnown known/unknown');
+}
+
+// Auth-bootstrap scenarios above are async — wait for the microtask /
+// macrotask queue to drain before printing the summary. (The previous
+// synchronous test blocks all completed in-tick, so no wait was needed
+// for them; ordering still holds.) Four setImmediate hops cover the
+// detected-token → checkAuth → /api/auth/check chain inside each
+// scenario's runBootstrap helper plus a buffer tick.
+setImmediate(function() {
+  setImmediate(function() {
+    setImmediate(function() {
+      setImmediate(function() {
+        console.log('\n' + (failed === 0 ? 'PASS' : 'FAIL') + ' — ' + passed + ' passed, ' + failed + ' failed');
+        process.exit(failed === 0 ? 0 : 1);
+      });
+    });
+  });
+});

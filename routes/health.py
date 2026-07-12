@@ -12,6 +12,7 @@ Owns the 11 routes registered on bp_health:
   GET  /api/service-status        — compact service_status for fleet heartbeat
   GET  /api/heartbeat-status      — heartbeat gap alerting status
   POST /api/heartbeat-ping        — record a heartbeat from frontend
+  GET  /api/agent-presence        — is any underlying agent (OpenClaw / NemoClaw) installed?
   GET  /api/rate-limits           — rolling 1m/1h API rate-limit utilisation
   GET  /api/health-stream         — SSE auto-refresh of health checks (30s)
   GET  /api/sandbox-status        — sandbox / inference / security posture
@@ -32,6 +33,8 @@ Module-level helpers (``_history_db``, ``AgentReliabilityScorer``,
 ``app``) stay in ``dashboard.py`` and are reached via late
 ``import dashboard as _d``. Pure mechanical move — zero behaviour change.
 """
+
+from __future__ import annotations
 
 import hashlib
 import json
@@ -1326,14 +1329,102 @@ def api_system_health():
             "security": _d._detect_security_metadata(),
             "service_status": service_status,
             "daemon": daemon_health,
+            "daemon_error_rate_per_min": round(
+                daemon_health.get("errors_last_5min", 0) / 5.0, 2
+            ),
             "gateway": gateway_health,
             # Issue #1310 follow-up — per-provider channel ingest summary
             # so operators see whether the gateway WS tap is actually
             # writing Telegram/Signal/Slack/etc. messages to DuckDB.
             "channel_ingest": _channel_ingest_recent(),
+            # Connector liveness (incident 2026-05-24: a node went deaf for
+            # ~37h with no alarm). Per enabled channel: is the inbound poll
+            # alive? 'down' = stopped receiving messages — the one that bites.
+            "connector_liveness": _connector_liveness(),
             "_source": top_source,
         }
     )
+
+
+# Freshness window for the DuckDB fast path. The sync daemon captures one
+# ``gateway.metric`` sample every 30s and dedupes near-identical samples for
+# up to 5 min (GATEWAY_METRIC_INTERVAL_SEC + GATEWAY_METRIC_DEDUP_WINDOW_SEC
+# in clawmetry/sync.py). 10 min keeps us safely past the dedupe horizon
+# while still flagging "DuckDB has nothing recent → defer to live psutil".
+_GATEWAY_HEALTH_FAST_PATH_MAX_AGE_SEC = 600
+
+
+def _try_local_store_gateway_health():
+    """Fast path for /api/gateway-health — read the most-recent
+    ``gateway.metric`` event the sync daemon has already captured to
+    DuckDB instead of re-running the psutil/ps live probe on every poll
+    (Tier-1 #1565).
+
+    Why the migration:
+      * The legacy ``compute_gateway_health()`` shells out to ``ps`` (or
+        invokes ``psutil``) every request, which costs ~30-80ms on macOS
+        per call and is the dominant cost when an external monitor polls
+        this endpoint at sub-minute cadence.
+      * On a multi-node fleet, the dashboard process may not see the
+        gateway PID at all (different container / different namespace),
+        producing a misleading ``not_running`` even when DuckDB has
+        recent samples written by the sibling daemon on the host where
+        the gateway actually lives.
+      * The sync daemon already writes ``gateway.metric`` events every
+        30s (clawmetry/sync.py::capture_gateway_metric) with the exact
+        ``{pid, uptime_seconds, rss_mb, cpu_pct}`` quartet we need.
+
+    Returns the canonical ``compute_gateway_health()`` shape with the
+    additional ``_source: 'local_store'`` marker so the audit canary can
+    confirm DuckDB-first service. Returns ``None`` to defer to the live
+    probe when:
+      * DuckDB is unreachable (no daemon, no fallback handle), OR
+      * no ``gateway.metric`` event exists in the freshness window
+        (fresh install or daemon down for >10 min).
+
+    The freshness gate is intentional: a 30-minute-old DuckDB sample is
+    NOT a useful health reading; the operator wants to know the gateway
+    is alive *now*, so we defer to ``compute_gateway_health()`` which
+    will correctly report ``not_running`` instead of returning stale
+    vitals tagged ``healthy``.
+    """
+    cutoff_iso = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=_GATEWAY_HEALTH_FAST_PATH_MAX_AGE_SEC)
+    ).isoformat()
+    # Pull just enough rows to find the freshest sample (DuckDB returns
+    # newest-first under ``query_events``). limit=1 keeps the daemon-proxy
+    # round-trip cheap.
+    rows = _ls_call(
+        "query_events",
+        event_type="gateway.metric",
+        since=cutoff_iso,
+        limit=1,
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    data = row.get("data") if isinstance(row.get("data"), dict) else {}
+    rss_mb = data.get("rss_mb")
+    cpu_pct = data.get("cpu_pct")
+    pid = data.get("pid")
+    uptime = data.get("uptime_seconds")
+    # The sync daemon never writes a sample with status=not_running
+    # (capture_gateway_metric returns early on that branch), so any row we
+    # find here represents a live gateway as of `ts`. Re-classify from
+    # rss_mb so we honour the same warning/critical thresholds the legacy
+    # path uses.
+    status = _classify_gateway_status(rss_mb, GATEWAY_MEMORY_THRESHOLD_MB)
+    return {
+        "pid": pid,
+        "uptime_seconds": uptime,
+        "rss_mb": rss_mb,
+        "cpu_pct": cpu_pct,
+        "status": status,
+        "memory_threshold_mb": GATEWAY_MEMORY_THRESHOLD_MB,
+        "sample_ts": row.get("ts"),
+        "_source": "local_store",
+    }
 
 
 @bp_health.route("/api/gateway-health")
@@ -1343,7 +1434,19 @@ def api_gateway_health():
     Mirrors the ``gateway`` block returned by ``/api/system-health`` so an
     operator (or external monitor) can poll just this surface without
     pulling the full system-health payload.
+
+    Issue #1565 Tier-1: prefer the DuckDB fast path (recent
+    ``gateway.metric`` event written by the sync daemon) when
+    ``CLAWMETRY_LOCAL_STORE_READ=1``. Falls through to the live psutil/ps
+    probe when DuckDB has no recent sample or the env gate is off.
     """
+    if is_local_store_read_enabled():
+        try:
+            fast = _try_local_store_gateway_health()
+        except Exception:
+            fast = None
+        if fast is not None:
+            return jsonify(fast)
     try:
         return jsonify(compute_gateway_health())
     except Exception:
@@ -1459,6 +1562,42 @@ def _channel_ingest_recent():
     # Most-recently-active provider first.
     out.sort(key=lambda r: r.get("mins_ago") if r.get("mins_ago") is not None else 1e9)
     return out
+
+
+# ── Connector liveness ("agent went deaf and nobody noticed") ───────────────
+# A channel went deaf for ~37h with no alarm (2026-05-24): the inbound
+# long-poll wedged but outbound (crons) kept working, so health stayed green.
+# The daemon records connector.health signals (sync.sync_connector_health
+# _from_logs); the classifier is shared with the cloud snapshot builder in
+# ``clawmetry/connector_health.py`` so the local UI and cloud never disagree.
+def _connector_liveness():
+    """Per-enabled-channel inbound-poll verdict for the System Health UI.
+
+    Returns ``[{provider, state, reason, mins_ago, last_kind}, ...]`` with
+    ``state`` ∈ ``down`` | ``degraded`` | ``unknown`` | ``ok`` (worst first).
+    Reads connector.health signals via the daemon proxy (DuckDB-first);
+    returns ``[]`` on any failure — never blocks /api/system-health.
+    """
+    from clawmetry.connector_health import (
+        enabled_channels_from_config, classify_connector_liveness,
+    )
+    enabled = enabled_channels_from_config()
+    if not enabled:
+        return []
+    rows = None
+    try:
+        from routes.local_query import local_store_via_daemon
+        rows = local_store_via_daemon("query_connector_health", since_hours=24)
+    except Exception:
+        rows = None
+    if rows is None:
+        try:
+            from clawmetry import local_store
+            store = local_store.get_store(read_only=True)
+            rows = store.query_connector_health(since_hours=24)
+        except Exception:
+            rows = []
+    return classify_connector_liveness(enabled, rows)
 
 
 def _summarise_gateway_metric_recent(minutes: int = 60):
@@ -1833,14 +1972,32 @@ def _try_local_store_service_status():
     Returns ``None`` when no recent heartbeat exists — the legacy handler
     will then live-probe the gateway port + run pgrep, which is the right
     behaviour for a node that has never written to the local store.
+
+    MOAT Tier-1 sweep (refs #1565): route through the daemon HTTP proxy
+    first. The previous direct ``local_store.get_store(read_only=True)``
+    open silently failed on multi-process installs (DuckDB exclusive lock
+    blocks even RO opens — see memory ``reference_duckdb_process_lock.md``),
+    forcing /api/service-status to fall through to a live gateway probe
+    + pgrep on every poll for every standard launchd / systemd user.
     """
-    try:
-        from clawmetry import local_store
-        # CRITICAL: read_only=True — see #1228.
-        store = local_store.get_store(read_only=True)
-        hb_rows = store.query_heartbeats(limit=1)
-    except Exception:
-        return None
+    from routes.local_query import local_store_via_daemon
+
+    def _query(method, **kwargs):
+        """Daemon proxy first, single-process direct open as fallback."""
+        try:
+            rows = local_store_via_daemon(method, **kwargs)
+            if rows is not None:
+                return rows
+        except Exception:
+            pass
+        try:
+            from clawmetry import local_store
+            store = local_store.get_store(read_only=True)
+            return getattr(store, method)(**kwargs)
+        except Exception:
+            return None
+
+    hb_rows = _query("query_heartbeats", limit=1)
     if not hb_rows:
         return None
     hb = hb_rows[0]
@@ -1862,13 +2019,10 @@ def _try_local_store_service_status():
     node_id = hb.get("node_id")
 
     def _latest_snapshot(kind: str):
-        try:
-            rows = store.query_system_snapshots(node_id=node_id, kind=kind, limit=1)
-            if not rows:
-                rows = store.query_system_snapshots(kind=kind, limit=1)
-            return rows[0] if rows else None
-        except Exception:
-            return None
+        rows = _query("query_system_snapshots", node_id=node_id, kind=kind, limit=1)
+        if not rows:
+            rows = _query("query_system_snapshots", kind=kind, limit=1)
+        return rows[0] if rows else None
 
     gw_snap = _latest_snapshot("gateway")
     if gw_snap and isinstance(gw_snap.get("data"), dict):
@@ -2138,10 +2292,197 @@ def api_heartbeat_ping():
     return jsonify({"ok": True})
 
 
+@bp_health.route("/api/agent-presence")
+def api_agent_presence():
+    """Return whether any underlying agent (OpenClaw / NVIDIA NemoClaw) is
+    installed and producing data. Sibling of ``/api/heartbeat-status``
+    that answers a different question (see ``detect_agent_install``
+    docstring in dashboard.py).
+
+    Frontend uses this to render the "No agent detected" page-level empty
+    state when ``no_agent=true``, so users who installed ClawMetry without
+    an agent see actionable copy + install links instead of an empty
+    dashboard that looks broken.
+    """
+    import dashboard as _d
+    return jsonify(_d.detect_agent_install())
+
+
+def _try_local_store_rate_limits():
+    """Fast path for /api/rate-limits — derive rolling 1m/1h utilisation
+    from the DuckDB ``events`` table instead of the per-process in-memory
+    ``metrics_store`` ring buffer.
+
+    Why the migration: the legacy handler aggregates only the LLM
+    token/cost events the *current dashboard process* witnessed via OTLP
+    + the in-process interceptor (see ``dashboard._record_token_event``
+    callers). On a fresh dashboard restart the buffer is empty and the
+    panel reads "0% utilisation" for several minutes until traffic
+    re-populates it; on multi-node fleets the buffer also misses spend
+    that landed on sibling nodes. The DuckDB ``events`` table is the
+    canonical, cross-process, cross-restart store — every cost-bearing
+    event the sync daemon ingests (Anthropic SDK echo, OpenClaw v3
+    ``model.completed`` bubbles, OTLP-relayed metrics) lands there with
+    a stable ``model``/``cost_usd``/``token_count`` column trio plus a
+    ``data`` blob carrying the raw ``usage`` dict for input/output
+    splits.
+
+    AUDIT FALSE-POSITIVE NOTE (refs #1565): Eng C's audit flagged this
+    route as "JSONL-fallback" but the actual legacy path is the
+    in-memory ``metrics_store`` (no JSONL walker). The migration is
+    still worth doing — promoting to the canonical DuckDB helper makes
+    the response visible to the audit canary (_source tag) and survives
+    dashboard restarts — but the audit row should be relabelled
+    "in-memory ring → DuckDB events" rather than "JSONL → DuckDB".
+
+    Returns ``None`` when the store is unreachable so the legacy
+    in-memory aggregation still serves. Returns a populated zero-shell
+    when the store is reachable but no cost-bearing events exist (fresh
+    install) — same shape the legacy handler emits for an empty buffer,
+    so the dashboard panel renders "no traffic" instantly instead of
+    waiting for the legacy path to confirm the same empty answer.
+    """
+    now = time.time()
+    one_min_ago = now - 60
+    one_hour_ago = now - 3600
+    since_iso = datetime.fromtimestamp(one_hour_ago, tz=timezone.utc).isoformat()
+
+    # query_events sorts newest-first and is bounded by the daemon-proxy
+    # row cap. 5k rows ≈ 80+ requests/min for a full hour — plenty of
+    # headroom while keeping the JSON payload modest. Anything older than
+    # 1h doesn't contribute to either rolling window.
+    rows = _ls_call("query_events", since=since_iso, limit=5000)
+    if rows is None:
+        return None
+
+    import dashboard as _d
+
+    # Buckets keyed by canonical provider name (anthropic/openai/google/...).
+    providers: dict = {}
+
+    def _get_p(prov):
+        if prov not in providers:
+            providers[prov] = {
+                'rpm_1m': 0, 'tokens_in_1m': 0, 'tokens_out_1m': 0,
+                'tokens_in_1h': 0, 'tokens_out_1h': 0,
+                'request_count_1h': 0, 'cost_1h': 0.0,
+                'models': set(),
+            }
+        return providers[prov]
+
+    def _row_ts_epoch(ev):
+        ts = ev.get("ts")
+        if isinstance(ts, (int, float)):
+            return float(ts)
+        try:
+            return datetime.fromisoformat(
+                str(ts).replace("Z", "+00:00")
+            ).timestamp()
+        except Exception:
+            return 0.0
+
+    # Event-type filter: only count cost/token-bearing turns. v3 real
+    # data emits ``model.completed`` and bare ``assistant`` (no synthetic
+    # ``message`` rows — per reference_openclaw_v3_event_types.md and
+    # feedback_synthetic_tests_missed_real_event_shape.md). Keep the
+    # legacy ``message`` string for synthetic harnesses.
+    BILLABLE_TYPES = {
+        "message", "assistant", "model.completed",
+        "subagent:assistant", "user",
+    }
+
+    for ev in rows:
+        et = (ev.get("event_type") or "").strip()
+        if et and et not in BILLABLE_TYPES:
+            continue
+        ts = _row_ts_epoch(ev)
+        if ts < one_hour_ago:
+            continue
+
+        # Extract input/output token splits. The ``token_count`` column
+        # is the SUM, the ``data`` blob carries the breakdown. Walk both
+        # the Anthropic-SDK echo shape (data.message.usage) AND the
+        # OpenClaw-native v3 shape (data.assistantMessage.usage) so we
+        # don't silently zero one or the other.
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        usage = {}
+        msg = data.get("message") if isinstance(data.get("message"), dict) else None
+        am = data.get("assistantMessage") if isinstance(data.get("assistantMessage"), dict) else None
+        if isinstance(msg, dict) and isinstance(msg.get("usage"), dict):
+            usage = msg["usage"]
+        elif isinstance(am, dict) and isinstance(am.get("usage"), dict):
+            usage = am["usage"]
+        elif isinstance(data.get("usage"), dict):
+            usage = data["usage"]
+        in_tok = int(usage.get("input_tokens") or usage.get("input") or 0)
+        out_tok = int(usage.get("output_tokens") or usage.get("output") or 0)
+        # Fall back to the coarse token_count column when the usage dict
+        # is missing entirely (e.g. legacy rows pre-v3).
+        total = int(ev.get("token_count") or 0)
+        if not (in_tok or out_tok) and total:
+            # Best-effort split: count as input (Anthropic-style prompt
+            # counts dominate). Better than zero.
+            in_tok = total
+            out_tok = 0
+
+        model = ev.get("model") or (data.get("model") if isinstance(data.get("model"), str) else "") or "unknown"
+        provider = _d._infer_provider({"provider": data.get("provider"), "model": model})
+
+        p = _get_p(provider)
+        p['models'].add(model)
+        if ts >= one_min_ago:
+            p['rpm_1m'] += 1
+            p['tokens_in_1m'] += in_tok
+            p['tokens_out_1m'] += out_tok
+        p['request_count_1h'] += 1
+        p['tokens_in_1h'] += in_tok
+        p['tokens_out_1h'] += out_tok
+        p['cost_1h'] += float(ev.get("cost_usd") or 0.0)
+
+    result = []
+    for prov, stats in sorted(providers.items()):
+        limits = _d._DEFAULT_RATE_LIMITS.get(
+            prov,
+            {'rpm': 60, 'tpm_input': 100_000, 'tpm_output': 20_000, 'label': prov.title()},
+        )
+        rpm_pct = round(stats['rpm_1m']        / limits['rpm']        * 100, 1) if limits['rpm']        else 0
+        in_pct  = round(stats['tokens_in_1m']  / limits['tpm_input']  * 100, 1) if limits['tpm_input']  else 0
+        out_pct = round(stats['tokens_out_1m'] / limits['tpm_output'] * 100, 1) if limits['tpm_output'] else 0
+        worst = max(rpm_pct, in_pct, out_pct)
+        result.append({
+            'provider': prov,
+            'label':    limits.get('label', prov.title()),
+            'models':   sorted(stats['models']),
+            'rpm':       {'current': stats['rpm_1m'],        'limit': limits['rpm'],        'pct': rpm_pct},
+            'tpm_input': {'current': stats['tokens_in_1m'],  'limit': limits['tpm_input'],  'pct': in_pct},
+            'tpm_output':{'current': stats['tokens_out_1m'], 'limit': limits['tpm_output'], 'pct': out_pct},
+            'hour': {
+                'requests':   stats['request_count_1h'],
+                'tokens_in':  stats['tokens_in_1h'],
+                'tokens_out': stats['tokens_out_1h'],
+                'cost_usd':   round(stats['cost_1h'], 4),
+            },
+            'utilization_pct': worst,
+            'status': 'red' if worst >= 90 else ('amber' if worst >= 70 else 'green'),
+        })
+
+    result.sort(key=lambda x: x['utilization_pct'], reverse=True)
+    return {
+        'providers': result,
+        'timestamp': now,
+        '_source': 'local_store',
+    }
+
+
 @bp_health.route('/api/rate-limits')
 def api_rate_limits():
     """Return rolling 1-minute and 1-hour API rate limit utilisation per provider."""
     import dashboard as _d
+    if is_local_store_read_enabled():
+        fast = _try_local_store_rate_limits()
+        if fast is not None:
+            return jsonify(fast)
+
     now = time.time()
     one_min_ago = now - 60
     one_hour_ago = now - 3600
@@ -2652,11 +2993,20 @@ def api_loop_signals():
            "first_seen": str, "last_seen": str, "severity": str,
            "agent_type": str, "details": dict|str|None}
         ],
-        "count": <int>
+        "count": <int>,
+        "total_count": <int>,         # rows the store would have returned
+        "capped_pro_gated": <bool>    # True when OSS cap dropped rows
       }
 
     Empty-list fallback (HTTP 200) on any error so the badge never breaks
     the page.
+
+    OSS / Cloud-Free gating (issue #1376): Cloud-Pro is the home of loop
+    history, alert-on-N-loops, and Slack/PagerDuty dispatch. Shipping the
+    full table in OSS leaks that value. We cap OSS callers to a single
+    teaser row and flag the response so the UI can render the upgrade CTA.
+    Cloud-Pro users (validated by ``dashboard._is_pro_user``) keep the
+    full table.
     """
     try:
         limit = int(request.args.get("limit", 20))
@@ -2667,6 +3017,13 @@ def api_loop_signals():
     except (TypeError, ValueError):
         since_minutes = 60
 
+    # Pro gate (issue #1376). Fail closed: any error → OSS cap applies.
+    try:
+        import dashboard as _d
+        is_pro = bool(_d._is_pro_user())
+    except Exception:
+        is_pro = False
+
     rows = _ls_call(
         "query_recent_loop_signals",
         limit=limit,
@@ -2674,7 +3031,19 @@ def api_loop_signals():
     )
     if rows is None:
         rows = []
-    return jsonify({"signals": rows, "count": len(rows)})
+
+    total_count = len(rows)
+    capped_pro_gated = False
+    if not is_pro and total_count > 1:
+        rows = rows[:1]
+        capped_pro_gated = True
+
+    return jsonify({
+        "signals": rows,
+        "count": len(rows),
+        "total_count": total_count,
+        "capped_pro_gated": capped_pro_gated,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -2954,3 +3323,295 @@ def api_handler_latency():
     stats = latency_tracker.get_stats(top_n=top_n, slow_threshold_ms=slow_ms)
     stats["_source"] = "in_memory"
     return jsonify(stats)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2861 -- version-aware health regression detection
+# ---------------------------------------------------------------------------
+
+_REGRESSION_THRESHOLD_PCT = 30.0
+_REGRESSION_MIN_SESSIONS = 3
+
+
+def _compute_version_regression(versions: list[dict]) -> dict:
+    """Flag degradation between the two most-recent OpenClaw versions.
+
+    Compares versions[0] (current) with versions[1] (previous) on cost,
+    error_rate, and avg_tokens.  Emits a banner string when any metric
+    worsens by more than _REGRESSION_THRESHOLD_PCT percent, provided both
+    versions have at least _REGRESSION_MIN_SESSIONS sessions so sparse
+    data doesn't trigger false positives.
+    """
+    regression: dict = {"detected": False}
+    if len(versions) >= 2:
+        current = versions[0]
+        baseline = versions[1]
+        if (current["session_count"] >= _REGRESSION_MIN_SESSIONS
+                and baseline["session_count"] >= _REGRESSION_MIN_SESSIONS):
+            for metric, label in [
+                ("avg_cost_usd", "Cost"),
+                ("error_rate", "Error rate"),
+                ("avg_tokens", "Token usage"),
+            ]:
+                base_val = float(baseline.get(metric) or 0)
+                curr_val = float(current.get(metric) or 0)
+                if base_val > 0:
+                    change_pct = (curr_val - base_val) / base_val * 100.0
+                    if change_pct > _REGRESSION_THRESHOLD_PCT:
+                        try:
+                            from datetime import datetime as _dt
+                            ago_days = (
+                                _dt.utcnow()
+                                - _dt.fromisoformat(
+                                    (current.get("first_seen") or "")[:10]
+                                )
+                            ).days
+                            ago_str = (
+                                f" -- {ago_days} day{'s' if ago_days != 1 else ''} ago"
+                            )
+                        except Exception:
+                            ago_str = ""
+                        regression = {
+                            "detected": True,
+                            "current_version": current["version"],
+                            "baseline_version": baseline["version"],
+                            "metric": label.lower(),
+                            "change_pct": round(change_pct, 1),
+                            "banner": (
+                                f"{label} +{round(change_pct)}% since upgrade to "
+                                f"{current['version']}{ago_str}"
+                            ),
+                        }
+                        break
+    return regression
+
+
+def _try_local_store_version_health(window_days: int) -> dict | None:
+    """Daemon-proxy first, then direct read-only store fallback."""
+    try:
+        from routes.local_query import local_store_via_daemon
+        rows = local_store_via_daemon("query_version_health", window_days=window_days)
+        if rows is not None:
+            return {
+                "versions": rows,
+                "regression": _compute_version_regression(rows),
+                "_source": "duckdb",
+            }
+    except Exception:
+        pass
+    try:
+        from clawmetry import local_store
+        store = local_store.get_store(read_only=True)
+        rows = store.query_version_health(window_days=window_days)
+        return {
+            "versions": rows,
+            "regression": _compute_version_regression(rows),
+            "_source": "duckdb",
+        }
+    except Exception:
+        return None
+
+
+@bp_health.route("/api/version-health")
+def api_version_health():
+    """Per-OpenClaw-version session metric rollup with regression flags.
+
+    Joins sessions with heartbeats to assign each session the OpenClaw
+    version active at session start, then groups by version and checks
+    whether the current version shows >30% degradation vs the previous on
+    cost / error-rate / token usage.
+
+    Query params (all optional):
+      window_days  -- lookback window in days (default 90, clamp 7..365)
+
+    Response shape:
+      {
+        "versions": [
+          { "version": str, "session_count": int,
+            "avg_cost_usd": float, "avg_tokens": float,
+            "avg_messages": float, "error_rate": float,
+            "first_seen": str, "last_seen": str }
+        ],
+        "regression": {
+          "detected": bool,
+          "current_version": str,   # only when detected=true
+          "baseline_version": str,
+          "metric": str,
+          "change_pct": float,
+          "banner": str
+        },
+        "_source": "duckdb" | "unavailable"
+      }
+    """
+    try:
+        window_days = max(7, min(365, int(request.args.get("window_days", 90))))
+    except (TypeError, ValueError):
+        window_days = 90
+
+    if is_local_store_read_enabled():
+        fast = _try_local_store_version_health(window_days)
+        if fast is not None:
+            return jsonify(fast)
+
+    return jsonify({
+        "versions": [],
+        "regression": {"detected": False},
+        "_source": "unavailable",
+    })
+
+
+@bp_health.route("/api/authority-violations")
+def api_authority_violations():
+    """Return recent authority-violation events from the enforcement proxy (#3305).
+
+    Query params:
+      session_id — narrow to one session
+      since      — ISO timestamp lower bound
+      limit      — max rows (default 200)
+    """
+    session_id = (request.args.get("session_id") or "").strip() or None
+    since = (request.args.get("since") or "").strip() or None
+    try:
+        limit = max(1, min(1000, int(request.args.get("limit", 200))))
+    except (TypeError, ValueError):
+        limit = 200
+
+    rows = None
+    if is_local_store_read_enabled():
+        try:
+            from routes.local_query import local_store_via_daemon
+            rows = local_store_via_daemon(
+                "query_authority_violations",
+                session_id=session_id,
+                since=since,
+                limit=limit,
+            )
+        except Exception:
+            rows = None
+
+    if rows is None:
+        try:
+            from clawmetry import local_store as _ls
+            rows = _ls.get_store().query_authority_violations(
+                session_id=session_id, since=since, limit=limit
+            )
+        except Exception:
+            rows = []
+
+    return jsonify({"violations": rows or [], "total": len(rows or [])})
+
+
+@bp_health.route("/api/security-threats")
+def api_security_threats_history():
+    """Return persisted security-threat events from DuckDB (#3302).
+
+    These are written by /api/security/threats each time a scan runs.
+    Query params:
+      session_id — narrow to one session
+      severity   — filter by severity (critical/high/medium/low)
+      since      — ISO timestamp lower bound
+      limit      — max rows (default 200)
+    """
+    session_id = (request.args.get("session_id") or "").strip() or None
+    severity = (request.args.get("severity") or "").strip() or None
+    since = (request.args.get("since") or "").strip() or None
+    try:
+        limit = max(1, min(1000, int(request.args.get("limit", 200))))
+    except (TypeError, ValueError):
+        limit = 200
+
+    rows = None
+    if is_local_store_read_enabled():
+        try:
+            from routes.local_query import local_store_via_daemon
+            rows = local_store_via_daemon(
+                "query_security_events",
+                session_id=session_id,
+                severity=severity,
+                since=since,
+                limit=limit,
+            )
+        except Exception:
+            rows = None
+
+    if rows is None:
+        try:
+            from clawmetry import local_store as _ls
+            rows = _ls.get_store().query_security_events(
+                session_id=session_id, severity=severity, since=since, limit=limit
+            )
+        except Exception:
+            rows = []
+
+    return jsonify({"threats": rows or [], "total": len(rows or [])})
+
+
+@bp_health.route("/api/audit-log")
+def api_audit_log():
+    """Return operator audit-log entries from DuckDB (#3306).
+
+    Records human actions (approve, deny, kill_session, config_change, etc.)
+    written via ``ingest_audit_log_entry``. Auth / RBAC enforcement is
+    cloud-side; this endpoint is the OSS read surface.
+
+    Query params:
+      actor      — filter by actor identity
+      action     — filter by action type
+      session_id — narrow to one session
+      since      — ISO timestamp lower bound
+      limit      — max rows (default 200)
+    """
+    actor = (request.args.get("actor") or "").strip() or None
+    action = (request.args.get("action") or "").strip() or None
+    session_id = (request.args.get("session_id") or "").strip() or None
+    since = (request.args.get("since") or "").strip() or None
+    try:
+        limit = max(1, min(1000, int(request.args.get("limit", 200))))
+    except (TypeError, ValueError):
+        limit = 200
+
+    rows = None
+    if is_local_store_read_enabled():
+        try:
+            from routes.local_query import local_store_via_daemon
+            rows = local_store_via_daemon(
+                "query_audit_log",
+                actor=actor,
+                action=action,
+                session_id=session_id,
+                since=since,
+                limit=limit,
+            )
+        except Exception:
+            rows = None
+
+    if rows is None:
+        try:
+            from clawmetry import local_store as _ls
+            rows = _ls.get_store().query_audit_log(
+                actor=actor, action=action, session_id=session_id,
+                since=since, limit=limit,
+            )
+        except Exception:
+            rows = []
+
+    return jsonify({"entries": rows or [], "total": len(rows or [])})
+
+
+@bp_health.route("/api/doctor-findings")
+def api_doctor_findings():
+    """Return structured ``openclaw doctor`` diagnostic findings (#3468).
+
+    Runs ``openclaw doctor --json`` and surfaces the categorised findings
+    (auth-profile, workspace, device-pairing, channel-plugin, memory-provider,
+    systemd-exhaustion, Windows LAN-firewall) so the dashboard can show
+    misconfiguration alerts without the user having to run the CLI manually.
+    Returns ``{"findings": [], "count": 0}`` when openclaw is absent or the
+    harness version pre-dates the ``--json`` flag.
+    """
+    try:
+        from clawmetry.adapters.openclaw import _openclaw_doctor_findings
+        findings = _openclaw_doctor_findings()
+    except Exception:
+        findings = []
+    return jsonify({"findings": findings, "count": len(findings)})

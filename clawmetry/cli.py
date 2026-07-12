@@ -247,13 +247,15 @@ def _stop_existing_daemon() -> None:
         )
     elif system == "Linux":
         if __import__("shutil").which("systemctl"):
-            subprocess.run(
-                ["systemctl", "--user", "stop", "clawmetry-sync"],
-                check=False,
-                capture_output=True,
-            )
-        else:
-            _kill_sync_daemon()
+            # Stop whichever scope owns it: --user (non-root) or system (root).
+            for _scope in (["--user"], []):
+                subprocess.run(
+                    ["systemctl", *_scope, "stop", "clawmetry-sync"],
+                    check=False,
+                    capture_output=True,
+                )
+        # Belt-and-braces: also kill any bare background subprocess daemon.
+        _kill_sync_daemon()
 
     # Send offline heartbeat for old node to deregister it from cloud
     if old_node_id and old_api_key:
@@ -283,8 +285,129 @@ def _stop_existing_daemon() -> None:
         LOG_FILE.write_text("")
 
 
+def _is_headless() -> bool:
+    """True when webbrowser.open() almost certainly can't reach a GUI on THIS host.
+
+    Used only to ORDER the auth flows, never as a hard gate: the headless path is
+    an interactive paste prompt (not a timed wait), so a wrong guess can never
+    hang the CLI. macOS/Windows always have a usable browser. On Linux, no
+    DISPLAY/WAYLAND or an SSH session means the browser would open on a DIFFERENT
+    machine (the loopback callback can't reach this box). CLAWMETRY_NO_BROWSER=1
+    forces it (for users who know their box, and for the live test).
+    """
+    if os.environ.get("CLAWMETRY_NO_BROWSER") == "1":
+        return True
+    if sys.platform in ("darwin", "win32"):
+        return False
+    no_display = not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY")
+    ssh = bool(os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY") or os.environ.get("SSH_CLIENT"))
+    return no_display or ssh
+
+
+def _oauth_browser_login(provider: str, input_fn=input, api_call=None) -> str:
+    """OAuth sign-in for `clawmetry connect` (GitHub / Google).
+
+    Desktop: a one-shot 127.0.0.1 loopback server captures the cm_ key the cloud
+    callback redirects back (the key never leaves 127.0.0.1). Headless/remote
+    (SSH/VPS, no GUI): the loopback can't be reached by a browser on another
+    machine, so we use a Claude-Code-style paste-code path instead. The CLI
+    generates a PKCE verifier (kept in memory; only its SHA256 challenge leaves
+    the process), the cloud shows a short single-use code, the user pastes it,
+    and the CLI redeems code+verifier at /api/oauth/cli/exchange over INGEST_URL.
+    Returns "" on timeout/skip/error so the caller falls back to email OTP.
+    """
+    import http.server
+    import urllib.parse
+    import webbrowser
+    import time as _time
+    import secrets as _secrets
+    import hashlib as _hashlib
+    import base64 as _base64
+
+    app_base = os.environ.get("CLAWMETRY_APP_BASE", "https://app.clawmetry.com").rstrip("/")
+
+    # PKCE: the verifier stays in CLI memory only; only its SHA256 (the
+    # challenge) ever leaves this process, in the start URL.
+    verifier = _base64.urlsafe_b64encode(_secrets.token_bytes(32)).rstrip(b"=").decode()
+    challenge = _base64.urlsafe_b64encode(
+        _hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+
+    def _paste_path() -> str:
+        """Headless paste-code path. No loopback; redeem over INGEST_URL."""
+        url = f"{app_base}/api/oauth/{provider}/start?cli_paste=1&cc={challenge}"
+        print(f"\n  Browser didn't open? Use the url below to sign in with {provider.title()}:\n  {url}\n")
+        try:
+            webbrowser.open(url)  # best-effort; no-ops on a headless box
+        except Exception:
+            pass
+        code = input_fn("  Paste code here if prompted > ").strip()
+        if not code or api_call is None:
+            return ""
+        resp = api_call("/api/oauth/cli/exchange", {"code": code, "verifier": verifier})
+        if isinstance(resp, dict) and str(resp.get("api_key", "")).startswith("cm_"):
+            print("  Account created. Welcome to ClawMetry." if resp.get("is_new")
+                  else "  Welcome back.")
+            return resp["api_key"]
+        err = (resp or {}).get("error", "that code did not work") if isinstance(resp, dict) else "network error"
+        print(f"  Sign-in could not be completed ({err}).")
+        return ""
+
+    # Headless/remote: skip loopback entirely and use the interactive paste path.
+    if _is_headless():
+        return _paste_path()
+
+    # Desktop: one-shot loopback fast-path.
+    captured = {}
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            captured["token"] = (params.get("token") or [""])[0]
+            ok = captured["token"].startswith("cm_")
+            msg = ("You're connected. Return to your terminal."
+                   if ok else "Sign-in failed. Return to your terminal and use email instead.")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(
+                ("<!DOCTYPE html><html><head><meta charset='utf-8'><title>ClawMetry</title></head>"
+                 "<body style='font-family:sans-serif;background:#0b0f1a;color:#e2e8f0;display:flex;"
+                 "align-items:center;justify-content:center;height:100vh;margin:0'>"
+                 "<div style='text-align:center'><div style='font-size:40px'>\U0001F99E</div>"
+                 "<h2 style='font-weight:700'>" + msg + "</h2></div></body></html>").encode("utf-8")
+            )
+
+        def log_message(self, *args):  # silence default stderr request logging
+            pass
+
+    try:
+        srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    except OSError:
+        # Can't bind loopback -> fall through to the paste path rather than fail.
+        return _paste_path()
+    port = srv.server_address[1]
+    url = f"{app_base}/api/oauth/{provider}/start?cli_port={port}"
+    print(f"\n  Opening your browser to sign in with {provider.title()}.")
+    print(f"  Browser didn't open? Use the url below to sign in:\n  {url}\n")
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+    srv.timeout = 1
+    deadline = _time.time() + 180
+    try:
+        while "token" not in captured and _time.time() < deadline:
+            srv.handle_request()
+    finally:
+        srv.server_close()
+
+    tok = captured.get("token", "")
+    return tok if tok.startswith("cm_") else ""
+
+
 def _get_api_key_interactive() -> str:
-    """Interactive API key acquisition: email OTP or direct paste."""
+    """Interactive API key acquisition: GitHub/Google OAuth, email OTP, or paste."""
     import getpass
     import urllib.request
     import urllib.error
@@ -316,7 +439,22 @@ def _get_api_key_interactive() -> str:
         return result
 
     print()
-    entry = _input("  📧 Enter your email: ").strip()
+    print("  Sign in with:")
+    print("    [1] GitHub      [2] Google")
+    print("    …or type your email to get a 6-digit code.")
+    entry = _input("  > ").strip()
+
+    # OAuth (GitHub / Google). Desktop uses a loopback browser hand-off; a
+    # headless/remote box (SSH/VPS) uses a paste-code path. Falls back to email
+    # on failure. _input is /dev/tty-aware (piped installs) and _api_call talks
+    # to INGEST_URL, both required by the headless exchange.
+    _provider = {"1": "github", "github": "github", "2": "google", "google": "google"}.get(entry.lower())
+    if _provider:
+        _key = _oauth_browser_login(_provider, input_fn=_input, api_call=_api_call)
+        if _key:
+            return _key
+        print("  Couldn't complete browser sign-in. Let's use email instead.")
+        entry = _input("  📧 Enter your email: ").strip()
 
     # If it's already an API key, return it directly
     if entry.startswith("cm_"):
@@ -470,6 +608,95 @@ def _verify_key_ownership(api_key: str) -> None:
 
 def _cmd_connect(args) -> None:
     """clawmetry connect — validate key, save config, start daemon."""
+    # #1937: respect the persistent local-only marker. If the user did
+    # `clawmetry disconnect` (or set CLAWMETRY_NO_CLOUD=1), don't silently
+    # re-prompt for an email on the next update / install.sh run. The
+    # `--force` flag lets the user override after explicit confirmation.
+    from clawmetry.config import is_cloud_disabled, NOCLOUD_MARKER_PATH
+    if is_cloud_disabled() and not getattr(args, "force", False):
+        # Two cases here:
+        #
+        # (A) AUTOMATED invocation -- install.sh / curl|bash / wrappers that
+        #     pass --key-only, --no-daemon, --key, or --enc-key. Refuse
+        #     silently: the WHOLE point of #1937 was that updates must not
+        #     silently re-prompt for an email. install.sh's `|| true`
+        #     swallows the exit so the install completes cleanly.
+        #
+        # (B) INTERACTIVE invocation -- a human typed `clawmetry connect` in
+        #     a terminal. Offer a one-time conversion choice: sign up for
+        #     cloud (which removes the marker and proceeds with the normal
+        #     flow), or stay local-only (which exits gracefully). This is the
+        #     conversion moment without re-introducing the #1937 silent
+        #     re-prompt.
+        _automation_flag = (
+            getattr(args, "key_only", False)
+            or getattr(args, "no_daemon", False)
+            or getattr(args, "key", None)
+            or getattr(args, "enc_key", None)
+        )
+        _has_tty = sys.stdin.isatty()
+        if not _has_tty:
+            try:
+                _tty_test = open("/dev/tty", "r")
+                _tty_test.close()
+                _has_tty = True
+            except OSError:
+                _has_tty = False
+
+        if _automation_flag or not _has_tty:
+            # Case A: silent refuse (preserves #1937 fix for install.sh).
+            print("Cloud sync is disabled on this machine (local-only mode).")
+            print(f"  Marker: {NOCLOUD_MARKER_PATH}")
+            print( "  Env:    CLAWMETRY_NO_CLOUD=" + (os.environ.get("CLAWMETRY_NO_CLOUD") or "(unset)"))
+            print()
+            print("The local dashboard at http://localhost:8900 keeps working.")
+            print("To re-enable cloud sync, remove the marker and re-run:")
+            print(f"    rm {NOCLOUD_MARKER_PATH}")
+            print( "    clawmetry connect")
+            print("or run `clawmetry connect --force` to override once.")
+            return
+
+        # Case B: interactive conversion prompt.
+        print()
+        print("✨ ClawMetry is currently in LOCAL-ONLY mode.")
+        print(f"   (marker: {NOCLOUD_MARKER_PATH})")
+        print()
+        print("Cloud sync is opt-in. With it you get:")
+        print("   • a hosted dashboard at https://app.clawmetry.com/cloud")
+        print("   • E2E-encrypted snapshot (your key never leaves the machine)")
+        print("   • alerts, multi-node fleet view, weekly insights")
+        print()
+        print("What would you like to do?")
+        print("   [1] Sign up for cloud (free trial, ~30s)")
+        print("   [2] Keep local-only (no change)")
+        print()
+        try:
+            _choice_src = (
+                open("/dev/tty", "r") if not sys.stdin.isatty() else sys.stdin
+            )
+            sys.stdout.write("Choice [1/2]: ")
+            sys.stdout.flush()
+            _choice = (_choice_src.readline() or "").strip()
+        except (OSError, KeyboardInterrupt, EOFError):
+            _choice = ""
+
+        if _choice != "1":
+            print()
+            print("Staying local-only. Dashboard: http://localhost:8900")
+            print(f"(To convert later: rm {NOCLOUD_MARKER_PATH} && clawmetry connect)")
+            return
+
+        # User chose cloud signup -- remove the marker, then fall through to
+        # the normal connect flow below (it'll prompt for email + OTP).
+        try:
+            os.unlink(NOCLOUD_MARKER_PATH)
+            print(f"✅ Removed local-only marker ({NOCLOUD_MARKER_PATH})")
+        except FileNotFoundError:
+            pass
+        except OSError as _e:
+            print(f"⚠️  Could not remove marker: {_e}")
+            print("    Continuing anyway -- the connect flow may re-fail.")
+        print()
     # Support piped stdin (curl | bash) — read from /dev/tty if needed
     _tty = None
     if not sys.stdin.isatty():
@@ -545,28 +772,38 @@ def _cmd_connect(args) -> None:
             print(f"❌  {e}")
             sys.exit(1)
 
-    from clawmetry.sync import generate_encryption_key
+    from clawmetry.sync import generate_encryption_key, _derive_key_for_storage
 
-    # Always prompt for encryption key — be transparent
-    # Store the raw passphrase as-is; normalization happens at encrypt/decrypt time
-    # Use --enc-key if provided (non-interactive sandbox/automated use)
+    # Accept CM_KEY=scroll://<mnemonic> env var — v5 node pairing flow (#1522).
+    # Strip the scroll:// URI prefix; the bare mnemonic/key material then feeds
+    # into the existing _derive_key_for_storage path just like --enc-key does.
+    _cm_key_env = os.environ.get("CM_KEY", "")
+    if _cm_key_env.startswith("scroll://"):
+        _cm_key_env = _cm_key_env[len("scroll://"):]
+    if _cm_key_env and not getattr(args, "enc_key", None):
+        setattr(args, "enc_key", _cm_key_env)
+
+    # Always prompt for encryption key — be transparent.
+    # A typed passphrase is run through a strong salted KDF (scrypt) and we store
+    # the DERIVED key, never the raw passphrase. A pasted real key is kept as-is.
+    # Use --enc-key if provided (non-interactive sandbox/automated use).
     _enc_key_arg = getattr(args, "enc_key", None) or ""
 
     print()
     print("🔐 Encryption key protects your data end-to-end.")
     if _enc_key_arg:
-        enc_key = _enc_key_arg
+        enc_key = _derive_key_for_storage(_enc_key_arg)
         print("  Using provided encryption key.")
     elif _saved_enc_key:
         masked = _saved_enc_key[:6] + "…" + _saved_enc_key[-4:]
         print(f"  Existing key: {masked}")
         custom_key = _input("  Press Enter to keep it, or type a new one: ").strip()
-        enc_key = custom_key if custom_key else _saved_enc_key
+        enc_key = _derive_key_for_storage(custom_key) if custom_key else _saved_enc_key
     else:
         custom_key = _input(
             "  Enter a custom secret key (or press Enter to auto-generate): "
         ).strip()
-        enc_key = custom_key if custom_key else generate_encryption_key()
+        enc_key = _derive_key_for_storage(custom_key) if custom_key else generate_encryption_key()
 
     config = {
         "api_key": api_key,
@@ -577,8 +814,38 @@ def _cmd_connect(args) -> None:
     }
     save_config(config)
 
+    # Explicit connect is an opt-in to cloud: clear any local-only marker so the
+    # daemon actually pushes (otherwise a prior local-only install / disconnect
+    # leaves it ingesting to DuckDB only and the node never appears in cloud).
+    try:
+        from clawmetry.config import enable_cloud as _enable_cloud
+        if _enable_cloud():
+            print("  Re-enabled cloud sync (was local-only)")
+    except Exception:
+        pass
+
     print()
     print(f"  Connected as: {node_id}")
+
+    # Auto-provision clawmetry-pro for entitled cloud accounts (Starter/Pro/
+    # Trial/Enterprise). The cloud is the single source of truth: license.py
+    # probes /api/license/entitlement with this cm_ key first and only then
+    # downloads+installs the closed-source wheel over HTTPS. A FREE account
+    # installs nothing and this prints nothing. This NEVER blocks or crashes
+    # connect — any failure (offline, server down, install error) is swallowed
+    # and the node keeps running on the free runtimes (OpenClaw + NemoClaw).
+    try:
+        from clawmetry.license import auto_provision_pro
+        _pro_installed, _pro_msg = auto_provision_pro(api_key, node_id)
+        if _pro_installed:
+            print("  Pro adapters installed - all 14 runtimes available.")
+        elif _pro_msg:
+            # Entitled but the wheel could not be installed right now; surface a
+            # quiet hint without alarming the user (connect still succeeded).
+            print(f"  Note: {_pro_msg}")
+    except Exception:
+        pass  # connect must never fail because of pro provisioning
+
     print()
 
     # --key-only: just save config, don't start daemon (for host-side NemoClaw OTP flow)
@@ -599,17 +866,21 @@ def _cmd_connect(args) -> None:
         print()
         return
 
-    # Default: defer the sync daemon until the user runs `clawmetry sync`.
-    # --start-sync-now restores the historical auto-spawn behavior.
-    _start_now = getattr(args, "start_sync_now", False)
-
-    if _start_now:
-        _start_daemon(config, args)
-    else:
-        print("  Sync is paused. Start it whenever you're ready:")
+    # Default (2026-06-01): start the sync daemon immediately on connect, so
+    # the dashboard populates without an extra step. A user who runs
+    # `clawmetry connect` wants their observability now; the previous deferred
+    # default ("Sync is paused") was a confusing trap where the node never
+    # heartbeated and the dashboard stayed empty. Pass `--defer-sync` to keep
+    # the old behavior (e.g. provisioning a node you do not want syncing yet).
+    # `--start-sync-now` is retained as a no-op alias for back-compat (it is
+    # now the default), so existing scripts and the cloud dashboard's copy of
+    # the connect command keep working.
+    if getattr(args, "defer_sync", False):
+        print("  Sync is paused (--defer-sync). Start it whenever you're ready:")
         print("    clawmetry sync")
-        print("  (or run `clawmetry connect --start-sync-now` to keep today's auto-start)")
         print()
+    else:
+        _start_daemon(config, args)
 
     # Open browser with encryption key in URL fragment (never sent to server)
     # The #key=... fragment stays client-side — true E2E encryption
@@ -620,6 +891,12 @@ def _cmd_connect(args) -> None:
     print("  All done! Opening your dashboard...")
     print(f"  https://app.clawmetry.com/cloud")
     print()
+
+    # If this was a zero-friction connect (no real key), the node landed on a
+    # temporary placeholder account and will NOT show under the user's real
+    # login. Warn loudly with the exact relink command instead of letting them
+    # discover a silent "0 nodes" later. No-op (+ skipped) for a keyed connect.
+    _warn_if_placeholder_account(api_key)
 
     try:
         import webbrowser
@@ -668,8 +945,13 @@ def _cmd_sync(args) -> None:
         print("❌  Config has no api_key. Run `clawmetry connect` first.")
         sys.exit(1)
 
-    print(f"  Starting sync daemon for {config.get('node_id', '<unknown>')}…")
+    _verb = "Restarting" if getattr(args, "restart", False) else "Starting"
+    print(f"  {_verb} sync daemon for {config.get('node_id', '<unknown>')}…")
+    # _start_daemon already bootout+bootstraps (launchd) / restarts (systemd),
+    # so it is itself a safe restart — `--restart` just makes the intent explicit.
     _start_daemon(config, args)
+    if getattr(args, "restart", False):
+        print("  ✅  Daemon restarted — re-checking entitlement & provisioning runtimes.")
     if not getattr(args, "foreground", False):
         print("  ✅  Sync daemon started.")
 
@@ -850,13 +1132,33 @@ def _register_launchd(config: dict) -> None:
 def _register_systemd(config: dict) -> None:
     from clawmetry.sync import LOG_FILE
     import subprocess
+    import shutil
+    import os as _os
+    from pathlib import Path as _Path
 
     label = "clawmetry-sync"
-    service_dir = __import__("pathlib").Path.home() / ".config" / "systemd" / "user"
-    service_dir.mkdir(parents=True, exist_ok=True)
-    service_path = service_dir / f"{label}.service"
-    # Use the current interpreter (venv-aware) so the daemon finds clawmetry
-    python = sys.executable
+    python = sys.executable  # current interpreter (venv-aware)
+    # `systemctl --user` needs a per-user D-Bus session, which root over SSH on a
+    # VPS usually does NOT have (enable --now then fails with "Failed to connect
+    # to bus" and the daemon silently never starts). So for root we install a
+    # SYSTEM service (persists across reboots + actually starts); non-root uses a
+    # --user service. Either way we VERIFY it came up and fall back to a detached
+    # background subprocess if systemd is unavailable / failed.
+    try:
+        _is_root = _os.geteuid() == 0
+    except Exception:
+        _is_root = False
+
+    if _is_root:
+        service_dir = _Path("/etc/systemd/system")
+        wanted_by = "multi-user.target"
+        scope = []            # system scope: `systemctl ...`
+        extra_unit = "User=root\n"
+    else:
+        service_dir = _Path.home() / ".config" / "systemd" / "user"
+        wanted_by = "default.target"
+        scope = ["--user"]    # user scope: `systemctl --user ...`
+        extra_unit = ""
 
     unit = f"""[Unit]
 Description=ClawMetry Cloud Sync Daemon
@@ -867,27 +1169,42 @@ ExecStart={python} -m clawmetry.sync
 # Issue #1310 — gateway WS tap default-on so Telegram/Signal/Slack
 # channel messages reach DuckDB. Tap silently no-ops on scope rejection.
 Environment=CLAWMETRY_ENABLE_WS_TAP=1
-Restart=always
+{extra_unit}Restart=always
 RestartSec=30
 StandardOutput=append:{LOG_FILE}
 StandardError=append:{LOG_FILE}
 
 [Install]
-WantedBy=default.target
+WantedBy={wanted_by}
 """
-    service_path.write_text(unit)
-    # Check if systemctl is available (not in Docker/containers without systemd)
-    import shutil
 
+    _installed = False
     if shutil.which("systemctl"):
-        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
-        subprocess.run(["systemctl", "--user", "enable", "--now", label], check=False)
-        print("  Running in the background. Your data is syncing to the cloud.")
+        try:
+            service_dir.mkdir(parents=True, exist_ok=True)
+            (service_dir / f"{label}.service").write_text(unit)
+            subprocess.run(["systemctl", *scope, "daemon-reload"],
+                           check=False, capture_output=True)
+            subprocess.run(["systemctl", *scope, "enable", "--now", label],
+                           check=False, capture_output=True)
+            # Verify it actually started (systemd may have refused, e.g. no
+            # --user bus). Give it a moment, then check active OR the process.
+            import time as _t
+            _t.sleep(1.0)
+            _chk = subprocess.run(["systemctl", *scope, "is-active", label],
+                                  capture_output=True, text=True)
+            _installed = _chk.stdout.strip() == "active" or _is_sync_running()
+        except Exception:
+            _installed = False
+
+    if _installed:
+        _how = "system service" if _is_root else "user service"
+        print(f"  Running in the background as a systemd {_how}. Your data is syncing to the cloud.")
         print("  To stop: clawmetry disconnect")
     else:
         if sys.stdout.isatty():
-            print("  ⚠️  systemctl not available (container/Docker?).")
-            print("  Falling back to background subprocess…")
+            print("  systemd unavailable here (container, or root with no --user session)")
+            print("  — starting a background process instead…")
         _start_subprocess()
 
 
@@ -938,30 +1255,61 @@ def _cmd_disconnect(args) -> None:
         print(f"✅  Stopped launchd daemon ({label})")
     elif system == "Linux":
         if __import__("shutil").which("systemctl"):
-            subprocess.run(
-                ["systemctl", "--user", "disable", "--now", "clawmetry-sync"],
-                check=False,
-                capture_output=True,
-            )
-            svc = (
-                __import__("pathlib").Path.home()
-                / ".config"
-                / "systemd"
-                / "user"
-                / "clawmetry-sync.service"
-            )
-            if svc.exists():
-                svc.unlink()
-            print("✅  Stopped systemd daemon (clawmetry-sync)")
-        else:
-            _kill_sync_daemon()
-            print("✅  Stopped sync daemon")
+            # Disable + stop whichever scope owns it (--user for non-root, system
+            # for root) so Restart=always can't bring it back, then remove the
+            # unit file from both possible locations.
+            from pathlib import Path as _P2
+            for _scope in (["--user"], []):
+                subprocess.run(
+                    ["systemctl", *_scope, "disable", "--now", "clawmetry-sync"],
+                    check=False,
+                    capture_output=True,
+                )
+            for _svc in (_P2.home() / ".config" / "systemd" / "user" / "clawmetry-sync.service",
+                         _P2("/etc/systemd/system/clawmetry-sync.service")):
+                try:
+                    if _svc.exists():
+                        _svc.unlink()
+                except Exception:
+                    pass
+            subprocess.run(["systemctl", "--user", "daemon-reload"], check=False, capture_output=True)
+            subprocess.run(["systemctl", "daemon-reload"], check=False, capture_output=True)
+        _kill_sync_daemon()  # also kill any bare subprocess daemon
+        print("✅  Stopped sync daemon")
 
     if CONFIG_FILE.exists():
         CONFIG_FILE.unlink()
         print(f"✅  Removed config ({CONFIG_FILE})")
     if STATE_FILE.exists():
         STATE_FILE.unlink()
+
+    # Drop the stale sync-progress file so the dashboard banner ("Step:
+    # crons · about 2m remaining") doesn't freeze on the last phase the
+    # daemon was in before we unloaded it. The file only ever describes
+    # cloud-sync progress; with cloud off it's pure misinformation.
+    from pathlib import Path as _Path
+    _prog = _Path.home() / ".clawmetry" / "sync_progress.json"
+    if _prog.exists():
+        try:
+            _prog.unlink()
+            print(f"✅  Cleared sync-progress file ({_prog})")
+        except Exception as _e:
+            print(f"⚠️  Could not remove {_prog}: {_e}")
+
+    # Drop the persistent local-only marker so a future `clawmetry update`
+    # / `install.sh` / `clawmetry connect` won't silently re-prompt for an
+    # email and reconnect. Survives across updates. Undo with:
+    #     rm ~/.clawmetry/nocloud
+    # or env CLAWMETRY_NO_CLOUD=0 for a one-off override (#1937).
+    from clawmetry.config import NOCLOUD_MARKER_PATH
+    try:
+        _Path(NOCLOUD_MARKER_PATH).parent.mkdir(parents=True, exist_ok=True)
+        _Path(NOCLOUD_MARKER_PATH).touch()
+        print(f"✅  Cloud sync disabled persistently ({NOCLOUD_MARKER_PATH})")
+        print("   The local dashboard at http://localhost:8900 still works.")
+        print(f"   To re-enable later: rm {NOCLOUD_MARKER_PATH} && clawmetry connect")
+    except Exception as _e:
+        print(f"⚠️  Could not write opt-out marker: {_e}")
 
     print("Disconnected from ClawMetry Cloud.")
 
@@ -1211,17 +1559,23 @@ def _cmd_uninstall() -> None:
             _kill_sync_daemon()
             print(f"  ✅  Killed {_stray} stray sync process(es)")
     elif system == "Linux":
-        svc = home / ".config" / "systemd" / "user" / "clawmetry-sync.service"
+        _svcs = [home / ".config" / "systemd" / "user" / "clawmetry-sync.service",
+                 __import__("pathlib").Path("/etc/systemd/system/clawmetry-sync.service")]
         if shutil.which("systemctl"):
-            subprocess.run(
-                ["systemctl", "--user", "disable", "--now", "clawmetry-sync"],
-                check=False,
-                capture_output=True,
-            )
+            for _scope in (["--user"], []):  # --user (non-root) + system (root)
+                subprocess.run(
+                    ["systemctl", *_scope, "disable", "--now", "clawmetry-sync"],
+                    check=False,
+                    capture_output=True,
+                )
         _stray = _count_sync_daemons()
         _kill_sync_daemon()
-        if svc.exists():
-            svc.unlink()
+        for svc in _svcs:
+            try:
+                if svc.exists():
+                    svc.unlink()
+            except Exception:
+                pass
         print("  ✅  Stopped and removed sync daemon" + (f" + {_stray} stray process(es)" if _stray else ""))
 
     # 2. Pip uninstall (BEFORE removing venv, since sys.executable may live there)
@@ -1302,12 +1656,134 @@ def _cmd_uninstall() -> None:
     print()
 
 
+def _status_live_line(rows, prev, now):
+    """Build the one-line live status from session rows. ``prev`` is the last
+    ``(total_tokens, time)`` sample (or None); ``now`` is the current time.
+    Returns ``(line, (total_tokens, now))``. Pure so it's unit-testable — the
+    refresh loop is the only impure part. Live tokens/sec is the total-token
+    delta over wall time (so it's ~0 when idle, and climbs while an agent works).
+    """
+    rows = rows or []
+    tot_tok = sum(int(r.get("total_tokens") or 0) for r in rows)
+    tot_cost = sum(float(r.get("cost_usd") or 0) for r in rows)
+    cur, best = {}, ""
+    for r in rows:
+        k = r.get("last_active_at") or r.get("updated_at") or r.get("started_at") or ""
+        if k >= best:
+            best, cur = k, r
+    _md = cur.get("metadata") if isinstance(cur.get("metadata"), dict) else {}
+    model = cur.get("model") or _md.get("model") or "—"
+    tps = 0.0
+    if prev is not None and now > prev[1]:
+        tps = max(0.0, (tot_tok - prev[0]) / (now - prev[1]))
+    line = f"\U0001F99E {len(rows)} sessions · {tot_tok:,} tokens · ${tot_cost:,.4f} · {model} · {tps:,.0f} tok/s"
+    return line, (tot_tok, now)
+
+
+def _status_live() -> None:
+    """clawmetry status --live — a refreshing one-line terminal status bar
+    (sessions · tokens · cost · model · live tokens/sec), read from the running
+    daemon's local store via the read-only proxy. Ctrl-C to exit."""
+    import sys as _sys
+    import time as _t
+    from clawmetry.local_store import get_store
+    try:
+        store = get_store(read_only=True)
+    except Exception as exc:
+        print(f"  Cannot open the local store (is the sync daemon running?): {exc}")
+        return
+    print("ClawMetry live  ·  Ctrl-C to exit\n")
+    prev = None
+    try:
+        while True:
+            try:
+                rows = store.query_sessions_table(limit=300) or []
+            except Exception:
+                rows = []
+            line, prev = _status_live_line(rows, prev, _t.time())
+            _sys.stdout.write("\r\033[2K" + line)
+            _sys.stdout.flush()
+            _t.sleep(2)
+    except KeyboardInterrupt:
+        _sys.stdout.write("\n")
+        _sys.stdout.flush()
+
+
+def _is_placeholder_account(email) -> bool:
+    """True when the account is a zero-friction PLACEHOLDER (the daemon
+    auto-registered without a real login). Such an account is invisible from
+    the user's real dashboard, so the node silently never shows up under their
+    email -- the recurring 'I installed it but see 0 nodes' trap."""
+    e = (email or "").strip().lower()
+    return e.endswith("@clawmetry.auto") or e.endswith("@clawmetry.linked")
+
+
+def _warn_if_placeholder_account(api_key: str, email=None) -> bool:
+    """If this node is bound to a placeholder account, print a LOUD, actionable
+    warning (it will NOT appear in the user's dashboard until linked). Returns
+    True when it warned. Best-effort: resolves the email itself if not given,
+    never raises, no-ops offline."""
+    try:
+        if email is None:
+            email, _ = _resolve_account_email(api_key)
+        if not _is_placeholder_account(email):
+            return False
+        print()
+        print("  \033[33m⚠  This machine is on a TEMPORARY account, not your ClawMetry login.\033[0m")
+        print("     It will NOT show up at app.clawmetry.com/cloud under your email.")
+        print("     Link it to your account (copy the command from the '+ Add node'")
+        print("     box at app.clawmetry.com/cloud -- it carries YOUR key):")
+        print("        \033[36mclawmetry connect --key cm_xxxxxxxxxxxx\033[0m")
+        print()
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_account_email(api_key: str):
+    """Best-effort: ask the cloud which ACCOUNT this node's api_key is linked to,
+    so `clawmetry status` can show the email (and plan). This is the fastest way
+    to catch the "my node is on the wrong account" trap. Short timeout + never
+    raises, so status stays fast and works offline (returns (None, None) then)."""
+    try:
+        if not api_key or not str(api_key).startswith("cm_"):
+            return None, None
+        import json as _json
+        import os as _os
+        import urllib.parse as _up
+        import urllib.request as _ur
+
+        base = _os.environ.get("CLAWMETRY_APP_BASE", "https://app.clawmetry.com").rstrip("/")
+        url = base + "/api/cloud/account?token=" + _up.quote(api_key)
+        with _ur.urlopen(url, timeout=2.5) as resp:
+            data = _json.loads(resp.read() or b"{}")
+        email = (data.get("email") or "").strip()
+        plan = (data.get("plan") or "").strip()
+        return (email or None), (plan or None)
+    except Exception:
+        return None, None
+
+
 def _cmd_status(args) -> None:
     """clawmetry status — show local + cloud sync status."""
+    if getattr(args, "live", False):
+        _status_live()
+        return
     import platform
     from clawmetry.sync import CONFIG_FILE, STATE_FILE, LOG_FILE
 
     print("ClawMetry Status\n" + "─" * 40)
+
+    # Installed version — so it's obvious at a glance whether this box is on the
+    # latest (the #1 "why is my node behaving like an old build" clue). Uses the
+    # lightweight package metadata, not the heavy dashboard import.
+    try:
+        import importlib.metadata as _md
+        _cm_ver = _md.version("clawmetry")
+    except Exception:
+        _cm_ver = ""
+    if _cm_ver:
+        print(f"  Version:     {_cm_ver}")
 
     # Config
     if CONFIG_FILE.exists():
@@ -1322,6 +1798,26 @@ def _cmd_status(args) -> None:
             )
             print("  Cloud sync:  ✅  Connected")
             print(f"  API key:     {masked_api}")
+            _acct_email, _acct_plan = _resolve_account_email(api_key)
+            # Self-heal the local plan cache from the LIVE account. The runtime
+            # entitlement gate below (and the daemon + dashboard) read
+            # ~/.clawmetry/cloud_plan.json, which only the daemon refreshes on a
+            # heartbeat. If the daemon is down, or hasn't heartbeated since the
+            # user upgraded (free -> trial/pro), that cache is stale and status
+            # contradicts itself ("trial" in the header, "FREE plan" in the gate).
+            # Mirroring the live plan here makes the gate reflect the real plan
+            # immediately and seeds the entitlement resolver so paid runtimes
+            # flip on without waiting for the daemon. Best-effort; never raises.
+            if _acct_plan:
+                try:
+                    from clawmetry.sync import _persist_cloud_plan_to_disk as _pcp
+                    _pcp(_acct_plan)
+                except Exception:
+                    pass
+            if _acct_email:
+                _plan_suffix = f"  ({_acct_plan})" if _acct_plan else ""
+                _acct_note = "  ⚠ temporary, not linked" if _is_placeholder_account(_acct_email) else ""
+                print(f"  Account:     {_acct_email}{_plan_suffix}{_acct_note}")
             print(f"  Node ID:     {cfg.get('node_id', '?')}")
             print(f"  Connected:   {cfg.get('connected_at', '?')[:19]}")
             if enc_key:
@@ -1333,6 +1829,9 @@ def _cmd_status(args) -> None:
                 print("  E2E:         🔒 enabled")
             else:
                 print("  E2E:         ⚠️  disabled (no secret key in config)")
+            # Loud, actionable block when the node is on a placeholder account
+            # (the recurring 'connected but 0 nodes in my dashboard' trap).
+            _warn_if_placeholder_account(api_key, _acct_email)
         except Exception as e:
             print(f"  Config error: {e}")
     else:
@@ -1348,6 +1847,67 @@ def _cmd_status(args) -> None:
             print(f"  Files seen:  {len(st.get('last_event_ids', {}))}")
         except Exception:
             pass
+
+    # Runtimes — which agent runtimes this node detects + actually SYNCS, so it's
+    # obvious at a glance whether Claude Code / Codex / etc. are being captured
+    # (the #1 "why don't I see my runtime?" question). The honest distinction:
+    # the adapter may DETECT a runtime locally, but paid runtimes only SYNC to
+    # the cloud on a Trial/Pro account — so we read the daemon's plan cache.
+    try:
+        print()
+        # Is this node's account entitled? (daemon mirrors the cloud plan here.)
+        _entitled = False
+        _plan = ""
+        try:
+            import json as _j2
+            _cp = Path(os.path.expanduser("~/.clawmetry/cloud_plan.json"))
+            if _cp.is_file():
+                _plan = str((json.loads(_cp.read_text()) or {}).get("plan", "")).lower()
+                _entitled = _plan not in ("", "cloud_free", "free")
+        except Exception:
+            pass
+        _prover = None
+        try:
+            from clawmetry.license import _pro_installed_version as _pv
+            _prover = _pv()
+        except Exception:
+            _prover = None
+        _det = []
+        try:
+            from clawmetry.sync import _detect_family_runtimes as _dfr
+            _det = _dfr() or []
+        except Exception:
+            _det = []
+        print("  Runtimes:")
+        print("    🦞 OpenClaw            ✅ syncing  (free)")
+        try:
+            from clawmetry.adapters.nemo import NemoClawAdapter as _NCA
+            _nemo = _NCA().detect()
+            if _nemo.detected:
+                print("    ⚡ NemoClaw            ✅ syncing  (free)")
+        except Exception:
+            pass
+        for _r in _det:
+            _n = int(_r.get("sessionCount") or 0)
+            _nm = _r.get("displayName") or _r.get("name") or "runtime"
+            _state = "✅ syncing" if _entitled else "○ detected, NOT syncing"
+            print(f"    • {_nm:<18} {_state}  ({_n} session{'s' if _n != 1 else ''})")
+        if not _prover:
+            print("    ⚠ Claude Code / Codex / Cursor / Aider / Goose / opencode / Qwen — NOT syncing")
+            if _entitled:
+                print("      → your account is entitled — the daemon auto-downloads the paid runtime")
+                print("        pack on start (no pip needed). If it hasn't yet: clawmetry sync --restart")
+            else:
+                print("      → paid runtimes need a Trial/Pro account. The daemon auto-downloads the")
+                print("        runtime pack on start once entitled — link your account in the dashboard.")
+        elif _det and not _entitled:
+            print(f"    clawmetry-pro {_prover} installed and detecting the above — but your account")
+            print(f"      is on the FREE plan ({_plan or 'free'}), so paid runtimes are NOT synced to")
+            print("      the cloud. Link to a Trial/Pro account (the dashboard prompts you) to sync them.")
+        elif _prover and not _det:
+            print(f"    clawmetry-pro {_prover} installed — no other runtimes found on this machine yet.")
+    except Exception:
+        pass
 
     # Daemon status
     system = platform.system()
@@ -1366,21 +1926,31 @@ def _cmd_status(args) -> None:
         import subprocess
         import shutil
 
-        if shutil.which("systemctl"):
-            r = subprocess.run(
-                ["systemctl", "--user", "is-active", "clawmetry-sync"],
-                capture_output=True,
-                text=True,
-            )
-            running = r.stdout.strip() == "active"
-            print(
-                f"  Daemon:      {'✅  Running (systemd)' if running else '○  Not running'}"
-            )
-        else:
-            running = _is_sync_running()
-            print(
-                f"  Daemon:      {'✅  Running (subprocess)' if running else '○  Not running'}"
-            )
+        # The actual process check is the source of truth: the daemon can run as
+        # a `systemctl --user` service, a system service (root/VPS), or a bare
+        # background subprocess. Reporting "Not running" off `systemctl --user`
+        # alone false-negatives on a root VPS (no --user D-Bus session) even
+        # when the daemon is up. Check the process first, then label how it's
+        # managed for a helpful hint.
+        running = _is_sync_running()
+        _how = ""
+        if running and shutil.which("systemctl"):
+            for _scope in (["--user"], []):  # user service, then system service
+                try:
+                    _a = subprocess.run(
+                        ["systemctl", *_scope, "is-active", "clawmetry-sync"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if _a.stdout.strip() == "active":
+                        _how = " (systemd)" if _scope == [] else " (systemd --user)"
+                        break
+                except Exception:
+                    pass
+            if not _how:
+                _how = " (background process)"
+        print(
+            f"  Daemon:      {'✅  Running' + _how if running else '○  Not running'}"
+        )
 
     if LOG_FILE.exists():
         print(f"  Log:         {LOG_FILE}")
@@ -1490,6 +2060,10 @@ def _print_nemoclaw_nodes(args) -> None:
             )
             print("  Cloud sync:  ✅  Connected")
             print(f"  API key:     {masked_api}")
+            _acct_email, _acct_plan = _resolve_account_email(api_key)
+            if _acct_email:
+                _plan_suffix = f"  ({_acct_plan})" if _acct_plan else ""
+                print(f"  Account:     {_acct_email}{_plan_suffix}")
             print(f"  Node ID:     {node_id}")
             if enc_key:
                 if getattr(args, "show_key", False):
@@ -1654,11 +2228,14 @@ def _cmd_onboard(args) -> None:
     if _os.environ.get("CLAWMETRY_API_KEY") or _os.environ.get("CLAWMETRY_NODE_ID"):
         already_connected = True
 
+    # NOTE: we no longer early-return when already connected. `clawmetry onboard`
+    # is the setup wizard, so it ALWAYS shows the [1]/[2]/[3] options and lets the
+    # user switch how ClawMetry runs (e.g. cloud -> local, or add a license). When
+    # already connected, an empty Enter keeps the current setup (handled in the
+    # choice logic below) so re-running never silently changes anything.
     if already_connected:
-        print(f"\n  {GREEN(BOLD('Already connected to ClawMetry Cloud'))}")
-        _maybe_apply_nemoclaw_preset(_input, BOLD, CYAN, DIM)
-        print(f"  {DIM('Run  clawmetry status  to check sync health.')}\n")
-        return
+        print(f"\n  {GREEN(BOLD('Already connected to ClawMetry.'))}")
+        print(f"  {DIM('Pick an option below to change how ClawMetry runs, or press Enter to keep your current setup.')}")
 
     # Get version for banner
     try:
@@ -1668,32 +2245,139 @@ def _cmd_onboard(args) -> None:
         _ver = ""
     _ver_str = f" {_ver}" if _ver else ""
 
-    print(f"\n  {BOLD(f'ClawMetry{_ver_str} installed!')}")
+    if not already_connected:
+        print(f"\n  {BOLD(f'ClawMetry{_ver_str} installed!')}")
     print()
-    print(f"  Monitor your AI agents from anywhere with ClawMetry Cloud.")
+    print(f"  {BOLD('How do you want to run ClawMetry?')}")
+    print()
+    print(f"    {BOLD('[1] Local only')}    {DIM('Free. No account, nothing leaves this machine.')}")
+    print(f"                     {DIM('Watch OpenClaw and NeMo at http://localhost:8900.')}")
+    print(f"    {BOLD('[2] Cloud')}         {DIM('Free trial. A dashboard you can open from anywhere.')}")
+    print(f"                     {DIM('Creates an account for this machine. No card needed.')}")
+    print(f"    {BOLD('[3] License key')}   {DIM('Self-Hosted Pro: all 14 runtimes, offline. Paste a key.')}")
     print()
 
-    try:
-        choice = _input("  Do you have a ClawMetry account? [y/N]: ").strip().lower() or "n"
-    except (EOFError, KeyboardInterrupt):
-        choice = "n"
+    def _write_nocloud_marker():
+        """Persist the local-only opt-out so updates can't silently re-enable
+        cloud sync (clawmetry/config.py is_cloud_disabled / GitHub #1937)."""
+        try:
+            from clawmetry.config import NOCLOUD_MARKER_PATH
+            from pathlib import Path as _P
+            _P(NOCLOUD_MARKER_PATH).parent.mkdir(parents=True, exist_ok=True)
+            _P(NOCLOUD_MARKER_PATH).touch()
+        except Exception:
+            pass
+
+    def _finish_local():
+        """Save an account-free config and start the daemon. The nocloud
+        marker makes every cloud call a no-op while local DuckDB ingestion
+        still feeds http://localhost:8900."""
+        import platform as _plat
+        import socket as _sock
+        # The daemon reads config['node_id'] by subscript on start, so a
+        # local-only config still needs one. Hostname matches the daemon's own
+        # _node_id() fallback. No api_key/encryption_key -> the nocloud marker
+        # short-circuits every cloud call regardless.
+        _local_node_id = getattr(args, "custom_node_id", None) or _sock.gethostname() or "local"
+        try:
+            from clawmetry.sync import save_config as _save_config
+            _save_config({
+                # Empty api_key keeps the local-only config shape complete: the
+                # daemon startup path subscripts config["api_key"], and an empty
+                # string is safe because is_cloud_disabled() gates all egress.
+                "api_key": "",
+                "node_id": _local_node_id,
+                "platform": _plat.system(),
+                "connected_at": __import__("datetime").datetime.now().isoformat(),
+                "local_only": True,
+            })
+        except Exception:
+            pass
+        print(f"  Starting local dashboard...")
+        _stop_existing_daemon()
+        _start_daemon({"local_only": True}, args)
+        print()
+        print(f"  {GREEN(BOLD('Watching your agents locally.'))}")
+        print(f"     {BOLD('http://localhost:8900')}")
+        print(f"     {DIM('Nothing leaves this machine. Enable cloud anytime: clawmetry connect')}")
         print()
 
+    # Scriptable / non-interactive overrides. A headless install (curl | bash
+    # with no /dev/tty) must NEVER silently create a cloud account, so the
+    # default AND the EOF fallback are both LOCAL.
+    _env_local = _os.environ.get("CLAWMETRY_LOCAL_ONLY", "").strip().lower() in ("1", "true", "yes", "on")
+    if getattr(args, "local", False) or _env_local:
+        choice = "1"
+    elif getattr(args, "cloud", False):
+        choice = "2"
+    else:
+        # When already connected, the default on an empty Enter is "keep current
+        # setup" (return without changes) so re-running onboard never silently
+        # switches a connected user to local. A fresh install defaults to [1].
+        _prompt = ("  Choose an option, or press Enter to keep your current setup: "
+                   if already_connected else "  Choose [1]: ")
+        try:
+            choice = _input(_prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            choice = ""
+            print()
+        if not choice:
+            if already_connected:
+                print(f"\n  {DIM('Keeping your current setup. Run  clawmetry status  to check sync health.')}\n")
+                return
+            choice = "1"
+
     print()
 
-    if choice in ("y", "yes"):
-        # Existing user: email -> OTP -> connect
-        import argparse as _ap
-
-        _fake_args = _ap.Namespace(
-            key=None, foreground=False, custom_node_id=None,
-            enc_key=None, key_only=False, no_daemon=False,
-        )
-        _cmd_connect(_fake_args)
-
+    if choice == "3":
+        # ── Self-Hosted Pro license (local, offline, all 14 runtimes) ──────
+        _write_nocloud_marker()
+        try:
+            _lic_key = _input("  Paste your license key (CLAW1...), or press Enter to do it later: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            _lic_key = ""
+            print()
+        print()
+        if _lic_key:
+            try:
+                from clawmetry import license as _lic
+                ok, msg = _lic.activate(_lic_key, node_id=_lic._node_id())
+                print(f"  {GREEN('Activated.') if ok else '⚠️  '}{msg}")
+                if not ok:
+                    print(f"     {DIM('Try again later:')} {CYAN('clawmetry activate <key>')}")
+            except Exception as _e:
+                print(f"  ⚠️  Activation failed: {_e}")
+                print(f"     {DIM('Try again later:')} {CYAN('clawmetry activate <key>')}")
+        else:
+            print(f"  {DIM('No problem. Buy a key at')} {CYAN('https://clawmetry.com/pricing')}")
+            print(f"  {DIM('then run')} {CYAN('clawmetry activate <key>')}")
         print()
         _maybe_apply_nemoclaw_preset(_input, BOLD, CYAN, DIM)
-    else:
+        _finish_local()
+        return
+
+    if choice == "2":
+        # ── Cloud (free trial) ────────────────────────────────────────────
+        try:
+            has_acct = (_input("  Already have a ClawMetry account? [y/N]: ").strip().lower() or "n")
+        except (EOFError, KeyboardInterrupt):
+            has_acct = "n"
+            print()
+        print()
+        if has_acct in ("y", "yes"):
+            # Existing user: email -> OTP -> connect
+            import argparse as _ap
+
+            _fake_args = _ap.Namespace(
+                key=None, foreground=False, custom_node_id=None,
+                enc_key=None, key_only=False, no_daemon=False,
+            )
+            _cmd_connect(_fake_args)
+
+            print()
+            _maybe_apply_nemoclaw_preset(_input, BOLD, CYAN, DIM)
+            return
+
         # New user: instant registration (no OTP)
         print(f"  Setting up your cloud dashboard...")
         print()
@@ -1771,6 +2455,15 @@ def _cmd_onboard(args) -> None:
         _start_daemon(config, args)
         print(f"  {GREEN(BOLD('Your agent is now being monitored!'))}")
         print()
+        return
+
+    # ── [1] Local only (default) ──────────────────────────────────────────
+    print(f"  {GREEN(BOLD('Local only.'))} {DIM('No account, no cloud.')}")
+    print()
+    _write_nocloud_marker()
+    _maybe_apply_nemoclaw_preset(_input, BOLD, CYAN, DIM)
+    _finish_local()
+    return
 
 
 def _cmd_account(args) -> None:
@@ -2138,6 +2831,179 @@ def _format_uptime(seconds):
     return f"{seconds / 86400:.1f}d"
 
 
+def _cmd_mcp(args) -> None:
+    """Start the ClawMetry MCP server on stdio (refs #2859)."""
+    from clawmetry.mcp_server import run
+    run()
+
+
+def _cmd_reports(args) -> None:
+    """Open the reports browser (refs #1005)."""
+    import webbrowser
+    port = getattr(args, "port", None) or 8900
+    url = f"http://localhost:{port}/reports/"
+    print(f"Opening {url} …")
+    print("(Make sure `clawmetry` is running. Write .md files to ~/.clawmetry/reports/.)")
+    webbrowser.open(url)
+
+
+def _cmd_eval(args) -> None:
+    """Run a golden eval suite (Phase 2 evals, refs #1619).
+
+    Exit code is 0 on all-pass, 1 on any-fail. The CI integration template
+    relies on that — see docs/EVALS_CI_INTEGRATION.md.
+    """
+    import json as _json
+    from clawmetry import eval_suite_runner as esr
+
+    # Phase 3 — regression replay path. Mutually exclusive with --suite
+    # (the two flows produce different table shapes; mixing them in one
+    # invocation only confuses CI logs).
+    if getattr(args, "regression", False):
+        _cmd_eval_regression(args)
+        return
+
+    if getattr(args, "list_suites", False):
+        suites = esr.list_suites()
+        if not suites:
+            print(
+                f"No suites found in {esr.SUITES_DIR}.\n"
+                f"Create one (see docs/EVALS_CI_INTEGRATION.md) and try again."
+            )
+            sys.exit(0)
+        print("Available suites:")
+        for s in suites:
+            print(f"  {s}")
+        sys.exit(0)
+
+    suite_arg = getattr(args, "suite", None)
+    if not suite_arg:
+        print(
+            "Error: --suite is required (or pass --list to see what's available).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # Watch mode wraps the same single-shot pipeline; --json is honoured
+    # on every iteration so the dev loop can be piped into jq.
+    def _print_result(run):
+        if getattr(args, "as_json", False):
+            print(_json.dumps({
+                "suite":   run.suite_name,
+                "ran_at":  run.ran_at,
+                "sha":     run.sha,
+                "passed":  run.passed,
+                "failed":  run.failed,
+                "exit":    run.exit_code,
+                "results": [r.to_dict() for r in run.results],
+            }, indent=2))
+        else:
+            print(esr.format_table(run))
+
+    persist = not getattr(args, "no_persist", False)
+
+    if getattr(args, "watch", False):
+        try:
+            esr.watch_suite(
+                suite_arg,
+                on_run=_print_result,
+                persist=persist,
+            )
+        except KeyboardInterrupt:
+            print("\nWatch stopped.")
+            sys.exit(0)
+        return
+
+    try:
+        suite = esr.load_suite(suite_arg)
+    except (FileNotFoundError, ValueError) as e:
+        # Keep error one-line and readable (per feedback_simple_ui_for_nontechnical).
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
+    run = esr.run_suite(suite, persist=persist)
+    _print_result(run)
+    sys.exit(run.exit_code)
+
+
+def _cmd_eval_regression(args) -> None:
+    """Phase 3 evals — replay last week's failed sessions against current
+    config. MANUAL invocation only: every replay costs API tokens, so the
+    runner enforces a hard ceiling (CLAWMETRY_EVALS_REGRESSION_MAX or the
+    --limit flag, defaulting to 10).
+
+    Exit code mirrors the eval-suite convention:
+        0 → ran cleanly (any mix of improved/same is fine)
+        1 → at least one regressed/errored row (signal worth investigating)
+    """
+    import json as _json
+    from clawmetry import eval_regression_replay as err
+
+    # Parse --window into days. Reuse the tiny human-readable parser style
+    # from routes/evals.py so flags + URL params behave the same.
+    raw = (getattr(args, "window", None) or "7d").strip().lower()
+    try:
+        if raw.endswith("d"):
+            window_days = int(float(raw[:-1]))
+        elif raw.endswith("h"):
+            window_days = max(1, int(float(raw[:-1]) // 24))
+        else:
+            window_days = int(float(raw))
+    except (TypeError, ValueError):
+        window_days = 7
+    window_days = max(1, min(90, window_days))
+
+    limit = getattr(args, "limit", None)
+    if limit is None:
+        limit = err.DEFAULT_REPLAY_BUDGET
+    limit = max(1, int(limit))
+
+    if not err.is_enabled():
+        print(
+            "Regression replay is disabled "
+            "(CLAWMETRY_EVALS_REGRESSION_ENABLED=0).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    print(
+        f"Replaying up to {limit} failed session(s) from the last "
+        f"{window_days}d... (manual cost-guarded run)",
+        flush=True,
+    )
+    run = err.run_regression(window_days=window_days, limit=limit)
+
+    if getattr(args, "as_json", False):
+        print(_json.dumps({
+            "ran_at":       run.ran_at,
+            "window_days":  run.window_days,
+            "tested":       run.tested,
+            "improved":     run.improved,
+            "regressed":    run.regressed,
+            "same":         run.same,
+            "errored":      run.errored,
+            "results":      [r.to_dict() for r in run.results],
+        }, indent=2))
+    else:
+        if not run.results:
+            print("No failed sessions in the window. Nothing to replay.")
+        else:
+            for r in run.results:
+                old_s = "-" if r.original_score is None else f"{r.original_score:.1f}"
+                new_s = "-" if r.new_score is None else f"{r.new_score:.1f}"
+                print(
+                    f"  {r.status.upper():<10} {r.session_id[:24]:<24} "
+                    f"{old_s} -> {new_s}  {r.reason[:60]}"
+                )
+            print()
+            print(
+                f"{run.improved} improved, {run.regressed} regressed, "
+                f"{run.same} same, {run.errored} errored "
+                f"({run.tested} tested over last {window_days}d)"
+            )
+    exit_code = 1 if (run.regressed > 0 or run.errored > 0) else 0
+    sys.exit(exit_code)
+
+
 def _cmd_update() -> None:
     """Self-update clawmetry to the latest PyPI version."""
     import subprocess
@@ -2188,10 +3054,14 @@ def _cmd_update() -> None:
 
                     if CONFIG_FILE.exists():
                         print("Restarting sync daemon...")
+                        # `clawmetry sync` re-registers the launchd/systemd unit
+                        # (bootout+bootstrap) = a safe restart. The old call to
+                        # the non-existent `daemon restart` subcommand silently
+                        # failed, so the daemon kept running the OLD wheel.
                         subprocess.run(
-                            ["clawmetry", "daemon", "restart"],
+                            ["clawmetry", "sync", "--restart"],
                             capture_output=True,
-                            timeout=15,
+                            timeout=20,
                         )
                         print("Daemon restarted with new version")
                 except Exception:
@@ -2207,8 +3077,471 @@ def _cmd_update() -> None:
         sys.exit(1)
 
 
+def _cmd_activate(args) -> None:
+    """clawmetry activate <KEY> — install a self-hosted Pro/Enterprise license."""
+    from clawmetry import license as _lic
+
+    ok, msg = _lic.activate(args.key, node_id=_lic._node_id(), actor="cli")
+    if ok:
+        print(f"✅  {msg}")
+        print("    Run `clawmetry license` to see status. Restart the daemon to load Pro features.")
+    else:
+        print(f"❌  {msg}")
+        print("    Need a key? Buy a self-hosted license at https://clawmetry.com/pricing")
+        sys.exit(1)
+
+
+def _cmd_license(args) -> None:
+    """clawmetry license [activate|status|deactivate] — manage the self-hosted license."""
+    action = getattr(args, "license_action", None) or "status"
+
+    if action == "activate":
+        key = getattr(args, "license_key", None) or ""
+        if not key:
+            print("❌  Usage: clawmetry license activate <KEY>")
+            sys.exit(1)
+        from clawmetry import license as _lic
+        ok, msg = _lic.activate(key.strip(), node_id=_lic._node_id(), actor="cli")
+        if ok:
+            print(f"✅  {msg}")
+            print("    Run `clawmetry license status` to verify. Restart the daemon to load Pro features.")
+        else:
+            print(f"❌  {msg}")
+            print("    Need a key? Buy a self-hosted license at https://clawmetry.com/pricing")
+            sys.exit(1)
+
+    elif action == "deactivate":
+        from clawmetry import license as _lic
+        ok, removed = _lic.deactivate(actor="cli")
+        if not ok:
+            print("❌  Could not remove the license file. Check filesystem permissions.")
+            sys.exit(1)
+        if removed:
+            print("✅  License removed. ClawMetry will revert to OSS tier on next restart.")
+        else:
+            print("ℹ️  No license key installed — nothing to deactivate.")
+
+    elif action == "fingerprint":
+        from clawmetry import license as _lic
+        info = _lic.pubkey_info()
+        fp = info.get("fingerprint_sha256")
+        print("ClawMetry License Public Key\n" + "─" * 40)
+        print(f"  Algorithm:   {info.get('algorithm', 'ed25519')}")
+        print(f"  Format:      {info.get('format', '')}")
+        if not fp:
+            print("  Fingerprint: ⚠️  unavailable (embedded key failed to parse)")
+            print("               This may indicate a corrupted or tampered install.")
+            sys.exit(1)
+        # Group the hex into 8-byte pairs for readability, mirroring SSH style.
+        grouped = ":".join(fp[i : i + 4] for i in range(0, len(fp), 4))
+        print(f"  SHA-256:     {fp}")
+        print(f"  Grouped:     {grouped}")
+        print(f"  Short:       {info.get('fingerprint_short')}")
+        print("\n  Compare this fingerprint against the canonical value")
+        print("  published at https://clawmetry.com/security to confirm your")
+        print("  install carries the genuine license-verification key.")
+
+    elif action == "verify":
+        # Dry-run: verify a key OFFLINE and show what it would unlock,
+        # WITHOUT writing anything to disk. Useful for support and pre-flight.
+        key = getattr(args, "license_key", None) or ""
+        if not key:
+            print("❌  Usage: clawmetry license verify <KEY>")
+            sys.exit(1)
+        from clawmetry import license as _lic
+        info = _lic.inspect_key(key.strip())
+        print("ClawMetry License Verify (dry-run)\n" + "─" * 40)
+        if info is None:
+            print("  Result:      ❌  Invalid or unrecognized license key")
+            print("  Disk:        nothing written")
+            sys.exit(1)
+        status = info.get("status", "unknown")
+        tier = str(info.get("tier", "pro")).capitalize()
+        if not info.get("valid"):
+            # Expired-but-parseable: show what it WAS for so support can confirm.
+            print(f"  Result:      ⚠️  {status} (signature verified, but expired)")
+            print(f"  Was for:     {tier} · {info.get('nodes', 1)} node(s)")
+            if info.get("days_left") is not None:
+                print(f"  Expired:     {abs(info['days_left'])} day(s) ago")
+        else:
+            print("  Result:      ✅  valid (signature verified offline)")
+            print(f"  Would set:   {tier} (self-hosted)")
+            print(f"  Nodes:       {info.get('nodes', 1)}")
+            if info.get("days_left") is not None:
+                print(f"  Expires:     in {info['days_left']} day(s)")
+        if info.get("sub"):
+            print(f"  Account:     {info['sub']}")
+        print("  Disk:        nothing written (run `clawmetry license activate <KEY>` to install)")
+
+    else:
+        from clawmetry import license as _lic
+        info = _lic.current_license_info()
+        print("ClawMetry License\n" + "─" * 40)
+        if not info:
+            print("  Plan:        OSS (free)")
+            print("  License:     none installed")
+            print("  Unlocks:     OpenClaw runtime + NeMo governance + core observability")
+            print("\n  Upgrade for all runtimes + advanced features:")
+            print("    self-hosted key  →  clawmetry license activate <KEY>   (https://clawmetry.com/pricing)")
+            return
+        if not info.get("valid"):
+            status = info.get("status", "invalid")
+            print(f"  License:     ⚠️  {status} (run `clawmetry license activate <KEY>` with a current key)")
+            return
+        tier = str(info.get("tier", "pro")).capitalize()
+        print(f"  Plan:        {tier} (self-hosted)")
+        print(f"  Nodes:       {info.get('nodes', 1)}")
+        if info.get("days_left") is not None:
+            print(f"  Expires:     in {info['days_left']} day(s)")
+        print("  E2E:         🔒 verified offline")
+        fp = info.get("pubkey_fingerprint_sha256")
+        if fp:
+            print(f"  Trust key:   sha256:{fp[:16]}…  (clawmetry license fingerprint)")
+
+
+def _cmd_tier(args) -> None:
+    """clawmetry tier — print the resolved open-core entitlement.
+
+    Read-only, side-effect free. Useful for scripting (``clawmetry tier --json
+    | jq -r .tier``) and for the "what tier am I on?" diagnostic that's
+    cheaper than the full ``clawmetry status`` block. Never raises — on any
+    resolution error it falls back to the OSS-free shape so a shell wrapper
+    always sees a valid response.
+
+    Output:
+      default — compact human-readable block matching the project style
+      --json  — :func:`Entitlement.to_dict` serialized (indent=2 for piping
+                to jq / direct viewing)
+    """
+    import json as _json
+
+    try:
+        from clawmetry import entitlements as _ent
+
+        ent = _ent.get_entitlement()
+        info = ent.to_dict()
+    except Exception as exc:
+        # The resolver itself never raises, but a broken install (missing dep,
+        # corrupt module) could. Match the never-crash contract — log the
+        # warning to stderr and emit the OSS-free fallback so scripts keep
+        # working.
+        print(f"⚠️  tier resolution failed: {exc}", file=sys.stderr)
+        info = {
+            "tier": "oss",
+            "source": "oss",
+            "node_limit": 1,
+            "expiry": None,
+            "expired": False,
+            "is_paid": False,
+            "grace": True,
+            "enforced": False,
+            "runtimes": ["nemoclaw", "openclaw"],
+            "features": [],
+            "free_runtimes": ["nemoclaw", "openclaw"],
+            "paid_runtimes": [],
+            "all_runtimes": ["nemoclaw", "openclaw"],
+        }
+
+    if getattr(args, "as_json", False):
+        print(_json.dumps(info, indent=2, sort_keys=True))
+        return
+
+    tier = str(info.get("tier", "oss")).lower()
+    source = str(info.get("source", "oss"))
+    grace = bool(info.get("grace", True))
+    runtimes = list(info.get("runtimes") or [])
+    all_runtimes = list(info.get("all_runtimes") or [])
+    locked = [r for r in all_runtimes if r not in set(runtimes)]
+    features = list(info.get("features") or [])
+
+    tier_label = "OSS (free)" if tier == "oss" else tier.replace("_", " ").title()
+    mode = "🟡 grace  (set CLAWMETRY_ENFORCE=1 to enforce)" if grace else "🔒 enforced"
+
+    print("ClawMetry Tier\n" + "─" * 40)
+    print(f"  Tier:        {tier_label}")
+    print(f"  Source:      {source}")
+    print(f"  Mode:        {mode}")
+    expiry = info.get("expiry")
+    if expiry:
+        expired = "expired" if info.get("expired") else "valid"
+        print(f"  Expiry:      {int(expiry)} ({expired})")
+    if info.get("node_limit") and info["node_limit"] != 1:
+        print(f"  Node limit:  {info['node_limit']}")
+    if runtimes:
+        print(f"  Runtimes:    {', '.join(runtimes)}")
+    if locked:
+        print(f"  Locked:      {', '.join(locked)}")
+    print(f"  Features:    {len(features)} unlocked")
+
+
+def _cmd_runtimes(args) -> None:
+    """clawmetry runtimes — list every observable runtime and which are unlocked.
+
+    Sibling of :func:`_cmd_tier`: that one answers "what tier am I on?", this
+    one answers "which runtimes is this install cleared to observe?". Reads
+    :func:`clawmetry.entitlements.runtime_catalog` -- the same source the
+    dashboard's ``GET /api/runtimes`` consumes -- so the CLI and the UI cannot
+    drift.
+
+    Never raises. A poisoned catalog read surfaces the error inline (a warning
+    row in the human table, or an ``error`` key on the JSON payload with
+    ``runtimes=[]``) so a wrapper script always sees a parseable response.
+    Matches the never-crash contract documented on :func:`get_entitlement`.
+
+    Output:
+      default -- compact table (id, label, tier, status)
+      --json  -- ``{tier, grace, enforced, runtimes: [...], error?: str}``
+    """
+    import json as _json
+
+    from clawmetry import entitlements as _ent
+
+    try:
+        ent = _ent.get_entitlement()
+        tier = ent.tier
+        grace = bool(ent.grace)
+        enforced = _ent.is_enforced()
+    except Exception as exc:
+        # Mirror _cmd_tier's never-crash fallback: a broken install still gets
+        # a parseable shape, with the failure surfaced to stderr so it isn't
+        # silently lost in a pipeline.
+        print(f"⚠️  entitlement resolution failed: {exc}", file=sys.stderr)
+        tier, grace, enforced = "oss", True, False
+
+    rows: list[dict] = []
+    catalog_error: str | None = None
+    try:
+        rows = list(_ent.runtime_catalog())
+    except Exception as exc:
+        catalog_error = str(exc)
+
+    if getattr(args, "as_json", False):
+        payload: dict = {
+            "tier": tier,
+            "grace": grace,
+            "enforced": enforced,
+            "runtimes": rows,
+        }
+        if catalog_error:
+            payload["error"] = catalog_error
+        print(_json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    mode_line = "off (grace)" if not enforced else "on"
+    print("ClawMetry Runtimes\n" + "─" * 40)
+    print(f"  Tier:        {tier}")
+    print(f"  Enforcement: {mode_line}")
+    if catalog_error:
+        print(f"  ⚠️  catalog error: {catalog_error}")
+        return
+
+    any_locked = False
+    print()
+    print(f"  {'ID':<14} {'Label':<14} {'Tier':<6} Status")
+    print("  " + "─" * 50)
+    for row in rows:
+        rid = str(row.get("id", ""))
+        label = str(row.get("label", rid))
+        is_free = bool(row.get("free", False))
+        locked = bool(row.get("locked", False))
+        if locked:
+            status = "🔒 locked"
+            any_locked = True
+        else:
+            status = "✅ available"
+        tier_tag = "free" if is_free else "paid"
+        print(f"  {rid:<14} {label:<14} {tier_tag:<6} {status}")
+    if any_locked:
+        print()
+        print("  Upgrade: clawmetry license activate <KEY>")
+
+
+def _cmd_features(args) -> None:
+    """clawmetry features — list every observable feature and which are unlocked.
+
+    Sibling of :func:`_cmd_runtimes`: that one answers "which runtimes is
+    this install cleared to observe?", this one answers the same question
+    for features. Reads :func:`clawmetry.entitlements.feature_catalog` --
+    the same source the dashboard's ``GET /api/features`` consumes -- so the
+    CLI and the UI cannot drift on the locked-but-visible upgrade affordance.
+
+    Never raises. A poisoned catalog read surfaces the error inline (a
+    warning row in the human table, or an ``error`` key on the JSON payload
+    with ``features=[]``) so a wrapper script always sees a parseable
+    response. Matches the never-crash contract documented on
+    :func:`get_entitlement`.
+
+    Output:
+      default -- compact table (id, label, tier, status)
+      --json  -- ``{tier, grace, enforced, features: [...], error?: str}``
+    """
+    import json as _json
+
+    from clawmetry import entitlements as _ent
+
+    try:
+        ent = _ent.get_entitlement()
+        tier = ent.tier
+        grace = bool(ent.grace)
+        enforced = _ent.is_enforced()
+    except Exception as exc:
+        # Mirror _cmd_runtimes' never-crash fallback: a broken install still
+        # gets a parseable shape, with the failure surfaced to stderr so it
+        # isn't silently lost in a pipeline.
+        print(f"⚠️  entitlement resolution failed: {exc}", file=sys.stderr)
+        tier, grace, enforced = "oss", True, False
+
+    rows: list[dict] = []
+    catalog_error: str | None = None
+    try:
+        rows = list(_ent.feature_catalog())
+    except Exception as exc:
+        catalog_error = str(exc)
+
+    if getattr(args, "as_json", False):
+        payload: dict = {
+            "tier": tier,
+            "grace": grace,
+            "enforced": enforced,
+            "features": rows,
+        }
+        if catalog_error:
+            payload["error"] = catalog_error
+        print(_json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    mode_line = "off (grace)" if not enforced else "on"
+    print("ClawMetry Features\n" + "─" * 40)
+    print(f"  Tier:        {tier}")
+    print(f"  Enforcement: {mode_line}")
+    if catalog_error:
+        print(f"  ⚠️  catalog error: {catalog_error}")
+        return
+
+    any_locked = False
+    print()
+    print(f"  {'ID':<28} {'Label':<28} {'Tier':<14} Status")
+    print("  " + "─" * 80)
+    for row in rows:
+        # Alias rows duplicate a canonical feature -- hide them so the table
+        # mirrors the upgrade affordance shown in /pricing rather than
+        # advertising deprecated names.
+        if row.get("alias"):
+            continue
+        fid = str(row.get("id", ""))
+        label = str(row.get("label", fid))
+        feat_tier = str(row.get("tier", "oss"))
+        is_free = bool(row.get("free", False))
+        locked = bool(row.get("locked", False))
+        if locked:
+            status = "🔒 locked"
+            any_locked = True
+        else:
+            status = "✅ available"
+        tier_tag = "free" if is_free else feat_tier
+        print(f"  {fid:<28} {label:<28} {tier_tag:<14} {status}")
+    if any_locked:
+        print()
+        print("  Upgrade: clawmetry license activate <KEY>")
+
+
+def _cmd_verify_integrity(args) -> None:
+    """clawmetry verify-integrity — walk the hash chain and report validity."""
+    from clawmetry.local_store import get_store
+
+    node_id = getattr(args, "node_id", None) or None
+    print("ClawMetry Integrity Verify\n" + "─" * 40)
+
+    try:
+        store = get_store(read_only=True)
+    except Exception as exc:
+        print(f"  Error: cannot open local store — {exc}")
+        raise SystemExit(1) from exc
+
+    try:
+        result = store.verify_integrity(node_id=node_id)
+    except Exception as exc:
+        print(f"  Error: verification failed — {exc}")
+        raise SystemExit(1) from exc
+
+    # When a sync daemon is running, ``get_store(read_only=True)`` returns a
+    # proxy that forwards through HTTP. Older daemons (< 0.12.343) do not
+    # have ``verify_integrity`` in their method allowlist and return None.
+    # Degrade gracefully instead of crashing on ``result["status"]``.
+    if result is None:
+        print("  Result:      ?  Could not reach the running daemon's verifier.")
+        print("               This usually means the daemon is older than the CLI.")
+        print("               Restart the sync daemon to pick up the new wheel, then re-run.")
+        raise SystemExit(2)
+
+    status = result["status"]
+    checked = result["checked"]
+    pre_chain = result["pre_chain"]
+    scope = result["node_id"]
+
+    print(f"  Scope:       {scope}")
+    print(f"  Checked:     {checked} stamped event(s)")
+    if pre_chain:
+        print(f"  Pre-chain:   {pre_chain} event(s) without hash (before integrity was enabled)")
+
+    if status == "empty":
+        print("  Result:      ○  No stamped events found")
+        print("               (set CLAWMETRY_INTEGRITY=1 to enable stamping)")
+    elif status == "valid":
+        print(f"  Result:      ✅  VALID — chain intact across {checked} event(s)")
+    else:
+        broken_at = result["broken_at"]
+        error = result["error"]
+        print(f"  Result:      ❌  INVALID — {error}")
+        print(f"  First break: {broken_at}")
+        raise SystemExit(1)
+
+
 def main() -> None:
     import argparse
+    # --v2 opt-in flag for the React SPA scaffold (see clawmetry/v2/routes.py).
+    # Strip it from argv so dashboard.main's argparse doesn't choke on it.
+    # Sets the env var that dashboard.py checks at blueprint registration time.
+    if "--v2-default" in sys.argv:
+        sys.argv = [a for a in sys.argv if a != "--v2-default"]
+        os.environ["CLAWMETRY_V2"] = "1"
+        os.environ["CLAWMETRY_V2_DEFAULT"] = "1"
+        print(
+            "v2 at / (default) · v1 at /v1",
+            flush=True,
+        )
+    elif "--v2" in sys.argv:
+        sys.argv = [a for a in sys.argv if a != "--v2"]
+        os.environ["CLAWMETRY_V2"] = "1"
+        print(
+            "v2 preview at http://localhost:8900/v2 · back to v1 at /",
+            flush=True,
+        )
+    # --otel-export <url>: stream agent traces as OpenTelemetry GenAI spans to
+    # any OTLP/HTTP collector (Datadog, Grafana, Honeycomb, your own).
+    # Sets the env var clawmetry/otel_exporter.py reads at boot. Strip from argv
+    # so dashboard.main's argparse doesn't choke on it. Accepts both
+    # `--otel-export URL` and `--otel-export=URL`.
+    _otel_ep = None
+    for _i, _a in enumerate(list(sys.argv)):
+        if _a == "--otel-export" and _i + 1 < len(sys.argv):
+            _otel_ep = sys.argv[_i + 1]
+            del sys.argv[_i:_i + 2]
+            break
+        if _a.startswith("--otel-export="):
+            _otel_ep = _a.split("=", 1)[1]
+            sys.argv.remove(_a)
+            break
+    if _otel_ep:
+        os.environ["CLAWMETRY_OTEL_EXPORT_ENDPOINT"] = _otel_ep
+        print(f"OpenTelemetry export ON → {_otel_ep} (GenAI semconv)", flush=True)
+    # Tag this process as the dashboard BEFORE importing dashboard, so every
+    # get_store() in dashboard.py (module-level + handlers) is barred from the
+    # DuckDB writer — only the sync daemon writes. Set before the import or a
+    # module-level open would race in before the gate is active. The daemon
+    # (-m clawmetry.sync) never takes this path and calls mark_writer_owner(),
+    # which overrides the gate.
+    os.environ["CLAWMETRY_ROLE"] = "dashboard"
     from dashboard import main as dashboard_main
 
     # Anonymous, opt-out, once-per-install ping. See clawmetry/telemetry.py
@@ -2279,6 +3612,14 @@ def main() -> None:
         dest="custom_node_id",
         help="Custom node name (default: hostname)",
     )
+    p_onboard.add_argument(
+        "--local", "--no-cloud", action="store_true", dest="local",
+        help="Local only: no cloud account, nothing leaves this machine",
+    )
+    p_onboard.add_argument(
+        "--cloud", action="store_true", dest="cloud",
+        help="Create a cloud account non-interactively (skip the prompt)",
+    )
 
     # connect
     p_connect = sub.add_parser("connect", help="Activate cloud sync")
@@ -2303,7 +3644,13 @@ def main() -> None:
         "--start-sync-now",
         action="store_true",
         dest="start_sync_now",
-        help="Start the sync daemon immediately after connect (default: defer until `clawmetry sync`)",
+        help="No-op (now the default). Retained for back-compat.",
+    )
+    p_connect.add_argument(
+        "--defer-sync",
+        action="store_true",
+        dest="defer_sync",
+        help="Connect but leave sync paused; start it later with `clawmetry sync`",
     )
     p_connect.add_argument(
         "--foreground", action="store_true", help="Run daemon in foreground"
@@ -2313,6 +3660,11 @@ def main() -> None:
         metavar="NAME",
         dest="custom_node_id",
         help="Custom node name (default: hostname)",
+    )
+    p_connect.add_argument(
+        "--force",
+        action="store_true",
+        help="Override the persistent local-only marker (#1937) and connect anyway",
     )
 
     # setup — alias for onboard (new user-facing name)
@@ -2328,6 +3680,14 @@ def main() -> None:
         metavar="NAME",
         dest="custom_node_id",
         help="Custom node name (default: hostname)",
+    )
+    p_setup.add_argument(
+        "--local", "--no-cloud", action="store_true", dest="local",
+        help="Local only: no cloud account, nothing leaves this machine",
+    )
+    p_setup.add_argument(
+        "--cloud", action="store_true", dest="cloud",
+        help="Create a cloud account non-interactively (skip the prompt)",
     )
 
     # account — link email or show account info
@@ -2349,10 +3709,15 @@ def main() -> None:
     p_sync.add_argument(
         "--foreground", action="store_true", help="Run daemon in foreground"
     )
+    p_sync.add_argument(
+        "--restart", action="store_true",
+        help="Restart the running daemon (bounces launchd/systemd; safe, no SIGKILL)",
+    )
 
     # status
     p_status = sub.add_parser("status", help="Show local + cloud sync status")
     p_status.add_argument("--show-key", action="store_true", help="Reveal secret key")
+    p_status.add_argument("--live", action="store_true", help="Live one-line status bar (sessions · tokens · cost · model · tok/s); Ctrl-C to exit")
 
     # proxy
     p_proxy = sub.add_parser(
@@ -2405,12 +3770,162 @@ def main() -> None:
         "--loop-detection", choices=["on", "off"], help="Toggle loop detection"
     )
 
+    # reports — open the reports browser (refs #1005)
+    p_reports = sub.add_parser(
+        "reports",
+        help="Open the reports browser (renders ~/.clawmetry/reports/*.md + DuckDB SQL)",
+    )
+    p_reports.add_argument(
+        "--port", type=int, default=8900, help="Dashboard port (default: 8900)"
+    )
+
+    # eval — run a golden test suite (Phase 2 evals, refs #1619)
+    p_eval = sub.add_parser(
+        "eval",
+        help="Run a golden eval suite (YAML in ~/.clawmetry/evals/)",
+    )
+    p_eval.add_argument(
+        "--suite",
+        metavar="NAME_OR_PATH",
+        help="Suite name (e.g. customer_support) or absolute path to a YAML file",
+    )
+    p_eval.add_argument(
+        "--list",
+        action="store_true",
+        dest="list_suites",
+        help="List available suites and exit",
+    )
+    p_eval.add_argument(
+        "--watch",
+        action="store_true",
+        help="Re-run on every change to the suite file (dev loop)",
+    )
+    p_eval.add_argument(
+        "--no-persist",
+        action="store_true",
+        dest="no_persist",
+        help="Do not write results to DuckDB (useful for dry runs)",
+    )
+    p_eval.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit machine-readable JSON instead of the table",
+    )
+    # Phase 3 (refs #1619) — regression replay of last week's failed sessions.
+    # MANUAL invocation only by design (no cron): replay costs API tokens, so
+    # the user opts in every time. ``--regression`` is mutually-exclusive with
+    # ``--suite`` at the handler level.
+    p_eval.add_argument(
+        "--regression",
+        action="store_true",
+        dest="regression",
+        help=(
+            "Replay last week's failed sessions against the current "
+            "config (manual cost-guarded; see --window / --limit)"
+        ),
+    )
+    p_eval.add_argument(
+        "--window",
+        metavar="DURATION",
+        default="7d",
+        help="Lookback window for --regression (e.g. 7d, 14d; default 7d)",
+    )
+    p_eval.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            "Hard ceiling on replays per --regression invocation "
+            "(default: CLAWMETRY_EVALS_REGRESSION_MAX or 10)"
+        ),
+    )
+
     # update — self-update to latest PyPI version
     sub.add_parser("update", help="Update clawmetry to the latest version")
+
+    # mcp — start MCP server on stdio (issue #2859)
+    sub.add_parser(
+        "mcp",
+        help="Start ClawMetry MCP server (stdio) — lets agents query their own telemetry",
+    )
 
     # uninstall — fully remove clawmetry
     sub.add_parser(
         "uninstall", help="Fully uninstall clawmetry (stop daemons, remove all files)"
+    )
+
+    # activate — install a self-hosted Pro/Enterprise license key
+    p_activate = sub.add_parser(
+        "activate", help="Activate a self-hosted Pro/Enterprise license key"
+    )
+    p_activate.add_argument("key", help="License key (CLAW1.…)")
+
+    # license — manage the self-hosted Pro/Enterprise license
+    p_license = sub.add_parser("license", help="Manage the self-hosted Pro/Enterprise license")
+    p_license.add_argument(
+        "license_action",
+        nargs="?",
+        default="status",
+        choices=["status", "activate", "deactivate", "fingerprint", "verify"],
+        help="status (default) | activate <KEY> | deactivate | fingerprint | verify <KEY>",
+    )
+    p_license.add_argument(
+        "license_key",
+        nargs="?",
+        default=None,
+        help="License key (CLAW1.…) — required for 'activate' / 'verify'",
+    )
+
+    # tier — print the resolved open-core entitlement (scriptable)
+    p_tier = sub.add_parser(
+        "tier",
+        help="Print the resolved open-core entitlement (tier, runtimes, features)",
+    )
+    p_tier.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit the full Entitlement.to_dict() as JSON (jq-friendly)",
+    )
+
+    # runtimes — list every observable runtime and which are unlocked (PR #3005)
+    p_runtimes = sub.add_parser(
+        "runtimes",
+        help="List every observable runtime and which this install can unlock",
+    )
+    p_runtimes.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit {tier, grace, enforced, runtimes:[...]} JSON (jq-friendly)",
+    )
+
+    # features — list every observable feature and which are unlocked.
+    # CLI sibling of `clawmetry runtimes` and of the dashboard's GET
+    # /api/features so the operator can answer "what does this tier unlock?"
+    # from the shell without parsing `tier --json`.
+    p_features = sub.add_parser(
+        "features",
+        help="List every observable feature and which this install can unlock",
+    )
+    p_features.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit {tier, grace, enforced, features:[...]} JSON (jq-friendly)",
+    )
+
+    # verify-integrity — walk hash chain and report validity (Issue #2200)
+    p_verify = sub.add_parser(
+        "verify-integrity",
+        help="Verify the tamper-evident hash chain for local events",
+    )
+    p_verify.add_argument(
+        "--node-id",
+        dest="node_id",
+        default=None,
+        help="Limit verification to a single node (default: all nodes)",
     )
 
     # Parse just the first token to decide if it's a sub-command or dashboard flag
@@ -2423,8 +3938,17 @@ def main() -> None:
         "sync",
         "status",
         "proxy",
+        "reports",
+        "eval",
+        "mcp",
         "update",
         "uninstall",
+        "activate",
+        "license",
+        "tier",
+        "runtimes",
+        "features",
+        "verify-integrity",
         "nemoclaw-daemons",
     )
     if len(sys.argv) > 1 and sys.argv[1] in _subcmds:
@@ -2447,14 +3971,37 @@ def main() -> None:
             _cmd_status(args)
         elif args.cmd == "proxy":
             _cmd_proxy(args)
+        elif args.cmd == "reports":
+            _cmd_reports(args)
+        elif args.cmd == "eval":
+            _cmd_eval(args)
+        elif args.cmd == "mcp":
+            _cmd_mcp(args)
         elif args.cmd == "update":
             _cmd_update()
         elif args.cmd == "uninstall":
             _cmd_uninstall()
+        elif args.cmd == "activate":
+            _cmd_activate(args)
+        elif args.cmd == "license":
+            _cmd_license(args)
+        elif args.cmd == "tier":
+            _cmd_tier(args)
+        elif args.cmd == "runtimes":
+            _cmd_runtimes(args)
+        elif args.cmd == "features":
+            _cmd_features(args)
+        elif args.cmd == "verify-integrity":
+            _cmd_verify_integrity(args)
         elif args.cmd == "nemoclaw-daemons":
             _register_nemoclaw_sandbox_daemons()
     else:
         # Fall through to dashboard (handles --host, --port, --version, start, stop, etc.)
+        # Tag this process as the dashboard so local_store.get_store() never
+        # opens the DuckDB writer here — only the sync daemon writes. The
+        # daemon (-m clawmetry.sync) doesn't take this path, and even if it
+        # inherited the env it calls mark_writer_owner() which overrides.
+        os.environ["CLAWMETRY_ROLE"] = "dashboard"
         dashboard_main()
 
 

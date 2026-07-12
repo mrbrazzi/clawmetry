@@ -6,12 +6,12 @@
   <!-- Header -->
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
     <div>
-      <span style="font-size:15px;font-weight:700;color:var(--text-primary);">Approvals</span>
+      <span style="font-size:15px;font-weight:700;color:var(--text-primary);" data-i18n="approvals.title">Approvals</span>
       <span id="approvals-pending-count" style="margin-left:8px;font-size:11px;color:var(--text-muted);"></span>
     </div>
     <div style="display:flex;gap:8px;align-items:center;">
       <span id="approvals-updated" style="font-size:11px;color:var(--text-muted);"></span>
-      <button class="refresh-btn" onclick="loadApprovalsTab()">&#8635; Refresh</button>
+      <button class="refresh-btn" onclick="loadApprovalsTab()">↻ <span data-i18n="common.refresh">Refresh</span></button>
     </div>
   </div>
 
@@ -26,29 +26,29 @@
 
   <!-- ═══ SECTION 1: Pending Queue (top of LEFT col) ═══ -->
   <div id="approvals-pending-section" style="margin-bottom:16px;">
-    <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:6px;">Pending Approvals</div>
+    <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:6px;" data-i18n="approvals.pending_approvals">Pending Approvals</div>
 
     <!-- Bulk-action header (#1343 Phase 1.3) — hidden until ≥1 selected.
          Lets operators triage a flood (e.g. "approve all 12 pending HTTP
          requests from the same trusted session") without per-row clicks. -->
     <div id="approvals-bulk-header" style="display:none;background:var(--bg-secondary);border:1px solid var(--border-secondary);border-radius:8px;padding:8px 12px;margin-bottom:8px;align-items:center;gap:10px;flex-wrap:wrap;">
       <span id="approvals-bulk-count" style="font-size:12px;font-weight:700;color:var(--text-primary);"></span>
-      <input type="text" id="approvals-bulk-reason" placeholder="Bulk decision reason (optional, applied to all)" style="flex:1;min-width:200px;padding:5px 10px;border:1px solid var(--border-secondary);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);font-size:12px;">
-      <button onclick="bulkDecide('approve')" style="background:#22c55e;color:#062614;border:0;padding:6px 14px;border-radius:6px;font-weight:600;font-size:12px;cursor:pointer;">Approve selected</button>
-      <button onclick="bulkDecide('deny')" style="background:#ef4444;color:#fff;border:0;padding:6px 14px;border-radius:6px;font-weight:600;font-size:12px;cursor:pointer;">Deny selected</button>
-      <button onclick="bulkClearSelection()" style="background:transparent;color:var(--text-muted);border:1px solid var(--border-secondary);padding:6px 12px;border-radius:6px;font-size:12px;cursor:pointer;">Clear</button>
+      <input type="text" id="approvals-bulk-reason" data-i18n-placeholder="approvals.bulk_reason_placeholder" placeholder="Bulk decision reason (optional, applied to all)" style="flex:1;min-width:200px;padding:5px 10px;border:1px solid var(--border-secondary);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);font-size:12px;">
+      <button onclick="bulkDecide('approve')" style="background:#22c55e;color:#062614;border:0;padding:6px 14px;border-radius:6px;font-weight:600;font-size:12px;cursor:pointer;" data-i18n="approvals.approve_selected">Approve selected</button>
+      <button onclick="bulkDecide('deny')" style="background:#ef4444;color:#fff;border:0;padding:6px 14px;border-radius:6px;font-weight:600;font-size:12px;cursor:pointer;" data-i18n="approvals.deny_selected">Deny selected</button>
+      <button onclick="bulkClearSelection()" style="background:transparent;color:var(--text-muted);border:1px solid var(--border-secondary);padding:6px 12px;border-radius:6px;font-size:12px;cursor:pointer;" data-i18n="approvals.clear">Clear</button>
     </div>
 
     <div id="approvals-pending-list">
-      <div style="padding:18px;text-align:center;color:var(--text-muted);font-size:12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;">Loading...</div>
+      <div style="padding:18px;text-align:center;color:var(--text-muted);font-size:12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;" data-i18n="app.loading">Loading...</div>
     </div>
   </div>
 
   <!-- ═══ SECTION 4: Recent Decisions (bottom of LEFT col) ═══ -->
   <div>
-    <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:6px;">Recent Decisions</div>
+    <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:6px;" data-i18n="approvals.recent_decisions">Recent Decisions</div>
     <div id="approvals-history-list">
-      <div style="padding:14px;text-align:center;color:var(--text-faint);font-size:12px;">No history yet.</div>
+      <div style="padding:14px;text-align:center;color:var(--text-faint);font-size:12px;" data-i18n="approvals.no_history">No history yet.</div>
     </div>
   </div>
 
@@ -60,8 +60,8 @@
   <!-- ═══ SECTION 2: Protection Rules (visual policy builder) ═══ -->
   <div style="margin-bottom:16px;">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
-      <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;">Protection Rules</div>
-      <button onclick="toggleCreateRuleForm()" id="btn-create-rule" style="background:var(--bg-accent,#3b82f6);color:#fff;border:0;padding:5px 12px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;">+ New Rule</button>
+      <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;" data-i18n="approvals.protection_rules">Protection Rules</div>
+      <button onclick="toggleCreateRuleForm()" id="btn-create-rule" style="background:var(--bg-accent,#3b82f6);color:#fff;border:0;padding:5px 12px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;" data-i18n="approvals.new_rule">+ New Rule</button>
     </div>
 
     <!-- Preset cards grid -->
@@ -70,48 +70,48 @@
 
     <!-- Create custom rule form (hidden by default) -->
     <div id="create-rule-form" style="display:none;background:var(--bg-secondary);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:12px;">
-      <div style="font-size:13px;font-weight:700;color:var(--text-primary);margin-bottom:12px;">Create Custom Rule</div>
+      <div style="font-size:13px;font-weight:700;color:var(--text-primary);margin-bottom:12px;" data-i18n="approvals.create_custom_rule">Create Custom Rule</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
         <div>
-          <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">Rule name</label>
-          <input id="rule-name" type="text" placeholder="e.g. Block production deploys" style="width:100%;box-sizing:border-box;padding:7px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);font-size:12px;">
+          <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;" data-i18n="approvals.rule_name">Rule name</label>
+          <input id="rule-name" type="text" data-i18n-placeholder="approvals.rule_name_placeholder" placeholder="e.g. Block production deploys" style="width:100%;box-sizing:border-box;padding:7px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);font-size:12px;">
         </div>
         <div>
-          <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">Tool type</label>
+          <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;" data-i18n="approvals.tool_type">Tool type</label>
           <select id="rule-tool" style="width:100%;box-sizing:border-box;padding:7px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);font-size:12px;">
-            <option value="">Any tool</option>
-            <option value="exec">Shell commands (exec)</option>
-            <option value="write">File writes (write)</option>
-            <option value="edit">File edits (edit)</option>
-            <option value="http">HTTP requests (http)</option>
+            <option value="" data-i18n="approvals.any_tool">Any tool</option>
+            <option value="exec" data-i18n="approvals.tool_exec">Shell commands (exec)</option>
+            <option value="write" data-i18n="approvals.tool_write">File writes (write)</option>
+            <option value="edit" data-i18n="approvals.tool_edit">File edits (edit)</option>
+            <option value="http" data-i18n="approvals.tool_http">HTTP requests (http)</option>
           </select>
         </div>
         <div style="grid-column:1/-1;">
-          <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">Block commands matching</label>
-          <input id="rule-pattern" type="text" placeholder="e.g. deploy, sudo, DROP TABLE" style="width:100%;box-sizing:border-box;padding:7px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);font-size:12px;">
-          <div style="font-size:10px;color:var(--text-faint);margin-top:3px;">Enter keywords separated by commas. The agent will be paused when any of these are detected.</div>
+          <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;" data-i18n="approvals.block_commands_matching">Block commands matching</label>
+          <input id="rule-pattern" type="text" data-i18n-placeholder="approvals.pattern_placeholder" placeholder="e.g. deploy, sudo, DROP TABLE" style="width:100%;box-sizing:border-box;padding:7px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);font-size:12px;">
+          <div style="font-size:10px;color:var(--text-faint);margin-top:3px;" data-i18n="approvals.keywords_hint">Enter keywords separated by commas. The agent will be paused when any of these are detected.</div>
         </div>
         <div>
-          <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">Approval timeout</label>
+          <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;" data-i18n="approvals.approval_timeout">Approval timeout</label>
           <select id="rule-timeout" style="width:100%;box-sizing:border-box;padding:7px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);font-size:12px;">
-            <option value="30">30 seconds</option>
-            <option value="60" selected>1 minute</option>
-            <option value="120">2 minutes</option>
-            <option value="300">5 minutes</option>
-            <option value="600">10 minutes</option>
+            <option value="30" data-i18n="approvals.timeout_30s">30 seconds</option>
+            <option value="60" selected data-i18n="approvals.timeout_1m">1 minute</option>
+            <option value="120" data-i18n="approvals.timeout_2m">2 minutes</option>
+            <option value="300" data-i18n="approvals.timeout_5m">5 minutes</option>
+            <option value="600" data-i18n="approvals.timeout_10m">10 minutes</option>
           </select>
         </div>
         <div>
-          <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">If no one responds</label>
+          <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;" data-i18n="approvals.if_no_response">If no one responds</label>
           <select id="rule-on-timeout" style="width:100%;box-sizing:border-box;padding:7px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);font-size:12px;">
-            <option value="deny" selected>Block the action (safer)</option>
-            <option value="approve">Allow the action</option>
+            <option value="deny" selected data-i18n="approvals.block_action_safer">Block the action (safer)</option>
+            <option value="approve" data-i18n="approvals.allow_action">Allow the action</option>
           </select>
         </div>
       </div>
       <div style="display:flex;gap:8px;margin-top:14px;">
-        <button onclick="saveCustomRule()" style="background:#22c55e;color:#062614;border:0;padding:8px 20px;border-radius:6px;font-weight:600;font-size:12px;cursor:pointer;">Save Rule</button>
-        <button onclick="toggleCreateRuleForm()" style="background:var(--bg-primary);color:var(--text-muted);border:1px solid var(--border);padding:8px 16px;border-radius:6px;font-size:12px;cursor:pointer;">Cancel</button>
+        <button onclick="saveCustomRule()" style="background:#22c55e;color:#062614;border:0;padding:8px 20px;border-radius:6px;font-weight:600;font-size:12px;cursor:pointer;" data-i18n="approvals.save_rule">Save Rule</button>
+        <button onclick="toggleCreateRuleForm()" style="background:var(--bg-primary);color:var(--text-muted);border:1px solid var(--border);padding:8px 16px;border-radius:6px;font-size:12px;cursor:pointer;" data-i18n="common.cancel">Cancel</button>
       </div>
     </div>
   </div>
@@ -121,13 +121,13 @@
        duplicating the cards here just made the same decision live in two
        places. One short link keeps the affordance discoverable. -->
   <div style="margin-bottom:16px;">
-    <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:8px;">Get Notified</div>
+    <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:8px;" data-i18n="approvals.get_notified">Get Notified</div>
     <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;background:var(--bg-secondary,#131929);border:1px solid var(--border,#1e293b);border-radius:10px;padding:12px 14px;">
-      <div style="font-size:12px;color:var(--text-secondary,#cbd5e1);">
+      <div style="font-size:12px;color:var(--text-secondary,#cbd5e1);" data-i18n="approvals.delivered_via">
         Approvals are delivered via your Notifications channels (Email, Slack, Phone, PagerDuty, Telegram).
       </div>
       <button onclick="if(typeof switchTab==='function')switchTab('notifications')"
-        style="flex-shrink:0;padding:7px 14px;border:1px solid #3b82f6;background:transparent;color:#60a5fa;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">
+        style="flex-shrink:0;padding:7px 14px;border:1px solid #3b82f6;background:transparent;color:#60a5fa;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;" data-i18n="approvals.configure_notifications">
         Configure notifications →
       </button>
     </div>
@@ -139,27 +139,27 @@
   <!-- ═══ Upgrade Modal ═══ -->
   <div id="approvals-upgrade-modal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;" onclick="if(event.target===this)closeUpgradeModal()">
     <div style="background:var(--bg-secondary,#131929);border:1px solid rgba(96,165,250,0.3);border-radius:16px;padding:32px 36px;max-width:420px;width:90%;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,0.5);">
-      <div style="font-size:32px;margin-bottom:12px;">&#128737;&#65039;</div>
-      <div style="font-size:18px;font-weight:700;color:var(--text-primary,#e2e8f0);margin-bottom:8px;">Protect Your Agents</div>
-      <div style="font-size:13px;color:var(--text-muted,#94a3b8);line-height:1.6;margin-bottom:20px;">
+      <div style="font-size:32px;margin-bottom:12px;">🛡️</div>
+      <div style="font-size:18px;font-weight:700;color:var(--text-primary,#e2e8f0);margin-bottom:8px;" data-i18n="approvals.protect_your_agents">Protect Your Agents</div>
+      <div style="font-size:13px;color:var(--text-muted,#94a3b8);line-height:1.6;margin-bottom:20px;" data-i18n="approvals.upgrade_pitch">
         Cloud-mediated approvals block risky agent actions before they execute.
-        Get notified via Slack, Email, PagerDuty or Telegram — and approve or deny with one click.
+        Get notified via Slack, Email, PagerDuty or Telegram, and approve or deny with one click.
       </div>
       <div style="background:rgba(96,165,250,0.08);border:1px solid rgba(96,165,250,0.2);border-radius:10px;padding:14px;margin-bottom:20px;">
-        <div style="font-size:14px;font-weight:700;color:#60a5fa;margin-bottom:4px;">Cloud Pro</div>
-        <div style="font-size:22px;font-weight:800;color:var(--text-primary,#e2e8f0);">$5<span style="font-size:13px;font-weight:400;color:var(--text-muted,#94a3b8);">/node/month</span></div>
-        <div style="font-size:11px;color:#22c55e;margin-top:4px;font-weight:600;">7-day free trial &middot; no credit card required</div>
+        <div style="font-size:14px;font-weight:700;color:#60a5fa;margin-bottom:4px;" data-i18n="app.cloud_pro">Cloud Pro</div>
+        <div style="font-size:22px;font-weight:800;color:var(--text-primary,#e2e8f0);">$5<span style="font-size:13px;font-weight:400;color:var(--text-muted,#94a3b8);" data-i18n="approvals.per_node_month">/node/month</span></div>
+        <div style="font-size:11px;color:#22c55e;margin-top:4px;font-weight:600;" data-i18n="approvals.trial_note">7-day free trial · no credit card required</div>
       </div>
       <div style="text-align:left;margin-bottom:20px;padding:0 8px;">
-        <div style="font-size:12px;color:var(--text-secondary,#cbd5e1);margin-bottom:6px;">&#10003; Cloud-mediated approval queue</div>
-        <div style="font-size:12px;color:var(--text-secondary,#cbd5e1);margin-bottom:6px;">&#10003; Slack, Email, PagerDuty, Telegram alerts</div>
-        <div style="font-size:12px;color:var(--text-secondary,#cbd5e1);margin-bottom:6px;">&#10003; 8 built-in protection rules + custom rules</div>
-        <div style="font-size:12px;color:var(--text-secondary,#cbd5e1);margin-bottom:6px;">&#10003; Audit log of all decisions</div>
-        <div style="font-size:12px;color:var(--text-secondary,#cbd5e1);">&#10003; Multi-node fleet management</div>
+        <div style="font-size:12px;color:var(--text-secondary,#cbd5e1);margin-bottom:6px;">✓ <span data-i18n="approvals.feat_queue">Cloud-mediated approval queue</span></div>
+        <div style="font-size:12px;color:var(--text-secondary,#cbd5e1);margin-bottom:6px;">✓ <span data-i18n="approvals.feat_alerts">Slack, Email, PagerDuty, Telegram alerts</span></div>
+        <div style="font-size:12px;color:var(--text-secondary,#cbd5e1);margin-bottom:6px;">✓ <span data-i18n="approvals.feat_rules">8 built-in protection rules + custom rules</span></div>
+        <div style="font-size:12px;color:var(--text-secondary,#cbd5e1);margin-bottom:6px;">✓ <span data-i18n="approvals.feat_audit">Audit log of all decisions</span></div>
+        <div style="font-size:12px;color:var(--text-secondary,#cbd5e1);">✓ <span data-i18n="approvals.feat_fleet">Multi-node fleet management</span></div>
       </div>
-      <button onclick="startProTrial()" style="width:100%;padding:12px;background:#3b82f6;color:#fff;border:0;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;transition:background 0.2s;" onmouseover="this.style.background='#2563eb'" onmouseout="this.style.background='#3b82f6'">Start Free Trial</button>
+      <button onclick="startProTrial()" style="width:100%;padding:12px;background:#3b82f6;color:#fff;border:0;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;transition:background 0.2s;" onmouseover="this.style.background='#2563eb'" onmouseout="this.style.background='#3b82f6'" data-i18n="approvals.start_free_trial">Start Free Trial</button>
       <div style="margin-top:10px;">
-        <button onclick="closeUpgradeModal()" style="background:none;border:none;color:var(--text-muted,#94a3b8);font-size:12px;cursor:pointer;text-decoration:underline;">Maybe later</button>
+        <button onclick="closeUpgradeModal()" style="background:none;border:none;color:var(--text-muted,#94a3b8);font-size:12px;cursor:pointer;text-decoration:underline;" data-i18n="approvals.maybe_later">Maybe later</button>
       </div>
     </div>
   </div>
@@ -204,6 +204,14 @@
     return true;
   }
 
+  // True when running as a plain OSS install (no cloud cm_ token).
+  // Rule creation is OSS-free per #1343; notification channels stay Pro-gated.
+  function _isOssMode() {
+    if (window.CLOUD_MODE || window.CLOUD_TOKEN) return false;
+    var t = localStorage.getItem('clawmetry_token') || '';
+    return !(t && t.startsWith('cm_'));
+  }
+
   window.showUpgradeModal = function() {
     var m = document.getElementById('approvals-upgrade-modal');
     if (m) m.style.display = 'flex';
@@ -224,35 +232,35 @@
 
   /* ── Preset policies ── */
   var PRESETS = [
-    {key:'rm_rf', name:'Block destructive deletes', icon:'&#128465;',
+    {key:'rm_rf', name:'Block destructive deletes', icon:'🗑',
      desc:'Stops rm -rf, shred, unlink on important paths',
      tool:'exec', pattern:'rm\\s+-rf|shred\\s|unlink\\s+/', timeout:60, on_timeout:'deny',
      color:'#ef4444'},
-    {key:'force_push', name:'Block force pushes', icon:'&#9888;&#65039;',
+    {key:'force_push', name:'Block force pushes', icon:'⚠️',
      desc:'Requires approval before git push --force',
      tool:'exec', pattern:'git\\s+push.*--force|git\\s+push.*-f\\b', timeout:300, on_timeout:'deny',
      color:'#f59e0b'},
-    {key:'db_mutation', name:'Block database mutations', icon:'&#128451;',
+    {key:'db_mutation', name:'Block database mutations', icon:'🗃',
      desc:'Catches DROP TABLE, TRUNCATE, DELETE without WHERE',
      tool:'exec', pattern:'DROP\\s+TABLE|TRUNCATE\\s|DELETE\\s+FROM.*(?!WHERE)', timeout:120, on_timeout:'deny',
      color:'#f97316'},
-    {key:'sudo', name:'Block sudo / root commands', icon:'&#128274;',
+    {key:'sudo', name:'Block sudo / root commands', icon:'🔒',
      desc:'Prevents privilege escalation via sudo or su',
      tool:'exec', pattern:'\\bsudo\\s|\\bsu\\s+-|\\bsu\\s+root', timeout:60, on_timeout:'deny',
      color:'#dc2626'},
-    {key:'secrets', name:'Protect secrets & credentials', icon:'&#128273;',
+    {key:'secrets', name:'Protect secrets & credentials', icon:'🔑',
      desc:'Blocks access to .env, credentials, private keys',
      tool:'', pattern:'\\.env\\b|credentials|private_key|secret_key|api_key|AWS_SECRET', timeout:60, on_timeout:'deny',
      color:'#8b5cf6'},
-    {key:'pkg_install', name:'Block package installs', icon:'&#128230;',
+    {key:'pkg_install', name:'Block package installs', icon:'📦',
      desc:'Requires approval for pip install, npm install, apt install',
      tool:'exec', pattern:'pip\\s+install|npm\\s+install|apt\\s+install|brew\\s+install', timeout:120, on_timeout:'deny',
      color:'#6366f1'},
-    {key:'network', name:'Block outbound network calls', icon:'&#127760;',
+    {key:'network', name:'Block outbound network calls', icon:'🌐',
      desc:'Catches curl, wget, fetch to external URLs',
      tool:'exec', pattern:'\\bcurl\\s|\\bwget\\s|\\bfetch\\(|requests\\.get|httpx\\.', timeout:60, on_timeout:'deny',
      color:'#0ea5e9'},
-    {key:'sys_config', name:'Block system config changes', icon:'&#9881;&#65039;',
+    {key:'sys_config', name:'Block system config changes', icon:'⚙️',
      desc:'Prevents writes to /etc, systemctl, crontab edits',
      tool:'exec', pattern:'/etc/|systemctl|crontab|chmod\\s+777|chown\\s+root', timeout:60, on_timeout:'deny',
      color:'#64748b'}
@@ -260,25 +268,25 @@
 
   /* ── Integration channels ── */
   var CHANNELS = [
-    {key:'email', name:'Email', icon:'&#9993;&#65039;', desc:'Notifications to your signup email',
+    {key:'email', name:'Email', icon:'✉️', desc:'Notifications to your signup email',
      color:'#3b82f6', fields:[],
      howTo:'Approval alerts will be sent to the email you signed up with. No setup needed.'},
-    {key:'phone', name:'Phone Call', icon:'&#128222;', desc:'Get a call, press 1 to approve',
+    {key:'phone', name:'Phone Call', icon:'📞', desc:'Get a call, press 1 to approve',
      color:'#10b981',
      fields:[{key:'phone_number', label:'Phone Number', placeholder:'+1 (555) 123-4567'}],
-     howTo:'Enter your phone number with country code (e.g. +1 for US, +91 for India, +31 for NL).<br><br>When a risky action fires, you\'ll get a phone call:<br><b>"Press 1 to approve. Press 2 to deny."</b><br><br>That\'s it — no app to install, works on any phone.'},
-    {key:'slack', name:'Slack', icon:'&#128172;', desc:'Post to a Slack channel',
+     howTo:'Enter your phone number with country code (e.g. +1 for US, +91 for India, +31 for NL).<br><br>When a risky action fires, you\'ll get a phone call:<br><b data-i18n="app.press_1_to_approve_press_2_to_deny">"Press 1 to approve. Press 2 to deny."</b><br><br>That\'s it — no app to install, works on any phone.'},
+    {key:'slack', name:'Slack', icon:'💬', desc:'Post to a Slack channel',
      color:'#4A154B',
      fields:[{key:'webhook_url', label:'Webhook URL', placeholder:'https://hooks.slack.com/services/T.../B.../xxx'}],
-     howTo:'1. Go to <b>api.slack.com/apps</b> and click <b>Create New App</b><br>2. Choose <b>From scratch</b>, name it "ClawMetry Alerts"<br>3. Click <b>Incoming Webhooks</b> → toggle ON<br>4. Click <b>Add New Webhook to Workspace</b> → pick your channel<br>5. Copy the webhook URL and paste it below'},
-    {key:'pagerduty', name:'PagerDuty', icon:'&#128225;', desc:'Trigger PagerDuty incidents',
+     howTo:'1. Go to <b data-i18n="app.api_slack_com_apps">api.slack.com/apps</b> and click <b data-i18n="app.create_new_app">Create New App</b><br>2. Choose <b data-i18n="app.from_scratch">From scratch</b>, name it "ClawMetry Alerts"<br>3. Click <b data-i18n="app.incoming_webhooks">Incoming Webhooks</b> → toggle ON<br>4. Click <b data-i18n="app.add_new_webhook_to_workspace">Add New Webhook to Workspace</b> → pick your channel<br>5. Copy the webhook URL and paste it below'},
+    {key:'pagerduty', name:'PagerDuty', icon:'📡', desc:'Trigger PagerDuty incidents',
      color:'#06AC38',
      fields:[{key:'routing_key', label:'Integration Key', placeholder:'e.g. R03F...'}],
-     howTo:'1. In PagerDuty, go to <b>Services</b> → pick your service<br>2. Click <b>Integrations</b> tab → <b>+ Add Integration</b><br>3. Choose <b>Events API v2</b><br>4. Copy the <b>Integration Key</b> and paste it below'},
-    {key:'telegram', name:'Telegram', icon:'&#9992;&#65039;', desc:'Send alerts to a Telegram chat',
+     howTo:'1. In PagerDuty, go to <b data-i18n="app.services">Services</b> → pick your service<br>2. Click <b data-i18n="app.integrations">Integrations</b> tab → <b data-i18n="app.add_integration">+ Add Integration</b><br>3. Choose <b data-i18n="app.events_api_v2">Events API v2</b><br>4. Copy the <b data-i18n="app.integration_key">Integration Key</b> and paste it below'},
+    {key:'telegram', name:'Telegram', icon:'✈️', desc:'Send alerts to a Telegram chat',
      color:'#2AABEE',
      fields:[{key:'bot_token', label:'Bot Token', placeholder:'123456:ABC-DEF...'}, {key:'chat_id', label:'Chat ID', placeholder:'-1001234567890'}],
-     howTo:'1. Open Telegram, search for <b>@BotFather</b><br>2. Send <b>/newbot</b> and follow the prompts<br>3. Copy the <b>bot token</b> and paste it below<br>4. Add the bot to your group chat<br>5. Get the chat ID: send a message in the group, then visit<br>&nbsp;&nbsp;&nbsp;<code>https://api.telegram.org/bot&lt;TOKEN&gt;/getUpdates</code>'}
+     howTo:'1. Open Telegram, search for <b data-i18n="app.botfather">@BotFather</b><br>2. Send <b data-i18n="app.newbot">/newbot</b> and follow the prompts<br>3. Copy the <b data-i18n="app.bot_token">bot token</b> and paste it below<br>4. Add the bot to your group chat<br>5. Get the chat ID: send a message in the group, then visit<br>&nbsp;&nbsp;&nbsp;<code>https://api.telegram.org/bot&lt;TOKEN&gt;/getUpdates</code>'}
   ];
 
   /* ── Render preset cards ── */
@@ -296,15 +304,15 @@
       return '<div id="preset-card-' + p.key + '" style="background:var(--bg-secondary);border:1px solid ' + (on ? p.color + '55' : 'var(--border)') + ';border-radius:10px;padding:14px;transition:border-color 0.2s;">'
         + '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">'
         + '<div style="display:flex;align-items:center;gap:8px;">'
-        + '<span style="font-size:16px;">' + p.icon + '</span>'
-        + '<span style="font-size:13px;font-weight:700;color:var(--text-primary);">' + escHtml(p.name) + '</span>'
+        + '<span style="font-size:16px;" data-i18n="app.p_icon">' + p.icon + '</span>'
+        + '<span style="font-size:13px;font-weight:700;color:var(--text-primary);" data-i18n="app.eschtml_p_name">' + escHtml(p.name) + '</span>'
         + '</div>'
         + '<div onclick="togglePresetPolicy(\'' + p.key + '\',' + (on ? 'false' : 'true') + ')" style="position:relative;width:42px;height:24px;cursor:pointer;flex-shrink:0;">'
         + '<div style="position:absolute;inset:0;background:' + (on ? p.color : '#374151') + ';border-radius:12px;transition:background 0.2s;"></div>'
         + '<div style="position:absolute;top:3px;left:' + (on ? '21px' : '3px') + ';width:18px;height:18px;background:#fff;border-radius:50%;transition:left 0.2s;box-shadow:0 1px 3px rgba(0,0,0,0.3);"></div>'
         + '</div>'
         + '</div>'
-        + '<div style="font-size:11px;color:var(--text-muted);line-height:1.4;">' + escHtml(p.desc) + '</div>'
+        + '<div style="font-size:11px;color:var(--text-muted);line-height:1.4;" data-i18n="app.eschtml_p_desc">' + escHtml(p.desc) + '</div>'
         + '</div>';
     }).join('');
   }
@@ -320,12 +328,12 @@
       var s = _savedIntegrations[ch.key];
       var on = s && s.enabled;
       return '<div style="background:var(--bg-secondary);border:1px solid ' + (on ? ch.color + '44' : 'var(--border)') + ';border-radius:10px;padding:14px;text-align:center;">'
-        + '<div style="font-size:20px;margin-bottom:6px;">' + ch.icon + '</div>'
-        + '<div style="font-size:12px;font-weight:700;color:var(--text-primary);margin-bottom:4px;">' + ch.name + '</div>'
-        + '<div style="font-size:11px;color:var(--text-muted);margin-bottom:10px;">' + escHtml(ch.desc) + '</div>'
+        + '<div style="font-size:20px;margin-bottom:6px;" data-i18n="app.ch_icon">' + ch.icon + '</div>'
+        + '<div style="font-size:12px;font-weight:700;color:var(--text-primary);margin-bottom:4px;" data-i18n="app.ch_name">' + ch.name + '</div>'
+        + '<div style="font-size:11px;color:var(--text-muted);margin-bottom:10px;" data-i18n="app.eschtml_ch_desc">' + escHtml(ch.desc) + '</div>'
         + (on
-          ? '<button onclick="openIntegrationSetup(\'' + ch.key + '\')" style="width:100%;padding:8px;border:1px solid ' + ch.color + '44;background:' + ch.color + '15;color:' + ch.color + ';border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;">Connected</button>'
-          : '<button onclick="openIntegrationSetup(\'' + ch.key + '\')" style="width:100%;padding:8px;border:0;background:' + ch.color + ';color:#fff;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;">Connect</button>'
+          ? '<button onclick="openIntegrationSetup(\'' + ch.key + '\')" style="width:100%;padding:8px;border:1px solid ' + ch.color + '44;background:' + ch.color + '15;color:' + ch.color + ';border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;" data-i18n="app.connected">Connected</button>'
+          : '<button onclick="openIntegrationSetup(\'' + ch.key + '\')" style="width:100%;padding:8px;border:0;background:' + ch.color + ';color:#fff;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;" data-i18n="app.connect">Connect</button>'
         )
         + '</div>';
     }).join('');
@@ -342,14 +350,14 @@
     // Reuse the modal container with different content
     var html = '<div style="background:var(--bg-secondary,#131929);border:1px solid ' + ch.color + '44;border-radius:16px;padding:28px 32px;max-width:440px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.5);">';
     html += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">';
-    html += '<span style="font-size:24px;">' + ch.icon + '</span>';
-    html += '<span style="font-size:16px;font-weight:700;color:var(--text-primary,#e2e8f0);">Connect ' + ch.name + '</span>';
-    html += '<span style="margin-left:auto;cursor:pointer;color:var(--text-muted);font-size:18px;" onclick="closeIntegrationSetup()">&times;</span>';
+    html += '<span style="font-size:24px;" data-i18n="app.ch_icon">' + ch.icon + '</span>';
+    html += '<span style="font-size:16px;font-weight:700;color:var(--text-primary,#e2e8f0);" data-i18n="app.connect_ch_name">Connect ' + ch.name + '</span>';
+    html += '<span style="margin-left:auto;cursor:pointer;color:var(--text-muted);font-size:18px;" onclick="closeIntegrationSetup()">×</span>';
     html += '</div>';
     // How-to instructions
     if (ch.howTo) {
       html += '<div style="background:rgba(96,165,250,0.06);border:1px solid rgba(96,165,250,0.15);border-radius:8px;padding:12px 14px;margin-bottom:16px;font-size:12px;color:var(--text-secondary,#cbd5e1);line-height:1.7;">';
-      html += '<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted,#94a3b8);margin-bottom:6px;">How to set up</div>';
+      html += '<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted,#94a3b8);margin-bottom:6px;" data-i18n="app.how_to_set_up">How to set up</div>';
       html += ch.howTo;
       html += '</div>';
     }
@@ -357,15 +365,15 @@
     if (ch.fields.length > 0) {
       ch.fields.forEach(function(f) {
         var val = (s && s.config && s.config[f.key]) || '';
-        html += '<label style="font-size:11px;color:var(--text-muted,#94a3b8);display:block;margin-bottom:4px;">' + escHtml(f.label) + '</label>';
+        html += '<label style="font-size:11px;color:var(--text-muted,#94a3b8);display:block;margin-bottom:4px;" data-i18n="app.eschtml_f_label">' + escHtml(f.label) + '</label>';
         html += '<input type="text" id="setup-' + ch.key + '-' + f.key + '" value="' + escHtml(val) + '" placeholder="' + escHtml(f.placeholder) + '" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--border,#1e293b);border-radius:6px;background:var(--bg-primary,#0B0F1A);color:var(--text-primary,#e2e8f0);font-size:12px;margin-bottom:10px;">';
       });
     }
     // Buttons
     html += '<div style="display:flex;gap:8px;margin-top:6px;">';
-    html += '<button onclick="submitIntegrationSetup(\'' + ch.key + '\')" style="flex:1;padding:10px;border:0;background:' + ch.color + ';color:#fff;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer;">' + (on ? 'Update' : 'Connect') + '</button>';
+    html += '<button onclick="submitIntegrationSetup(\'' + ch.key + '\')" style="flex:1;padding:10px;border:0;background:' + ch.color + ';color:#fff;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer;" data-i18n="app.on_update_connect">' + (on ? 'Update' : 'Connect') + '</button>';
     if (on) {
-      html += '<button onclick="disconnectIntegration(\'' + ch.key + '\')" style="padding:10px 16px;border:1px solid #ef444444;background:transparent;color:#ef4444;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">Disconnect</button>';
+      html += '<button onclick="disconnectIntegration(\'' + ch.key + '\')" style="padding:10px 16px;border:1px solid #ef444444;background:transparent;color:#ef4444;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;" data-i18n="app.disconnect">Disconnect</button>';
     }
     html += '</div>';
     html += '</div>';
@@ -435,21 +443,21 @@
       // initBulkSelection() listens for change events on the list.
       html += '<input type="checkbox" class="approval-bulk-checkbox" data-approval-id="' + escHtml(r.id) + '" style="cursor:pointer;flex-shrink:0;" title="Select for bulk action">';
     }
-    html += '<span style="font-weight:700;color:var(--text-primary);font-size:13px;">' + escHtml(r.tool_name || '?') + '</span>';
-    html += '<span style="background:' + c + '22;color:' + c + ';border:1px solid ' + c + '44;padding:1px 8px;border-radius:99px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;">' + escHtml(r.status) + '</span>';
+    html += '<span style="font-weight:700;color:var(--text-primary);font-size:13px;" data-i18n="app.eschtml_r_tool_name">' + escHtml(r.tool_name || '?') + '</span>';
+    html += '<span style="background:' + c + '22;color:' + c + ';border:1px solid ' + c + '44;padding:1px 8px;border-radius:99px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;" data-i18n="app.eschtml_r_status">' + escHtml(r.status) + '</span>';
     if (r.policy_name) {
-      html += '<span style="color:var(--text-muted);font-size:11px;">rule: ' + escHtml(r.policy_name) + '</span>';
+      html += '<span style="color:var(--text-muted);font-size:11px;" data-i18n="app.rule_eschtml_r_policy_name">rule: ' + escHtml(r.policy_name) + '</span>';
     }
     if (r.session_id) {
-      html += '<span style="background:var(--bg-primary);color:var(--text-secondary);border:1px solid var(--border-secondary);padding:1px 6px;border-radius:4px;font-size:10px;font-family:var(--font-mono,monospace);">sess ' + escHtml(String(r.session_id).slice(0,8)) + '</span>';
+      html += '<span style="background:var(--bg-primary);color:var(--text-secondary);border:1px solid var(--border-secondary);padding:1px 6px;border-radius:4px;font-size:10px;font-family:var(--font-mono,monospace);" data-i18n="app.sess_eschtml_string_r_session_id_slice_0_8">sess ' + escHtml(String(r.session_id).slice(0,8)) + '</span>';
     }
     if (r.node_id) {
-      html += '<span style="background:var(--bg-primary);color:var(--text-secondary);border:1px solid var(--border-secondary);padding:1px 6px;border-radius:4px;font-size:10px;font-family:var(--font-mono,monospace);">node ' + escHtml(String(r.node_id).slice(0,8)) + '</span>';
+      html += '<span style="background:var(--bg-primary);color:var(--text-secondary);border:1px solid var(--border-secondary);padding:1px 6px;border-radius:4px;font-size:10px;font-family:var(--font-mono,monospace);" data-i18n="app.node_eschtml_string_r_node_id_slice_0_8">node ' + escHtml(String(r.node_id).slice(0,8)) + '</span>';
     }
-    html += '<span style="color:var(--text-faint);font-size:10px;margin-left:auto;">' + escHtml(when) + '</span>';
+    html += '<span style="color:var(--text-faint);font-size:10px;margin-left:auto;" data-i18n="app.eschtml_when">' + escHtml(when) + '</span>';
     html += '</div>';
     if (r.context) {
-      html += '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px;">' + escHtml(r.context) + '</div>';
+      html += '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px;" data-i18n="app.eschtml_r_context">' + escHtml(r.context) + '</div>';
     }
     html += '<pre style="margin:0;padding:8px 10px;font-size:11px;background:var(--bg-primary);border:1px solid var(--border-secondary);border-radius:6px;overflow:auto;max-height:200px;color:var(--text-secondary);white-space:pre-wrap;word-break:break-word;">' + escHtml(argsPretty) + '</pre>';
     if (pending) {
@@ -457,14 +465,14 @@
       html += '<input type="text" id="dec-reason-' + escHtml(r.id) + '" placeholder="Reason (optional — recorded in audit log)" style="width:100%;box-sizing:border-box;padding:6px 10px;border:1px solid var(--border-secondary);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);font-size:12px;">';
       html += '</div>';
       html += '<div style="display:flex;gap:8px;margin-top:8px;">';
-      html += '<button onclick="decideApproval(\'' + escHtml(r.id) + '\',\'approve\')" style="background:#22c55e;color:#062614;border:0;padding:7px 16px;border-radius:6px;font-weight:600;font-size:12px;cursor:pointer;">Approve</button>';
-      html += '<button onclick="decideApproval(\'' + escHtml(r.id) + '\',\'deny\')" style="background:#ef4444;color:#fff;border:0;padding:7px 16px;border-radius:6px;font-weight:600;font-size:12px;cursor:pointer;">Deny</button>';
-      html += '<span style="color:var(--text-muted);font-size:11px;align-self:center;margin-left:6px;">expires ' + escHtml((r.expires_at||'').slice(11,19)) + '</span>';
+      html += '<button onclick="decideApproval(\'' + escHtml(r.id) + '\',\'approve\')" style="background:#22c55e;color:#062614;border:0;padding:7px 16px;border-radius:6px;font-weight:600;font-size:12px;cursor:pointer;" data-i18n="app.approve_2">Approve</button>';
+      html += '<button onclick="decideApproval(\'' + escHtml(r.id) + '\',\'deny\')" style="background:#ef4444;color:#fff;border:0;padding:7px 16px;border-radius:6px;font-weight:600;font-size:12px;cursor:pointer;" data-i18n="app.deny">Deny</button>';
+      html += '<span style="color:var(--text-muted);font-size:11px;align-self:center;margin-left:6px;" data-i18n="app.expires_eschtml_r_expires_at_slice_11_19">expires ' + escHtml((r.expires_at||'').slice(11,19)) + '</span>';
       html += '</div>';
     } else if (r.decided_by) {
       html += '<div style="font-size:11px;color:var(--text-muted);margin-top:6px;">Decided by ' + escHtml(r.decided_by) + ' at ' + escHtml((r.decided_at||'').slice(11,19));
       if (r.decision_reason) {
-        html += ' — <span style="font-style:italic;">' + escHtml(r.decision_reason) + '</span>';
+        html += ' — <span style="font-style:italic;" data-i18n="app.eschtml_r_decision_reason">' + escHtml(r.decision_reason) + '</span>';
       }
       html += '</div>';
     }
@@ -475,19 +483,28 @@
   /* ── Main loader ── */
   window.loadApprovalsTab = async function() {
     try {
+      var ossMode = _isOssMode();
       var [pending, history, policies, integrations] = await Promise.all([
-        fetchJsonWithTimeout('/api/cloud/approvals?status=pending&limit=50' + _q(), 6000).catch(function(){return {approvals:[]};}),
-        fetchJsonWithTimeout('/api/cloud/approvals?limit=50' + _q(), 6000).catch(function(){return {approvals:[]};}),
-        fetchJsonWithTimeout('/api/cloud/policies?' + _q().replace(/^&/,''), 6000).catch(function(){return {policies:[]};}),
-        fetchJsonWithTimeout('/api/cloud/integrations?' + _q().replace(/^&/,''), 6000).catch(function(){return {integrations:[]};})
+        fetchJsonWithTimeout(
+          ossMode ? '/api/nemoclaw/pending-approvals'
+                  : '/api/cloud/approvals?status=pending&limit=50' + _q(),
+          6000).catch(function(){return {approvals:[]};}),
+        ossMode ? Promise.resolve({approvals:[]})
+                : fetchJsonWithTimeout('/api/cloud/approvals?limit=50' + _q(), 6000).catch(function(){return {approvals:[]};}),
+        fetchJsonWithTimeout(
+          ossMode ? '/api/nemoclaw/rules'
+                  : '/api/cloud/policies?' + _q().replace(/^&/,''),
+          6000).catch(function(){return {policies:[]};}),
+        ossMode ? Promise.resolve({integrations:[]})
+                : fetchJsonWithTimeout('/api/cloud/integrations?' + _q().replace(/^&/,''), 6000).catch(function(){return {integrations:[]};})
       ]);
       var p = (pending.approvals || []).filter(function(r){return r.status==='pending';});
-      var h = (history.approvals || []).filter(function(r){return r.status!=='pending';});
+      var h = ossMode ? [] : (history.approvals || []).filter(function(r){return r.status!=='pending';});
 
       // Pending
       var pe = document.getElementById('approvals-pending-list');
       if (p.length === 0) {
-        pe.innerHTML = '<div style="padding:14px;text-align:center;color:var(--text-muted);font-size:12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;">No pending approvals right now.</div>';
+        pe.innerHTML = '<div style="padding:14px;text-align:center;color:var(--text-muted);font-size:12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;" data-i18n="app.no_pending_approvals_right_now">No pending approvals right now.</div>';
         // Drop selections for IDs that are no longer pending (decided
         // elsewhere, expired, etc.) so the bulk header doesn't lie.
         _approvalsBulkSelected.clear();
@@ -518,7 +535,7 @@
 
       // History
       var he = document.getElementById('approvals-history-list');
-      he.innerHTML = h.length ? h.map(function(r){return _renderRow(r, false);}).join('') : '<div style="padding:14px;text-align:center;color:var(--text-faint);font-size:12px;">No decisions yet. Enable a protection rule above to get started.</div>';
+      he.innerHTML = h.length ? h.map(function(r){return _renderRow(r, false);}).join('') : '<div style="padding:14px;text-align:center;color:var(--text-faint);font-size:12px;" data-i18n="app.no_decisions_yet_enable_a_protection_rule_above_to">No decisions yet. Enable a protection rule above to get started.</div>';
 
       // Counts + badge
       document.getElementById('approvals-pending-count').textContent = p.length ? '(' + p.length + ' pending)' : '';
@@ -529,7 +546,7 @@
         else { nav.style.display = 'none'; }
       }
     } catch(e) {
-      document.getElementById('approvals-pending-list').innerHTML = '<div style="padding:14px;color:var(--text-error);font-size:12px;">Failed to load: ' + escHtml(String(e)) + '</div>';
+      document.getElementById('approvals-pending-list').innerHTML = '<div style="padding:14px;color:var(--text-error);font-size:12px;" data-i18n="app.failed_to_load_eschtml_string_e">Failed to load: ' + escHtml(String(e)) + '</div>';
     }
   };
 
@@ -537,7 +554,9 @@
   var _toggleBusy = {};
   window.togglePresetPolicy = async function(presetKey, enabled) {
     if (_toggleBusy[presetKey]) return;
-    if (_showUpgradeIfNeeded()) return;
+    var ossMode = _isOssMode();
+    // OSS users can toggle preset rules (rule creation is free, per #1343).
+    if (!ossMode && _showUpgradeIfNeeded()) return;
     _toggleBusy[presetKey] = true;
     var preset = PRESETS.find(function(p){return p.key === presetKey;});
     if (!preset) { delete _toggleBusy[presetKey]; return; }
@@ -551,22 +570,40 @@
       card.style.borderColor = enabled ? preset.color + '55' : 'var(--border)';
     }
     try {
-      var r = await fetch('/api/cloud/policies', {
-        method: 'POST', headers: _authHeaders(),
-        body: JSON.stringify({
-          name: preset.name,
-          tool: preset.tool,
-          pattern_type: 'command_regex',
-          pattern: preset.pattern,
-          action: 'require_approval',
-          timeout: preset.timeout,
-          on_timeout: preset.on_timeout,
-          enabled: enabled,
-          preset_key: preset.key
-        })
-      });
+      var r;
+      if (ossMode) {
+        if (enabled) {
+          // Enable: upsert into ~/.clawmetry/policies.yml
+          r = await fetch('/api/nemoclaw/rules', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              name: preset.name, tool: preset.tool,
+              pattern_type: 'command_regex', pattern: preset.pattern,
+              action: 'require_approval', timeout: preset.timeout,
+              on_timeout: preset.on_timeout, preset_key: preset.key
+            })
+          });
+        } else {
+          // Disable: remove from YAML so the local daemon stops enforcing it.
+          // (The daemon enforces all YAML entries regardless of enabled flag.)
+          r = await fetch('/api/nemoclaw/rules/' + encodeURIComponent(presetKey), {
+            method: 'DELETE', headers: {'Content-Type': 'application/json'}
+          });
+        }
+      } else {
+        r = await fetch('/api/cloud/policies', {
+          method: 'POST', headers: _authHeaders(),
+          body: JSON.stringify({
+            name: preset.name, tool: preset.tool,
+            pattern_type: 'command_regex', pattern: preset.pattern,
+            action: 'require_approval', timeout: preset.timeout,
+            on_timeout: preset.on_timeout, enabled: enabled,
+            preset_key: preset.key
+          })
+        });
+        if (!r.ok && r.status === 402) { showUpgradeModal(); loadApprovalsTab(); return; }
+      }
       if (!r.ok) {
-        if (r.status === 402) { showUpgradeModal(); loadApprovalsTab(); return; }
         var d = await r.json().catch(function(){return {};});
         throw new Error(d.error || ('HTTP ' + r.status));
       }
@@ -581,7 +618,8 @@
 
   /* ── Save custom rule ── */
   window.saveCustomRule = async function() {
-    if (_showUpgradeIfNeeded()) return;
+    var ossMode = _isOssMode();
+    if (!ossMode && _showUpgradeIfNeeded()) return;
     var name = (document.getElementById('rule-name').value || '').trim();
     var tool = document.getElementById('rule-tool').value;
     var patternRaw = (document.getElementById('rule-pattern').value || '').trim();
@@ -592,12 +630,14 @@
     // Convert comma-separated keywords to regex alternation
     var pattern = patternRaw.split(',').map(function(s){return s.trim();}).filter(Boolean).join('|');
     try {
-      var r = await fetch('/api/cloud/policies', {
-        method: 'POST', headers: _authHeaders(),
+      var url = ossMode ? '/api/nemoclaw/rules' : '/api/cloud/policies';
+      var headers = ossMode ? {'Content-Type': 'application/json'} : _authHeaders();
+      var r = await fetch(url, {
+        method: 'POST', headers: headers,
         body: JSON.stringify({
           name: name, tool: tool, pattern_type: 'command_regex',
           pattern: pattern, action: 'require_approval',
-          timeout: timeout, on_timeout: onTimeout, enabled: true
+          timeout: timeout, on_timeout: onTimeout
         })
       });
       if (!r.ok) {
@@ -614,7 +654,7 @@
   };
 
   window.toggleCreateRuleForm = function() {
-    if (_showUpgradeIfNeeded()) return;
+    if (!_isOssMode() && _showUpgradeIfNeeded()) return;
     var f = document.getElementById('create-rule-form');
     f.style.display = f.style.display === 'none' ? '' : 'none';
   };
@@ -741,8 +781,13 @@
     }
   });
 
-  /* ── Background badge poll ── */
+  /* ── Background badge poll ──
+     #1969: gate on document visibility too. Pre-fix, this fetched
+     /api/cloud/approvals every 10s on every tab AND while the browser tab
+     was hidden — pointless noise in the access log for a nav-badge count
+     nobody is watching when the window isn't focused. */
   setInterval(function(){
+    if (typeof document !== 'undefined' && document.hidden) return;
     var pg = document.getElementById('page-approvals');
     if (pg && pg.classList.contains('active')) return;
     fetchJsonWithTimeout('/api/cloud/approvals?status=pending&limit=10' + _q(), 4000)

@@ -1,0 +1,206 @@
+// Topbar — 14px padding, paper bg, 1px bottom border.
+//
+// Ports DashTopbar from design_handoff_clawmetry_v3/boards-dashboards.jsx
+// (lines ~62-70). Adds:
+//   - Title + mono subtitle bound to the current route
+//   - Ghost action buttons (export / share) as placeholders
+//   - LIVE / AWAIT / ALERT status pill (defaults to LIVE)
+//   - Pill-link "✨ You're on v2 (beta) · Back to v1 ↩" pointing at "/"
+//     (the cross-version link required by the README "What to communicate" rule)
+//   - Language picker (i18n foundation, issue #1986)
+
+import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { useLocation } from "react-router-dom";
+import { getNavItemBySlug } from "./nav";
+import { EncryptedBadge } from "./EncryptedBadge";
+
+interface RouteMeta {
+  title: string;
+  subtitle: string;
+}
+
+const ROUTE_META: Record<string, RouteMeta> = {
+  "": {
+    title: "Welcome to v2",
+    subtitle: "preview build · sidebar nav is wired, tabs land in week 2",
+  },
+  trace: { title: "Live trace", subtitle: "the hood, real time" },
+  brain: { title: "Brain", subtitle: "per-turn reasoning chain" },
+  context: { title: "Context", subtitle: "what the LLM sees this turn" },
+  approvals: { title: "Approvals", subtitle: "hold the claw, needs human" },
+  cost: { title: "Cost", subtitle: "tokens, dollars, anomalies" },
+  subagents: { title: "Sub agents", subtitle: "7-day swimlanes" },
+  skills: { title: "Skills", subtitle: "IDE for the agent's playbook" },
+  ops: { title: "Ops", subtitle: "heartbeats and crons" },
+  fleet: { title: "Fleet sonar", subtitle: "multi-node radar" },
+  rules: { title: "Rules", subtitle: "guardrails as a graph" },
+  settings: { title: "Settings", subtitle: "workspace, team, billing" },
+};
+
+function metaForPath(pathname: string): RouteMeta {
+  // basename is /v2, so location.pathname comes through as "/" or "/trace" etc.
+  const slug = pathname.replace(/^\/+/, "").split("/")[0] ?? "";
+  return ROUTE_META[slug] ?? {
+    title: getNavItemBySlug(slug)?.label ?? "ClawMetry v2",
+    subtitle: "preview build",
+  };
+}
+
+interface LangMeta {
+  code: string;
+  endonym: string;
+  enabled: boolean;
+}
+
+// Language picker that loads the shared _meta.json catalog and calls
+// i18n.changeLanguage() on selection.  Renders nothing until the catalog
+// arrives so there's no layout shift on fast connections.
+function LanguagePicker() {
+  const { i18n } = useTranslation();
+  const [langs, setLangs] = useState<LangMeta[]>([]);
+
+  useEffect(() => {
+    fetch("/static/locales/_meta.json")
+      .then((r) => r.json())
+      .then((data: LangMeta[]) => setLangs(data.filter((l) => l.enabled)))
+      .catch(() => {/* silently degrade when locales endpoint is unreachable */});
+  }, []);
+
+  if (langs.length === 0) return null;
+
+  return (
+    <select
+      aria-label="Language"
+      value={i18n.language}
+      onChange={(e) => void i18n.changeLanguage(e.target.value)}
+      style={{
+        fontSize: 11,
+        padding: "3px 6px",
+        borderRadius: 6,
+        border: "1px solid var(--line)",
+        background: "var(--paper)",
+        color: "var(--ink-3)",
+        cursor: "pointer",
+        fontFamily: "inherit",
+      }}
+    >
+      {langs.map((l) => (
+        <option key={l.code} value={l.code}>
+          {l.endonym}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+export function Topbar() {
+  const { pathname } = useLocation();
+  const meta = metaForPath(pathname);
+
+  return (
+    <header
+      style={{
+        padding: "14px 22px",
+        borderBottom: "1px solid var(--line)",
+        background: "var(--paper)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 16,
+        flex: "0 0 auto",
+      }}
+    >
+      <div style={{ minWidth: 0 }}>
+        <div
+          style={{
+            fontSize: 16,
+            fontWeight: 500,
+            color: "var(--ink)",
+            lineHeight: 1.1,
+          }}
+        >
+          {meta.title}
+        </div>
+        <div
+          className="mono"
+          style={{
+            fontSize: 10,
+            color: "var(--ink-4)",
+            marginTop: 2,
+          }}
+        >
+          {meta.subtitle}
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexShrink: 0 }}>
+        {/* Placeholder action buttons — real handlers land per-tab in week 2+ */}
+        <button
+          type="button"
+          className="cm-btn ghost tiny"
+          title="Export (coming soon)"
+          disabled
+          style={{ opacity: 0.55, cursor: "not-allowed" }}
+        >
+          ⤓ export
+        </button>
+        <button
+          type="button"
+          className="cm-btn ghost tiny"
+          title="Share (coming soon)"
+          disabled
+          style={{ opacity: 0.55, cursor: "not-allowed" }}
+        >
+          share ↗
+        </button>
+
+        {/* Language picker — loads _meta.json, calls i18n.changeLanguage() */}
+        <LanguagePicker />
+
+        {/* E2E badge — cloud sync is AES-256-GCM encrypted */}
+        <EncryptedBadge />
+
+        {/* Default LIVE pill — per-tab overrides land in week 2+ */}
+        <span
+          className="cm-badge"
+          style={{ color: "var(--moss)", fontSize: 10 }}
+          title="Live data stream"
+        >
+          <span className="dot cm-pulse" /> LIVE
+        </span>
+
+        {/* Cross-version pill-link — README §Migration strategy mandates this */}
+        <a
+          href="/"
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            padding: "4px 12px",
+            borderRadius: 999,
+            border: "1px solid var(--claw-red)",
+            background: "var(--claw-red-wash)",
+            color: "var(--claw-red-deep)",
+            fontSize: 11,
+            fontWeight: 500,
+            textDecoration: "none",
+            whiteSpace: "nowrap",
+            transition: "background 120ms ease-out",
+          }}
+          onMouseEnter={(e) => {
+            (e.currentTarget as HTMLAnchorElement).style.background =
+              "var(--claw-red-soft)";
+          }}
+          onMouseLeave={(e) => {
+            (e.currentTarget as HTMLAnchorElement).style.background =
+              "var(--claw-red-wash)";
+          }}
+        >
+          <span aria-hidden="true">✨</span>
+          <span>You're on v2 (beta) · Back to v1 ↩</span>
+        </a>
+      </div>
+    </header>
+  );
+}

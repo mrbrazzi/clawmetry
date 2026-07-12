@@ -39,11 +39,33 @@ zero behaviour change.
 import json
 import os
 import time
+from pathlib import Path
 
 from flask import Blueprint, jsonify, request
 from clawmetry.config import is_local_store_read_enabled
 
+
+def _audit(action, **kwargs):
+    """Best-effort Enterprise audit-log producer. Never raises into the
+    request path (the audit store itself never raises, but the import could)."""
+    try:
+        from clawmetry import audit as _a
+        _a.audit_event(action, **kwargs)
+    except Exception:
+        pass
+
+
+def _actor():
+    """Best-effort actor string for a dashboard-originated state change."""
+    try:
+        return (request.headers.get("X-Cm-User")
+                or request.remote_addr or "dashboard")
+    except Exception:
+        return "dashboard"
+
 bp_budget = Blueprint('budget', __name__)
+
+from clawmetry._gate import gate
 bp_alerts = Blueprint('alerts', __name__)
 
 
@@ -88,10 +110,182 @@ def _try_local_store_alert_rules():
     return {"rules": rows or [], "_source": "local_store"}
 
 
+# ── Default alert-rule seed list (issue #1707) ─────────────────────────────
+#
+# Templates the dashboard offers as one-click seed rules on the Alerts
+# tab. Each entry mirrors the POST /api/alerts/rules body, plus a
+# ``pro_only`` gate the UI uses to render the upsell. The cloud
+# dashboard hits ``/api/alerts/defaults`` on first paint for Pro users
+# and installs any missing rules via the standard POST path.
+
+DEFAULT_ALERT_RULES = [
+    {
+        "id":           "unproductive_burn_default",
+        "type":         "unproductive_burn",
+        "threshold":    50_000,
+        "channels":     ["banner", "telegram"],
+        "cooldown_min": 15,
+        "enabled":      True,
+        "pro_only":     True,
+        "label":        "Unproductive burn > 50k tok / 10min",
+        "description": (
+            "Fires when any session burns 50,000+ tokens with zero new "
+            "tools, files, or error types in the last 10 minutes. "
+            "Catches genuine spinning, not just busy productive burn."
+        ),
+    },
+    # #3305 (authority tracking): fires when the proxy detects a tool
+    # declaration outside the operator's allowed_tools list. Off by default
+    # because allowed_tools is empty (= no restriction) until explicitly
+    # configured. Pro-only because it requires the enforcement proxy.
+    {
+        "id":           "authority_violation_default",
+        "type":         "authority_violation",
+        "event_type":   "authority_violation",
+        "window_hours": 24,
+        "threshold":    1,
+        "channels":     ["banner"],
+        "cooldown_min": 60,
+        "enabled":      False,
+        "pro_only":     True,
+        "label":        "Agent exceeded declared authority",
+        "description": (
+            "Fires when the proxy detects a tool declaration not in the "
+            "session's allowed_tools list. Configure allowed_tools in "
+            "proxy.json to activate. Observe-only: requests are never blocked."
+        ),
+    },
+    # G3 of #1708 (Wolfgang burnout): the proxy now emits a structured
+    # BUDGET_EXCEEDED abort signal when the daily cap is hit. This seed
+    # rule surfaces those aborts in the alerts UI as an opt-in template
+    # so a user who configured a budget sees a one-click way to be
+    # notified when their agent actually got halted. NOT default-enabled
+    # because most users don't run the proxy yet.
+    {
+        "id":           "agent_halted_budget_default",
+        "type":         "budget_abort",
+        "event_type":   "budget_blocked",
+        "window_hours": 24,
+        "threshold":    1,
+        "channels":     ["banner", "telegram"],
+        "cooldown_min": 60,
+        "enabled":      False,
+        "pro_only":     True,
+        "label":        "Agent halted by budget",
+        "description": (
+            "Fires when the Pro proxy emits at least one BUDGET_EXCEEDED "
+            "abort in the last 24 hours. Use this to confirm the daily "
+            "cap actually stopped a runaway agent, not just logged a "
+            "warning."
+        ),
+    },
+]
+
+
+@bp_alerts.route("/api/alerts/defaults")
+def api_alerts_defaults():
+    """Default seed-rule templates (issue #1707).
+
+    Surfaced in the Alerts tab so the dashboard can offer one-click
+    install. Pro-only rules carry ``pro_only: true`` so the UI can
+    render the Cloud Pro upsell instead of the install button for free
+    users.
+    """
+    return jsonify({"rules": DEFAULT_ALERT_RULES})
+
+
+# ── PR #1410 comms envelope (issue #1419) ─────────────────────────────────
+# Before PR #1410, the alert evaluator only saw ``daily_spent`` from the
+# OTLP metrics buffer — installs without ``[otel]`` had ``daily_spent=0``
+# forever, so "alert when spend > $X" rules never fired on real spend.
+# Now the evaluator falls back to DuckDB-aggregated events (cost_source=
+# "duckdb"). We piggyback three signals on the /api/alerts/rules GET
+# response so the dashboard can surface the silent fix as a visible win:
+#   - show_alerts_comms_banner: one-time "your rules will fire now" notice
+#   - show_cloud_pro_cta:       upsell when on the DuckDB path (lower fidelity)
+#   - per-rule last_fired_at:   "Last fired: 5m ago" pill or "Not yet fired"
+_RULE_AGE_THRESHOLD_SECS = 86400  # 24h
+
+
+def _enrich_rules_with_comms(rules):
+    """Decorate ``rules`` with ``last_fired_at`` and compute comms flags.
+
+    Returns ``(rules_with_last_fired, comms_dict)``. Never raises — bad
+    state degrades to empty comms (no banner, no CTA) so the legacy alerts
+    list keeps rendering.
+    """
+    import dashboard as _d
+    enriched = list(rules or [])
+    # Fan the alert_history table into a {rule_id: max(fired_at)} map. One
+    # query, then dict.get — keeps the per-rule path O(1).
+    last_fired = {}
+    try:
+        for hist in _d._get_alert_history(limit=500) or []:
+            rid = hist.get("rule_id")
+            ts = hist.get("fired_at")
+            if rid and ts and ts > last_fired.get(rid, 0):
+                last_fired[rid] = ts
+    except Exception:
+        last_fired = {}
+    for r in enriched:
+        rid = r.get("id")
+        if rid and rid in last_fired:
+            r["last_fired_at"] = last_fired[rid]
+        # Don't inject ``last_fired_at: None`` when the rule has never
+        # fired — keeps the legacy response shape byte-stable for callers
+        # that do strict-equality asserts (see test_alert_rules_local_store).
+
+    # Comms flags. All three predicates need to be True for the banner:
+    # 1+ rules configured, 0 historical fires across all of them, oldest
+    # rule is >24h old (so we're not nagging a user who just configured
+    # alerts five minutes ago).
+    now = time.time()
+    has_rules = len(enriched) > 0
+    has_any_fire = len(last_fired) > 0
+    oldest_rule_age = 0.0
+    for r in enriched:
+        created = r.get("created_at") or 0
+        try:
+            age = now - float(created)
+        except (TypeError, ValueError):
+            age = 0.0
+        if age > oldest_rule_age:
+            oldest_rule_age = age
+    is_stale_rule_cohort = (
+        has_rules and not has_any_fire and oldest_rule_age > _RULE_AGE_THRESHOLD_SECS
+    )
+
+    # cost_source comes from /api/budget/status (set in dashboard.py:799).
+    # "duckdb" = no OTLP installed — the cohort PR #1410 unbroke and the
+    # right audience for the Cloud-Pro telemetry upsell.
+    cost_source = "unknown"
+    try:
+        cost_source = str(_d._get_budget_status().get("cost_source") or "unknown")
+    except Exception:
+        pass
+
+    is_pro = False
+    try:
+        is_pro = bool(_d._is_pro_user())
+    except Exception:
+        is_pro = False
+
+    show_cloud_pro_cta = (
+        is_stale_rule_cohort and cost_source == "duckdb" and not is_pro
+    )
+
+    return enriched, {
+        "show_alerts_comms_banner": is_stale_rule_cohort,
+        "show_cloud_pro_cta": show_cloud_pro_cta,
+        "cost_source": cost_source,
+    }
+
+
 # ── Budget API Routes ───────────────────────────────────────────────────
 
 
 @bp_budget.route("/api/budget/config", methods=["GET", "POST"])
+@gate("budget_limits")
 def api_budget_config():
     """Get or update budget configuration."""
     import dashboard as _d
@@ -108,16 +302,59 @@ def api_budget_config():
             "warning_threshold_pct",
             "telegram_bot_token",
             "telegram_chat_id",
+            # Issue #555 Phase 1 — hard budget cap fields.
+            "daily_cap_usd",
+            "monthly_cap_usd",
+            "session_cap_usd",
         ]
         updates = {k: v for k, v in data.items() if k in allowed}
         if not updates:
             return jsonify({"error": "No valid fields provided"}), 400
+        # Issue #1169: refuse to enable auto-pause for non-Pro users.
+        # We accept the rest of the payload so the user can still tune
+        # warning thresholds + limits, but strip the gated toggle and
+        # tell the UI to render the upsell. Free users keep the warning
+        # banner; only the hard kill switch is gated.
+        # Capture the prior values of the fields being changed so the audit
+        # entry carries old -> new for each budget knob.
+        try:
+            _old_cfg = dict(_d._get_budget_config() or {})
+        except Exception:
+            _old_cfg = {}
+        _changed = {k: {"old": _old_cfg.get(k), "new": v}
+                    for k, v in updates.items()}
+        if updates.get("auto_pause_enabled") and not _d._auto_pause_allowed():
+            updates["auto_pause_enabled"] = False
+            _changed["auto_pause_enabled"] = {"old": _old_cfg.get("auto_pause_enabled"),
+                                              "new": False}
+            _d._set_budget_config(updates)
+            _audit("budget.config", actor=_actor(), target="budget",
+                   result="updated", source="dashboard",
+                   metadata={"changed": _changed, "auto_pause_pro_required": True})
+            return jsonify({
+                "ok": True,
+                "auto_pause_pro_required": True,
+                "message": (
+                    "Auto-pause is a Cloud Pro feature. Start a 7-day "
+                    "free trial at https://app.clawmetry.com/upgrade"
+                ),
+            })
         _d._set_budget_config(updates)
+        _audit("budget.config", actor=_actor(), target="budget",
+               result="updated", source="dashboard",
+               metadata={"changed": _changed})
         return jsonify({"ok": True})
-    return jsonify(_d._get_budget_config())
+    cfg = _d._get_budget_config()
+    try:
+        cfg = dict(cfg)
+        cfg["auto_pause_pro_enabled"] = bool(_d._auto_pause_allowed())
+    except Exception:
+        pass
+    return jsonify(cfg)
 
 
 @bp_budget.route("/api/budget/status")
+@gate("budget_limits")
 def api_budget_status():
     """Get current budget status with spending totals."""
     import dashboard as _d
@@ -125,6 +362,7 @@ def api_budget_status():
 
 
 @bp_budget.route("/api/budget/auto-pause", methods=["POST"])
+@gate("budget_limits")
 def api_budget_auto_pause():
     """Set absolute daily auto-pause/alert threshold."""
     import dashboard as _d
@@ -142,10 +380,14 @@ def api_budget_auto_pause():
     _d._set_budget_config(
         {"auto_pause_threshold_usd": threshold_val, "auto_pause_action": action}
     )
+    _audit("budget.auto_pause", actor=_actor(), target="budget",
+           result="updated", source="dashboard",
+           metadata={"threshold_usd": threshold_val, "action": action})
     return jsonify({"ok": True, "threshold_usd": threshold_val, "action": action})
 
 
 @bp_budget.route("/api/budget/pause", methods=["POST"])
+@gate("budget_limits")
 def api_budget_pause():
     """Manually pause the gateway."""
     import dashboard as _d
@@ -153,21 +395,124 @@ def api_budget_pause():
     _d._budget_paused_at = time.time()
     _d._budget_paused_reason = "Manually paused from dashboard"
     _d._pause_gateway()
+    _audit("gateway.pause", actor=_actor(), target="gateway",
+           result="paused", source="dashboard",
+           metadata={"reason": "Manually paused from dashboard"})
     return jsonify({"ok": True, "paused": True})
 
 
 @bp_budget.route("/api/budget/resume", methods=["POST"])
+@gate("budget_limits")
 def api_budget_resume():
     """Resume the gateway after budget pause."""
     import dashboard as _d
     _d._resume_gateway()
+    _audit("gateway.resume", actor=_actor(), target="gateway",
+           result="resumed", source="dashboard")
     return jsonify({"ok": True, "paused": False})
+
+
+# ── Hard budget cap endpoints (issue #555 Phase 1) ─────────────────────
+# Distinct from ``/pause`` / ``/resume`` above (which the dashboard's
+# Telegram banner button already uses) so the cap-banner POST target is
+# unambiguous and Phase 2 can swap the body for gateway-RPC without
+# touching the existing manual-pause flow.
+
+
+@bp_budget.route("/api/budget/pause-gateway", methods=["POST"])
+@gate("budget_limits")
+def api_budget_pause_gateway():
+    """Set the daemon-level paused flag for the cap-reached banner.
+
+    Phase 1: only persists the paused state so the banner renders.
+    Phase 2 will wire the actual gateway-RPC stop.
+    """
+    import dashboard as _d
+    data = request.get_json(silent=True) or {}
+    reason = str(data.get("reason") or "Budget cap reached, gateway paused.")
+    _d._budget_paused = True
+    _d._budget_paused_at = time.time()
+    _d._budget_paused_reason = reason
+    _audit("gateway.pause", actor=_actor(), target="gateway",
+           result="paused", source="dashboard", metadata={"reason": reason})
+    return jsonify({"ok": True, "paused": True, "reason": reason})
+
+
+@bp_budget.route("/api/budget/resume-gateway", methods=["POST"])
+@gate("budget_limits")
+def api_budget_resume_gateway():
+    """Clear the daemon-level paused flag and reach into the gateway-stop
+    fallback in case the user's tap is recovering from an auto-pause.
+    """
+    import dashboard as _d
+    _d._resume_gateway()
+    _audit("gateway.resume", actor=_actor(), target="gateway",
+           result="resumed", source="dashboard")
+    return jsonify({"ok": True, "paused": False})
+
+
+# ── Emergency stop (issue #3439) ──────────────────────────────────────────
+# Global halt: writes a flag file that proxy.py reads on every request.
+# File-based (matching the HITL pause pattern) so the proxy and Flask
+# processes share state without IPC even across restarts.
+
+_ESTOP_FLAG = Path.home() / ".clawmetry" / "hitl" / "emergency_stop"
+
+
+@bp_budget.route("/api/emergency-stop/status", methods=["GET"])
+def api_emergency_stop_status():
+    """Return whether the global emergency stop is currently active."""
+    active = _ESTOP_FLAG.exists()
+    activated_at = None
+    if active:
+        try:
+            activated_at = json.loads(_ESTOP_FLAG.read_text()).get("activated_at")
+        except Exception:  # noqa: BLE001 — missing/corrupt flag: report active, no ts
+            pass
+    return jsonify({"active": active, "activated_at": activated_at})
+
+
+@bp_budget.route("/api/emergency-stop", methods=["POST"])
+def api_emergency_stop():
+    """Activate global emergency stop — all proxy requests return 503 immediately."""
+    _ESTOP_FLAG.parent.mkdir(parents=True, exist_ok=True)
+    meta = {"activated_at": time.time(), "actor": _actor()}
+    _ESTOP_FLAG.write_text(json.dumps(meta))
+    _audit("emergency_stop.activate", actor=_actor(), target="all_sessions",
+           result="stopped", source="dashboard")
+    return jsonify({"ok": True, "active": True, "activated_at": meta["activated_at"]})
+
+
+@bp_budget.route("/api/emergency-stop/clear", methods=["POST"])
+def api_emergency_stop_clear():
+    """Deactivate emergency stop — proxy resumes forwarding requests."""
+    try:
+        _ESTOP_FLAG.unlink(missing_ok=True)
+    except OSError:
+        pass
+    _audit("emergency_stop.clear", actor=_actor(), target="all_sessions",
+           result="cleared", source="dashboard")
+    return jsonify({"ok": True, "active": False})
+
+
+@bp_budget.route("/api/budget/is-over-cap")
+@gate("budget_limits")
+def api_budget_is_over_cap():
+    """Reflect ``_is_over_cap(scope)`` so the dashboard banner can decide
+    whether to render without recomputing the cap math in JS."""
+    import dashboard as _d
+    scope = (request.args.get("scope") or "daily").strip().lower()
+    tripped, info = _d._is_over_cap(scope)
+    out = {"over_cap": bool(tripped)}
+    out.update(info)
+    return jsonify(out)
 
 
 # ── Per-agent budget overrides (issue #951) ────────────────────────────
 
 
 @bp_budget.route("/api/budget", methods=["GET"])
+@gate("budget_limits")
 def api_budget_root():
     """Unified GET — global config + per-agent overrides map.
 
@@ -187,10 +532,23 @@ def api_budget_root():
         for row in overrides_list
         if row.get("agent_id")
     }
-    return jsonify({"config": cfg, "agents": overrides})
+    # Issue #1168: per-agent LIMITS are OSS table-stakes, but Telegram
+    # dispatch on per-agent thresholds is Cloud-Pro only. Surface the
+    # gate so the UI can show an upsell row instead of pretending alerts
+    # will fire when they will not.
+    try:
+        pro_dispatch_enabled = bool(_d._is_pro_user())
+    except Exception:
+        pro_dispatch_enabled = False
+    return jsonify({
+        "config": cfg,
+        "agents": overrides,
+        "pro_dispatch_enabled": pro_dispatch_enabled,
+    })
 
 
 @bp_budget.route("/api/agents/<agent_id>/budget", methods=["GET"])
+@gate("budget_limits")
 def api_agent_budget_get(agent_id):
     """Return one agent's effective budget + current MTD/daily spend.
 
@@ -203,6 +561,7 @@ def api_agent_budget_get(agent_id):
 
 
 @bp_budget.route("/api/agents/<agent_id>/budget", methods=["PUT"])
+@gate("budget_limits")
 def api_agent_budget_put(agent_id):
     """Upsert a per-agent budget override row.
 
@@ -238,20 +597,28 @@ def api_agent_budget_put(agent_id):
     )
     if not ok:
         return jsonify({"ok": False, "error": "local store unavailable"}), 500
+    _audit("budget.agent_set", actor=_actor(), target=agent_id,
+           result="updated", source="dashboard",
+           metadata={"daily_limit_usd": daily, "monthly_limit_usd": monthly})
     return jsonify({"ok": True, "budget": _d._get_agent_budget_status(agent_id)})
 
 
 @bp_budget.route("/api/agents/<agent_id>/budget", methods=["DELETE"])
+@gate("budget_limits")
 def api_agent_budget_delete(agent_id):
     """Remove the per-agent override row — agent falls back to global."""
     import dashboard as _d
     if not agent_id:
         return jsonify({"ok": False, "error": "agent_id required"}), 400
     deleted = _d._delete_agent_budget(agent_id)
+    _audit("budget.agent_delete", actor=_actor(), target=agent_id,
+           result="deleted", source="dashboard",
+           metadata={"deleted": int(deleted)})
     return jsonify({"ok": True, "deleted": int(deleted)})
 
 
 @bp_budget.route("/api/budget/test-telegram", methods=["POST"])
+@gate("budget_limits")
 def api_budget_test_telegram():
     """Send a test Telegram notification using saved config."""
     import dashboard as _d
@@ -286,6 +653,7 @@ def api_budget_test_telegram():
 
 
 @bp_alerts.route("/api/alerts/rules", methods=["GET", "POST"])
+@gate("custom_alerts")
 def api_alert_rules():
     """List or create alert rules."""
     import dashboard as _d
@@ -296,7 +664,8 @@ def api_alert_rules():
         channels = data.get("channels", ["banner"])
         cooldown = data.get("cooldown_min", 30)
         enabled = data.get("enabled", True)
-        if rtype not in ("threshold", "spike", "token_spike", "anomaly", "agent_down"):
+        if rtype not in ("threshold", "spike", "token_spike", "anomaly",
+                         "agent_down", "unproductive_burn"):
             return jsonify({"error": "Invalid alert type"}), 400
         if not isinstance(threshold, (int, float)) or threshold <= 0:
             return jsonify({"error": "Threshold must be a positive number"}), 400
@@ -322,6 +691,10 @@ def api_alert_rules():
             )
             db.commit()
             db.close()
+        _audit("alert_rule.create", actor=_actor(), target=rule_id,
+               result="created", source="dashboard",
+               metadata={"type": rtype, "threshold": threshold,
+                         "channels": channels, "enabled": bool(enabled)})
         return jsonify({"ok": True, "id": rule_id})
     # Phase 3 of #1032 — local DuckDB fast path. Opt-in via
     # CLAWMETRY_LOCAL_STORE_READ=1; falls through to the legacy fleet-DB
@@ -329,11 +702,33 @@ def api_alert_rules():
     if is_local_store_read_enabled():
         fast = _try_local_store_alert_rules()
         if fast is not None:
+            # DuckDB holds cloud-synced rules; fleet_db (SQLite) holds
+            # locally-created ones written by the POST path above. Without
+            # this merge, a POST-then-GET round-trip drops the new rule
+            # because the fast path returns only DuckDB rows (drift #1406).
+            cloud_ids = {r.get("id") for r in (fast.get("rules") or [])}
+            try:
+                local_only = [r for r in _d._get_alert_rules()
+                              if r.get("id") not in cloud_ids]
+                if local_only:
+                    fast = dict(fast)
+                    fast["rules"] = list(fast.get("rules") or []) + local_only
+            except Exception:
+                pass
+            # Issue #1419: enrich with last_fired + comms flags so the
+            # Alerts UI can render the PR #1410 "your rules will fire now"
+            # banner and per-rule "Last fired" pills.
+            enriched, comms = _enrich_rules_with_comms(fast.get("rules") or [])
+            fast = dict(fast)
+            fast["rules"] = enriched
+            fast["_comms"] = comms
             return jsonify(fast)
-    return jsonify({"rules": _d._get_alert_rules()})
+    enriched, comms = _enrich_rules_with_comms(_d._get_alert_rules())
+    return jsonify({"rules": enriched, "_comms": comms})
 
 
 @bp_alerts.route("/api/alerts/rules/<rule_id>", methods=["PUT", "DELETE"])
+@gate("custom_alerts")
 def api_alert_rule(rule_id):
     """Update or delete an alert rule."""
     import dashboard as _d
@@ -343,6 +738,8 @@ def api_alert_rule(rule_id):
             db.execute("DELETE FROM alert_rules WHERE id = ?", (rule_id,))
             db.commit()
             db.close()
+        _audit("alert_rule.delete", actor=_actor(), target=rule_id,
+               result="deleted", source="dashboard")
         return jsonify({"ok": True})
     # PUT
     data = request.get_json(silent=True) or {}
@@ -367,6 +764,11 @@ def api_alert_rule(rule_id):
         db.execute(f"UPDATE alert_rules SET {', '.join(sets)} WHERE id = ?", vals)
         db.commit()
         db.close()
+    _audit("alert_rule.update", actor=_actor(), target=rule_id,
+           result="updated", source="dashboard",
+           metadata={"fields": {k: data[k] for k in data
+                                 if k in ("threshold", "cooldown_min",
+                                          "enabled", "channels")}})
     return jsonify({"ok": True})
 
 
@@ -401,6 +803,7 @@ def api_alerts_active():
 
 
 @bp_alerts.route("/api/alerts/webhook", methods=["GET", "POST"])
+@gate("custom_webhooks")
 def api_alerts_webhook():
     """Get or update outgoing webhook configuration."""
     import dashboard as _d
@@ -410,6 +813,9 @@ def api_alerts_webhook():
             "webhook_url",
             "slack_webhook_url",
             "discord_webhook_url",
+            "pagerduty_routing_key",
+            "opsgenie_api_key",
+            "opsgenie_api_url",
             "cost_spike_alerts",
             "agent_error_rate_alerts",
             "security_posture_changes",
@@ -421,6 +827,7 @@ def api_alerts_webhook():
 
 
 @bp_alerts.route("/api/alerts/webhook/test", methods=["POST"])
+@gate("custom_webhooks")
 def api_alerts_webhook_test():
     """Send a test payload to configured outgoing webhooks."""
     import dashboard as _d
@@ -451,6 +858,25 @@ def api_alerts_webhook_test():
         if url:
             _d._send_webhook_alert(url, payload, payload_type="discord")
             sent.append("discord")
+    if target in ("all", "pagerduty"):
+        pd_key = str(cfg.get("pagerduty_routing_key", "")).strip()
+        if pd_key:
+            _d._send_webhook_alert(
+                "",  # PD uses the fixed enqueue URL
+                dict(payload, _pd_routing_key=pd_key),
+                payload_type="pagerduty",
+            )
+            sent.append("pagerduty")
+    if target in ("all", "opsgenie"):
+        og_key = str(cfg.get("opsgenie_api_key", "")).strip()
+        if og_key:
+            og_url = str(cfg.get("opsgenie_api_url", "")).strip() or _d._OG_DEFAULT_API_URL
+            _d._send_webhook_alert(
+                og_url,
+                dict(payload, _og_api_key=og_key),
+                payload_type="opsgenie",
+            )
+            sent.append("opsgenie")
     if not sent:
         return jsonify(
             {"ok": False, "error": "No configured webhook URL for selected target"}
@@ -474,6 +900,7 @@ def api_alerts_velocity():
 
 
 @bp_alerts.route("/api/alert-channels", methods=["GET", "POST"])
+@gate("custom_webhooks")
 def api_alert_channels():
     """GET/POST alert channel configuration (webhook, Slack, Discord, severity filter).
 
@@ -488,6 +915,9 @@ def api_alert_channels():
             "webhook_url",
             "slack_webhook_url",
             "discord_webhook_url",
+            "pagerduty_routing_key",
+            "opsgenie_api_key",
+            "opsgenie_api_url",
             "cost_spike_alerts",
             "agent_error_rate_alerts",
             "security_posture_changes",
@@ -500,6 +930,7 @@ def api_alert_channels():
 
 
 @bp_alerts.route("/api/alert-channels/test", methods=["POST"])
+@gate("custom_webhooks")
 def api_alert_channels_test():
     """Send a test alert to one or all configured channels.
 

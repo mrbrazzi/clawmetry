@@ -1,9 +1,8 @@
 """
-routes/fleet_history.py — Multi-node fleet + SQLite time-series endpoints.
+routes/fleet_history.py — Multi-node fleet endpoints.
 
 Extracted from dashboard.py as Phase 5.10 of the incremental modularisation.
-Owns the 5 routes registered on ``bp_fleet`` plus the 7 routes registered on
-``bp_history``:
+Owns the 5 routes registered on ``bp_fleet``:
 
   bp_fleet:
     GET  /fleet                         — fleet overview HTML page
@@ -12,28 +11,18 @@ Owns the 5 routes registered on ``bp_fleet`` plus the 7 routes registered on
     GET  /api/nodes                     — list all registered nodes
     GET  /api/nodes/<node_id>           — detail + 24h history for one node
 
-  bp_history:
-    GET  /api/history/metrics                     — query historical metrics
-    GET  /api/history/metrics/list                — list available metric names
-    GET  /api/history/sessions                    — historical session data
-    GET  /api/history/crons                       — historical cron runs
-    GET  /api/history/snapshot/<float:timestamp>  — snapshot nearest a timestamp
-    GET  /api/history/stats                       — history DB stats
-    GET  /api/history/reliability                 — cross-session reliability
-
 Module-level helpers (``_fleet_db``, ``_fleet_db_lock``, ``_fleet_check_key``,
-``_fleet_update_statuses``, ``_history_db``, ``_ext_emit``, ``FLEET_HTML``,
-``AgentReliabilityScorer``) stay in ``dashboard.py`` and are reached via late
-``import dashboard as _d``. Pure mechanical move — zero behaviour change.
+``_fleet_update_statuses``, ``_ext_emit``, ``FLEET_HTML``) stay in
+``dashboard.py`` and are reached via late ``import dashboard as _d``.
 """
 
+import datetime
 import json
 import time
 
 from flask import Blueprint, jsonify, request
 
 bp_fleet = Blueprint('fleet', __name__)
-bp_history = Blueprint('history', __name__)
 
 
 # ── Fleet (multi-node) API Routes ───────────────────────────────────────
@@ -158,6 +147,33 @@ def api_nodes_list():
 
         db.close()
 
+    # Enrich the local node's entry with accurate DuckDB-derived totals so
+    # the fleet view can show real cost/token data without relying on the
+    # heartbeat payload (which doesn't include these fields today).
+    try:
+        from clawmetry.local_store import get_store
+        today = datetime.date.today().isoformat()
+        store = get_store()
+        if store is not None:
+            agg_rows = store.query_aggregates(since=today)
+            cost_today = round(sum(r.get("cost_usd", 0) or 0 for r in agg_rows), 4)
+            tokens_today = int(sum(r.get("token_count", 0) or 0 for r in agg_rows))
+            local_node_id = getattr(store, "node_id", None)
+            for n in result:
+                if local_node_id and n["node_id"] == local_node_id:
+                    n["duckdb_summary"] = {
+                        "cost_today_usd": cost_today,
+                        "token_count_today": tokens_today,
+                        "source": "local_duckdb",
+                    }
+                    n["is_local"] = True
+                    # Use DuckDB-sourced cost as the authoritative value for
+                    # fleet_summary rather than the (often empty) heartbeat figure.
+                    total_cost = max(total_cost, cost_today)
+                    break
+    except Exception:
+        pass
+
     return jsonify(
         {
             "nodes": result,
@@ -167,6 +183,10 @@ def api_nodes_list():
                 "offline": offline_count,
                 "total_cost_today": round(total_cost, 2),
                 "total_sessions_today": total_sessions,
+                # data_scope signals to callers that analytics tabs show
+                # local-node data only; multi_node_partial means remote nodes
+                # rely on heartbeat payloads which may lack DuckDB summaries.
+                "data_scope": "single_node" if len(result) <= 1 else "multi_node_partial",
             },
         }
     )
@@ -217,91 +237,3 @@ def api_node_detail(node_id):
         }
     )
 
-
-# ── History / Time-Series API Routes ────────────────────────────────────
-
-
-@bp_history.route("/api/history/metrics")
-def api_history_metrics():
-    """Query historical metrics. Params: metric, from, to, interval."""
-    import dashboard as _d
-    if not _d._history_db:
-        return jsonify({"error": "History not available", "data": []}), 200
-    metric = request.args.get("metric", "tokens_in_total")
-    from_ts = request.args.get("from", type=float, default=time.time() - 3600)
-    to_ts = request.args.get("to", type=float, default=time.time())
-    interval = request.args.get("interval", None)
-    data = _d._history_db.query_metrics(metric, from_ts, to_ts, interval)
-    return jsonify({"data": data, "metric": metric})
-
-
-@bp_history.route("/api/history/metrics/list")
-def api_history_metrics_list():
-    """List available metric names."""
-    import dashboard as _d
-    if not _d._history_db:
-        return jsonify({"metrics": []})
-    return jsonify({"metrics": _d._history_db.get_available_metrics()})
-
-
-@bp_history.route("/api/history/sessions")
-def api_history_sessions():
-    """Query historical session data."""
-    import dashboard as _d
-    if not _d._history_db:
-        return jsonify({"data": []})
-    from_ts = request.args.get("from", type=float, default=time.time() - 3600)
-    to_ts = request.args.get("to", type=float, default=time.time())
-    session_key = request.args.get("session", None)
-    data = _d._history_db.query_sessions(from_ts, to_ts, session_key)
-    return jsonify({"data": data})
-
-
-@bp_history.route("/api/history/crons")
-def api_history_crons():
-    """Query historical cron run data."""
-    import dashboard as _d
-    if not _d._history_db:
-        return jsonify({"data": []})
-    from_ts = request.args.get("from", type=float, default=time.time() - 3600)
-    to_ts = request.args.get("to", type=float, default=time.time())
-    job_id = request.args.get("job_id", None)
-    data = _d._history_db.query_crons(from_ts, to_ts, job_id)
-    return jsonify({"data": data})
-
-
-@bp_history.route("/api/history/snapshot/<float:timestamp>")
-def api_history_snapshot(timestamp):
-    """Get the snapshot closest to a given timestamp."""
-    import dashboard as _d
-    if not _d._history_db:
-        return jsonify({"error": "History not available"}), 200
-    snap = _d._history_db.query_snapshot(timestamp)
-    if snap:
-        return jsonify(snap)
-    return jsonify({"error": "No snapshot found"}), 404
-
-
-@bp_history.route("/api/history/stats")
-def api_history_stats():
-    """Get history database stats."""
-    import dashboard as _d
-    if not _d._history_db:
-        return jsonify({"enabled": False})
-    stats = _d._history_db.get_stats()
-    stats["enabled"] = True
-    return jsonify(stats)
-
-
-@bp_history.route("/api/history/reliability")
-def api_history_reliability():
-    """Cross-session behavioral reliability trend."""
-    import dashboard as _d
-    if not _d._history_db:
-        return jsonify({"error": "History DB not available"}), 503
-    from history import AgentReliabilityScorer
-
-    scorer = AgentReliabilityScorer(_d._history_db)
-    window = request.args.get("window", 30, type=int)
-    result = scorer.score(window_days=window)
-    return jsonify(result)

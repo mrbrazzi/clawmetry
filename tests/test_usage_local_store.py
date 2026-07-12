@@ -221,6 +221,53 @@ def test_usage_legacy_when_env_unset(legacy_path_app):
     assert body.get("_source") != "local_store"
 
 
+# ── /api/usage 24h retention cap (issue #1448 surface 2) ─────────────────
+#
+# OSS / Cloud-Free callers get clamped to the last 24h of the 14-day chart;
+# Cloud-Pro callers (gated by ``dashboard._is_pro_user``) keep the full
+# window. Response always carries ``capped_at_24h`` so the UI can render
+# the upgrade CTA.
+
+
+def test_api_usage_caps_14d_to_24h_for_free(fast_path_app, monkeypatch):
+    app, ls, _u = fast_path_app
+    # Seed events across 7 days; the cap should zero out everything except
+    # today + yesterday for non-Pro callers.
+    _seed_events(ls.get_store(), n=14, base_tokens=100)
+
+    import dashboard as _d
+    monkeypatch.setattr(_d, "_is_pro_user", lambda: False)
+
+    body = app.test_client().get("/api/usage").get_json()
+    assert body["capped_at_24h"] is True
+    # Chart still has 14 slots so the UI shape is unchanged.
+    assert isinstance(body["days"], list) and len(body["days"]) == 14
+    # Buckets older than today/yesterday must be zeroed.
+    older = body["days"][:-2]
+    for d in older:
+        assert d["tokens"] == 0, f"older bucket {d['date']} leaked tokens"
+        assert d["cost"] == 0
+
+
+def test_api_usage_no_cap_for_pro(fast_path_app, monkeypatch):
+    app, ls, _u = fast_path_app
+    _seed_events(ls.get_store(), n=14, base_tokens=100)
+
+    import dashboard as _d
+    monkeypatch.setattr(_d, "_is_pro_user", lambda: True)
+
+    body = app.test_client().get("/api/usage").get_json()
+    assert body["capped_at_24h"] is False
+    # Pro callers see the full 14-day window with seeded tokens spread
+    # across the whole period (events seeded at day_offset = i % 7).
+    assert isinstance(body["days"], list) and len(body["days"]) == 14
+    # At least one bucket older than yesterday must carry tokens.
+    older = body["days"][:-2]
+    assert any(d["tokens"] > 0 for d in older), (
+        "pro caller should see historical tokens beyond 24h window"
+    )
+
+
 # ── /api/usage/anomalies ───────────────────────────────────────────────────
 
 def test_usage_anomalies_fast_path(fast_path_app):
@@ -365,6 +412,40 @@ def test_cost_comparison_legacy_when_env_unset(legacy_path_app):
     app, _ls = legacy_path_app
     body = app.test_client().get("/api/usage/cost-comparison").get_json()
     assert body.get("_source") != "local_store"
+
+
+def test_cost_comparison_does_not_double_count_v3_sibling_pairs(fast_path_app):
+    """Regression: on real v3 installs every billable turn emits both an
+    ``assistant`` row AND a slim ``model.completed`` sibling ~100 ms later.
+    The cost-comparison fast path used to sum ``token_count`` across every
+    event row, doubling actual tokens + cost on real data and making the
+    "savings vs alternative" $ amounts look 2× as good as truth. We now
+    skip the slimmer sibling when the assistant exists for the same
+    (session_id, ts ±1 s) bucket.
+    """
+    app, ls, _u = fast_path_app
+    store = ls.get_store()
+    # One LLM turn within the 30-day window: 100 in + 50 out = 150 tokens.
+    # Both writers race-emit so two rows land at the same ts.
+    ts_iso = _iso(time.time() - 86400)
+    _ingest_v3_assistant(
+        store, sid="sess-dup", ts=ts_iso, ev_id="ev-assistant",
+        input_tokens=100, output_tokens=50, cache_read=0, cache_write=0,
+    )
+    _ingest_v3_model_completed(
+        store, sid="sess-dup", ts=ts_iso, ev_id="ev-modelcompleted",
+        input_tokens=100, output_tokens=50,
+    )
+    _wait_flush(store)
+
+    body = app.test_client().get("/api/usage/cost-comparison").get_json()
+    assert body["_source"] == "local_store"
+    # The pair represents ONE LLM turn = 150 tokens. Anything > 150 means
+    # the sibling-dedup regressed and we're double-counting again.
+    assert body["actual"]["tokens"] == 150, (
+        f"cost-comparison double-counted sibling pair: "
+        f"got {body['actual']['tokens']}, expected 150 (one deduped turn)"
+    )
 
 
 # ── /api/model-attribution ─────────────────────────────────────────────────
@@ -847,3 +928,78 @@ def test_query_daily_usage_splits_skips_zero_usage_rows(fast_path_app):
 
     rows = store.query_daily_usage_splits()
     assert rows[0]["event_count"] == 1
+
+
+# ── issue #1451: sibling-dedupe across remaining surfaces ─────────────────
+
+
+def _ingest_v3_pair(store, *, sid, ts_iso, plugin="bash", tokens=150):
+    """Seed one v3 assistant + model.completed sibling pair. Both rows
+    carry ``token_count=tokens`` — a blind sum returns 2×, a deduped sum
+    returns ``tokens``. Used by all #1451 regression tests."""
+    base = {
+        "node_id": "agent+test", "agent_id": "main", "session_id": sid,
+        "cost_usd": 0.0, "token_count": tokens, "model": "claude-opus-4-7",
+    }
+    store.ingest({**base, "id": f"asst-{sid}", "event_type": "assistant",
+                  "ts": ts_iso,
+                  "data": {"plugin": plugin, "message": {"role": "assistant"}}})
+    store.ingest({**base, "id": f"mc-{sid}", "event_type": "model.completed",
+                  "ts": ts_iso, "data": {"plugin": plugin}})
+
+
+def test_by_plugin_does_not_double_count_v3_sibling_pairs(fast_path_app):
+    """Regression: /api/usage/by-plugin summed ``token_count`` per plugin
+    without skipping the slim ``model.completed`` sibling — every turn was
+    counted twice. Shared dedupe helper (issue #1451) must collapse to 1×."""
+    app, ls, _u = fast_path_app
+    _ingest_v3_pair(ls.get_store(), sid="sess-plug-dup",
+                     ts_iso=_iso(time.time() - 3600))
+    _wait_flush(ls.get_store())
+
+    body = app.test_client().get("/api/usage/by-plugin").get_json()
+    assert body["_source"] == "local_store"
+    bash_row = next((r for r in body["plugins"] if r["plugin"] == "bash"), None)
+    assert bash_row is not None, "expected bash plugin row"
+    assert bash_row["total_tokens"] == 150, (
+        f"by-plugin double-counted sibling pair: got "
+        f"{bash_row['total_tokens']}, expected 150"
+    )
+
+
+def test_by_plugin_trend_does_not_double_count_v3_sibling_pairs(fast_path_app):
+    """Same regression as the by-plugin scalar route but for the daily
+    bucket aggregator at /api/usage/by-plugin/trend."""
+    app, ls, _u = fast_path_app
+    today = datetime.now().strftime("%Y-%m-%d")
+    _ingest_v3_pair(ls.get_store(), sid="sess-trend-dup",
+                     ts_iso=f"{today}T10:00:00.100Z")
+    _wait_flush(ls.get_store())
+
+    body = app.test_client().get("/api/usage/by-plugin/trend?days=14").get_json()
+    assert body["_source"] == "local_store"
+    today_entry = next((e for e in (body["plugins"].get("bash") or [])
+                         if e["day"] == today), None)
+    assert today_entry is not None, "expected today entry in bash trend"
+    assert today_entry["tokens"] == 150, (
+        f"by-plugin/trend double-counted sibling pair: got "
+        f"{today_entry['tokens']}, expected 150"
+    )
+
+
+def test_sessions_clusters_does_not_double_count_v3_sibling_pairs(fast_path_app):
+    """Regression: the session aggregator at routes/usage.py:1372 read
+    ``token_count`` from ``query_sessions`` (which returns ``SUM`` over
+    events) and never deduped — every session's tokens were 2× on v3.
+    Shared dedupe helper must collapse to 1×."""
+    app, ls, _u = fast_path_app
+    _ingest_v3_pair(ls.get_store(), sid="sess-clust-dup",
+                     ts_iso=_iso(time.time() - 3600))
+    _wait_flush(ls.get_store())
+
+    body = app.test_client().get("/api/sessions/clusters?days=30").get_json()
+    total = sum(c.get("total_tokens", 0) for c in body.get("clusters", []))
+    assert total == 150, (
+        f"sessions/clusters double-counted sibling pair: got {total}, "
+        f"expected 150"
+    )

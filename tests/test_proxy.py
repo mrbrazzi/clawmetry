@@ -209,6 +209,65 @@ class TestSSEParsing:
         assert usage.output_tokens == 150
         assert usage.stop_reason == "end_turn"
 
+    def test_anthropic_streamed_thinking_matches_nonstreamed(self):
+        # A full extended-thinking SSE sequence (thinking + signature deltas, then
+        # text) must accumulate the same output_tokens the equivalent non-streamed
+        # response reports in its final usage. Refs #2842.
+        from clawmetry.proxy import parse_anthropic_sse_chunk, StreamUsage
+
+        usage = StreamUsage()
+        stream = [
+            'data: {"type":"message_start","message":{"model":"claude-opus-4-20260313","usage":{"input_tokens":58,"cache_read_input_tokens":12,"output_tokens":2}}}',
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}',
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me reason about this"}}',
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc123"}}',
+            'data: {"type":"content_block_stop","index":0}',
+            'data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}',
+            'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Answer."}}',
+            'data: {"type":"content_block_stop","index":1}',
+            # Final message_delta carries the authoritative total (thinking + text).
+            'data: {"type":"message_delta","usage":{"output_tokens":314},"delta":{"stop_reason":"end_turn"}}',
+        ]
+        for line in stream:
+            parse_anthropic_sse_chunk(line, usage)
+
+        # Equivalent non-streamed usage block reports output_tokens=314.
+        nonstreamed_output = 314
+        assert usage.input_tokens == 58
+        assert usage.cache_read_tokens == 12
+        assert usage.output_tokens == nonstreamed_output
+        assert usage.stop_reason == "end_turn"
+
+    def test_anthropic_truncated_stream_keeps_floor(self):
+        # If the stream is cut off before the final message_delta, the output_tokens
+        # floor seeded from message_start must survive (never reset to 0). Refs #2842.
+        from clawmetry.proxy import parse_anthropic_sse_chunk, StreamUsage
+
+        usage = StreamUsage()
+        parse_anthropic_sse_chunk(
+            'data: {"type":"message_start","message":{"model":"m","usage":{"input_tokens":40,"output_tokens":7}}}',
+            usage,
+        )
+        # ... thinking deltas stream, then the connection drops. No message_delta.
+        parse_anthropic_sse_chunk(
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"partial"}}',
+            usage,
+        )
+        assert usage.input_tokens == 40
+        assert usage.output_tokens == 7  # floor preserved, not 0
+
+    def test_anthropic_message_start_output_floor_never_lowers_delta(self):
+        # message_start's floor must not clobber a larger value already accumulated.
+        from clawmetry.proxy import parse_anthropic_sse_chunk, StreamUsage
+
+        usage = StreamUsage()
+        usage.output_tokens = 200
+        parse_anthropic_sse_chunk(
+            'data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":3}}}',
+            usage,
+        )
+        assert usage.output_tokens == 200
+
     def test_anthropic_ignores_non_data(self):
         from clawmetry.proxy import parse_anthropic_sse_chunk, StreamUsage
 
@@ -544,6 +603,53 @@ class TestLoopDetector:
         is_loop, _ = loop_detector.check("", "same")
         assert is_loop is False
 
+    def test_loop_emits_alert_event(self, loop_detector, proxy_db, monkeypatch):
+        """Issue #1377: a positive LoopDetector.check() must also push a
+        ``loop_detected`` event into local_store.ingest() so the daemon's
+        alert evaluator (clawmetry/alert_evaluator.py) can fire matching
+        Cloud-Pro rules. This is the only OSS-side hook the alert pipeline
+        needs — the daemon then walks DuckDB + cached rules and dispatches.
+        """
+        captured: list[dict] = []
+
+        class _FakeStore:
+            def ingest(self, event):
+                captured.append(event)
+
+            def ingest_loop_signal(self, **kwargs):
+                # Existing badge write — not what this test cares about, but
+                # we still accept the call so the detector's first try-block
+                # doesn't raise.
+                pass
+
+        fake = _FakeStore()
+        # Patch get_store at the module the detector imports lazily.
+        from clawmetry import local_store as _ls
+        monkeypatch.setattr(_ls, "get_store", lambda: fake)
+
+        for _ in range(4):
+            proxy_db.record_usage(
+                provider="anthropic",
+                model="test",
+                input_tokens=100,
+                output_tokens=50,
+                cost_usd=0.01,
+                session_id="s-1377",
+                request_hash="loop-sig-1377",
+            )
+        is_loop, _ = loop_detector.check("s-1377", "loop-sig-1377")
+        assert is_loop is True
+
+        # Exactly one loop_detected event was emitted with the expected shape.
+        loop_events = [e for e in captured if e.get("event_type") == "loop_detected"]
+        assert len(loop_events) == 1
+        evt = loop_events[0]
+        assert evt["session_id"] == "s-1377"
+        assert evt["agent_id"] == "clawmetry-proxy"
+        assert evt["data"]["signature"] == "loop-sig-1377"
+        assert evt["data"]["repeat_count"] >= 3
+        assert "id" in evt and "ts" in evt and "node_id" in evt
+
 
 # ── Model Router ───────────────────────────────────────────────────────
 
@@ -767,3 +873,76 @@ class TestProxyApp:
         status = resp.get_json()
         assert status["budget"]["daily_remaining"] == 0.0
         assert status["budget"]["daily_limit"] == 10.0
+
+
+class TestProxyDisabledPassthrough:
+    """ProxyConfig.enabled=False must turn the proxy into a pure pass-through.
+
+    Regression for clawmetry-cloud#1577: the top-level ``enabled`` flag was a
+    dead no-op — every breaker checked its own ``enabled`` but the master
+    switch was never consulted in ``proxy_request``, so a "disabled" proxy
+    still ran full budget/loop/model-rewrite enforcement. These tests pin the
+    contract: when disabled, an over-budget request is forwarded (and fails
+    only at the upstream API-key step) instead of being budget-blocked.
+    """
+
+    def _build_client(self, tmp_path, enabled, monkeypatch):
+        import clawmetry.proxy
+        from clawmetry.proxy import create_proxy_app, ProxyConfig, BudgetConfig, ProxyDB
+
+        # No upstream key, so a forwarded request stops at the 401 auth step
+        # without ever touching the network.
+        for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+            monkeypatch.delenv(var, raising=False)
+
+        config = ProxyConfig(
+            port=14199,
+            enabled=enabled,
+            budget=BudgetConfig(daily_usd=10.0, monthly_usd=100.0, action="block"),
+        )
+        db_path = tmp_path / f"passthrough_{enabled}.db"
+
+        original_init = ProxyDB.__init__
+
+        def patched_init(self, db_path=None):
+            original_init(self, db_path or clawmetry.proxy.PROXY_DB_FILE)
+
+        with (
+            patch.object(clawmetry.proxy, "PROXY_DB_FILE", db_path),
+            patch.object(ProxyDB, "__init__", patched_init),
+        ):
+            app = create_proxy_app(config)
+        app.config["TESTING"] = True
+
+        # Blow the daily budget so enforcement *would* block if it ran.
+        ProxyDB(db_path=db_path).record_usage(
+            provider="anthropic",
+            model="claude-3-5-sonnet-20241022",
+            input_tokens=1000,
+            output_tokens=500,
+            cost_usd=15.0,
+        )
+        return app.test_client()
+
+    def _post(self, client):
+        return client.post(
+            "/v1/messages",
+            data=json.dumps({"model": "claude-3-5-sonnet-20241022", "stream": False}),
+            content_type="application/json",
+            headers={"x-session-id": "sess-passthrough"},
+        )
+
+    def test_enabled_budget_blocks(self, tmp_path, monkeypatch):
+        """Sanity guard: with enforcement ON, the over-budget request is blocked."""
+        client = self._build_client(tmp_path, enabled=True, monkeypatch=monkeypatch)
+        resp = self._post(client)
+        assert resp.status_code == 429
+        assert resp.get_json()["error"]["type"] == "budget_exceeded"
+
+    def test_disabled_bypasses_enforcement(self, tmp_path, monkeypatch):
+        """With enforcement OFF, the same request is forwarded, not budget-blocked."""
+        client = self._build_client(tmp_path, enabled=False, monkeypatch=monkeypatch)
+        resp = self._post(client)
+        # Reaches the forward step; fails only because no upstream key is set.
+        assert resp.status_code == 401
+        assert resp.get_json()["error"]["type"] == "authentication_error"

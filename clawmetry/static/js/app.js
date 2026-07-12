@@ -81,7 +81,28 @@ async function loadBudgetConfig() {
     document.getElementById('budget-weekly').value = cfg.weekly_limit || 0;
     document.getElementById('budget-monthly').value = cfg.monthly_limit || 0;
     document.getElementById('budget-warn-pct').value = cfg.warning_threshold_pct || 80;
-    document.getElementById('budget-autopause').checked = cfg.auto_pause_enabled || false;
+    var apEl = document.getElementById('budget-autopause');
+    if (apEl) {
+      apEl.checked = cfg.auto_pause_enabled || false;
+      // Issue #1169: auto-pause is a Cloud Pro feature. For OSS / Free
+      // users, disable the toggle and render an inline upsell. The
+      // warning-only banner path stays free as a teaser.
+      var proOk = !!cfg.auto_pause_pro_enabled;
+      apEl.disabled = !proOk;
+      var upsellId = 'budget-autopause-upsell';
+      var existing = document.getElementById(upsellId);
+      if (existing) existing.parentNode.removeChild(existing);
+      if (!proOk) {
+        apEl.checked = false;
+        var note = document.createElement('div');
+        note.id = upsellId;
+        note.style.cssText = 'margin-top:6px;padding:8px 10px;background:var(--bg-tertiary);border:1px solid var(--border-primary);border-radius:6px;font-size:12px;color:var(--text-secondary);';
+        note.innerHTML = '<span style="font-weight:600;color:var(--text-primary);">' + t("app.auto_pause_is_a_cloud_pro_feature", null, "Auto-pause is a Cloud Pro feature.") + '</span> '
+          + 'Budget warnings still fire here. To stop the gateway automatically at 100%, '
+          + '<a href="https://app.clawmetry.com/upgrade" target="_blank" rel="noopener" style="color:var(--bg-accent);text-decoration:underline;font-weight:600;">start a 7-day free trial</a>.';
+        if (apEl.parentNode) apEl.parentNode.appendChild(note);
+      }
+    }
   } catch(e) {}
 }
 
@@ -105,7 +126,7 @@ async function loadBudgetStatus() {
     }
     document.getElementById('budget-status-content').innerHTML = html;
   } catch(e) {
-    document.getElementById('budget-status-content').textContent = 'Failed to load';
+    document.getElementById('budget-status-content').textContent = t("app.failed_to_load", null, "Failed to load");
   }
 }
 
@@ -117,7 +138,14 @@ async function saveBudgetConfig() {
     warning_threshold_pct: parseInt(document.getElementById('budget-warn-pct').value) || 80,
     auto_pause_enabled: document.getElementById('budget-autopause').checked,
   };
-  await fetch('/api/budget/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)});
+  try {
+    var resp = await fetch('/api/budget/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)}).then(function(r){return r.json();});
+    if (resp && resp.auto_pause_pro_required) {
+      // Server stripped the toggle because the user isn't Pro yet.
+      // Re-render the config so the disabled state + upsell appear.
+      loadBudgetConfig();
+    }
+  } catch(e) {}
   loadBudgetStatus();
 }
 
@@ -153,19 +181,41 @@ async function loadAlertRules() {
     // Tolerate all three shapes: legacy array, {rules,_source:"local_store"},
     // {rules_blob,_source:"cache"} via the shared unwrap helper.
     var rules = await unwrapListAsync(data, 'rules', 'rules_blob');
+    // Issue #1419: PR #1410 comms envelope. Banner = rules configured but
+    // never fired (pre-fix cohort). CTA = same + on the DuckDB cost path
+    // (no OTLP installed — the audience PR #1410 unbroke).
+    var comms = (data && data._comms) || {};
     if(rules.length === 0) {
-      document.getElementById('alert-rules-list').innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-muted);">No alert rules configured</div>';
+      document.getElementById('alert-rules-list').innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-muted);">' + t("app.no_alert_rules_configured", null, "No alert rules configured") + '</div>';
       return;
     }
     var html = '';
+    if (comms.show_alerts_comms_banner) {
+      html += '<div id="alerts-comms-banner" style="padding:12px 14px;margin-bottom:10px;background:var(--bg-secondary);border:1px solid var(--border-primary);border-left:3px solid #16a34a;border-radius:8px;font-size:13px;color:var(--text-primary);display:flex;align-items:flex-start;gap:10px;">';
+      html += '<span style="font-size:16px;line-height:1;">&#x2728;</span>';
+      html += '<div style="flex:1;">';
+      html += '<div style="font-weight:600;margin-bottom:2px;">Heads up: alert rules now fire on real OpenClaw spend.</div>';
+      html += '<div style="color:var(--text-secondary);font-size:12px;">Your previous rules should start triggering normally.';
+      if (comms.show_cloud_pro_cta) {
+        html += ' Want richer telemetry plus 90-day retention? <a href="/cloud/billing" style="color:var(--text-accent);text-decoration:underline;">Upgrade to Cloud-Pro.</a>';
+      }
+      html += '</div></div>';
+      html += '<span style="cursor:pointer;color:var(--text-muted);font-size:18px;line-height:1;" onclick="this.parentElement.style.display=\'none\';" title="Dismiss">&times;</span>';
+      html += '</div>';
+    }
     rules.forEach(function(r) {
       var channels = [];
       try { channels = JSON.parse(r.channels); } catch(e) { channels = [r.channels]; }
-      html += '<div style="padding:10px;border-bottom:1px solid var(--border-secondary);display:flex;align-items:center;gap:8px;">';
+      html += '<div style="padding:10px;border-bottom:1px solid var(--border-secondary);display:flex;align-items:center;gap:8px;flex-wrap:wrap;">';
       html += '<span style="font-weight:600;">' + escHtml(r.type) + '</span>';
       html += '<span style="color:var(--text-accent);">' + (r.type==='spike' ? r.threshold+'x' : '$'+r.threshold) + '</span>';
       html += '<span style="color:var(--text-muted);font-size:11px;">' + channels.join(', ') + '</span>';
       html += '<span style="color:var(--text-muted);font-size:11px;">' + r.cooldown_min + 'min cooldown</span>';
+      if (r.last_fired_at) {
+        html += '<span style="font-size:11px;padding:2px 6px;border-radius:10px;background:rgba(22,163,74,0.12);color:#16a34a;">Last fired: ' + timeAgo(r.last_fired_at * 1000) + '</span>';
+      } else {
+        html += '<span style="font-size:11px;padding:2px 6px;border-radius:10px;background:var(--bg-tertiary);color:var(--text-muted);">Not yet fired</span>';
+      }
       html += '<span style="margin-left:auto;cursor:pointer;color:var(--text-error);font-size:16px;" data-rule-id="'+r.id+'" onclick="deleteAlertRule(this.dataset.ruleId)" title="Delete">&#x1f5d1;</span>';
       html += '</div>';
     });
@@ -200,7 +250,7 @@ async function loadWebhookConfig() {
 
 async function saveWebhookConfig() {
   var status = document.getElementById('alert-webhook-status');
-  status.textContent = 'Saving...';
+  status.textContent = t("app.saving", null, "Saving...");
   var minSevEl = document.getElementById('alert-min-severity');
   var payload = {
     webhook_url: document.getElementById('alert-webhook-url').value.trim(),
@@ -222,14 +272,14 @@ async function saveWebhookConfig() {
     status.textContent = 'Saved';
   } catch(e) {
     status.style.color = 'var(--text-error)';
-    status.textContent = 'Save failed';
+    status.textContent = t("app.save_failed", null, "Save failed");
   }
 }
 
 async function testWebhookConfig(target) {
   var status = document.getElementById('alert-webhook-status');
   status.style.color = 'var(--text-muted)';
-  status.textContent = 'Sending test...';
+  status.textContent = t("app.sending_test", null, "Sending test...");
   try {
     var r = await fetch('/api/alert-channels/test', {
       method:'POST',
@@ -239,14 +289,14 @@ async function testWebhookConfig(target) {
     var data = await r.json();
     if(data.ok) {
       status.style.color = 'var(--text-success)';
-      status.textContent = 'Test sent to: ' + (data.sent || []).join(', ');
+      status.textContent = t("app.test_sent_to", null, "Test sent to: ") + (data.sent || []).join(', ');
     } else {
       status.style.color = 'var(--text-error)';
       status.textContent = data.error || 'No URL configured for ' + (target || 'all');
     }
   } catch(e) {
     status.style.color = 'var(--text-error)';
-    status.textContent = 'Test failed';
+    status.textContent = t("app.test_failed", null, "Test failed");
   }
 }
 
@@ -255,7 +305,7 @@ async function loadAlertHistory() {
     var data = await fetch('/api/alerts/history?limit=50').then(function(r){return r.json();});
     var alerts = data.alerts || [];
     if(alerts.length === 0) {
-      document.getElementById('alert-history-list').innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-muted);">No alerts fired yet</div>';
+      document.getElementById('alert-history-list').innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-muted);">' + t("app.no_alerts_fired_yet", null, "No alerts fired yet") + '</div>';
       return;
     }
     var html = '';
@@ -276,6 +326,30 @@ async function loadAlertHistory() {
   }
 }
 
+// QW5 — plain-words duration for the "data feed stopped" banner.
+function _cmHumanizeMinutes(mins) {
+  mins = Math.max(1, Math.round(mins));
+  if (mins < 60) return mins === 1 ? t('app.one_minute', null, '1 minute') : t('app.n_minutes', { n: mins }, mins + ' minutes');
+  var hours = Math.round(mins / 60);
+  if (hours < 48) return hours === 1 ? t('app.one_hour', null, '1 hour') : t('app.n_hours', { n: hours }, hours + ' hours');
+  var days = Math.round(mins / 1440);
+  return days === 1 ? t('app.one_day', null, '1 day') : t('app.n_days', { n: days }, days + ' days');
+}
+
+// QW5 — rewrite the server's agent_down message into plain words. The server
+// copy ("Agent appears down: no OTLP data for N minutes") carries jargon and a
+// raw minute count; users get a humanized duration and an honest scope note.
+function _cmAgentDownBannerCopy(orig) {
+  try {
+    var m = /(\d+)\s*minute/.exec(orig || '');
+    if (m) {
+      var dur = _cmHumanizeMinutes(parseInt(m[1], 10));
+      return t('alerts.feed_stopped', { duration: dur }, 'One of our data feeds from your agent stopped about ' + dur + ' ago. You’re still seeing live activity, but some charts may lag.');
+    }
+  } catch (e) {}
+  return t('alerts.feed_stopped_unknown', null, 'One of our data feeds from your agent stopped. You’re still seeing live activity, but some charts may lag.');
+}
+
 async function checkActiveAlerts() {
   try {
     var data = await fetch('/api/alerts/active').then(function(r){return r.json();});
@@ -288,13 +362,49 @@ async function checkActiveAlerts() {
     if (bellBadge) { bellBadge.textContent = countLabel; bellBadge.style.display = count > 0 ? '' : 'none'; }
     if (tabBadge)  { tabBadge.textContent  = countLabel; tabBadge.style.display  = count > 0 ? '' : 'none'; }
     var banner = document.getElementById('alert-banner');
-    if(count === 0) {
+    // QW5: when the live feed delivered an event in the last 2 minutes, the
+    // "feed stopped" alert contradicts what the user can see — suppress it
+    // from the banner (it stays in the bell/alert history).
+    var _liveMs = (typeof window._cmLastLiveEventMs === 'number') ? window._cmLastLiveEventMs : 0;
+    var _liveRecent = _liveMs > 0 && (Date.now() - _liveMs) < 120000;
+    var bannerAlerts = _liveRecent
+      ? alerts.filter(function(a) { return a && a.type !== 'agent_down'; })
+      : alerts;
+    if(bannerAlerts.length === 0) {
       if (banner) banner.style.display = 'none';
       return;
     }
     // Show most recent alert
-    var latest = alerts[0];
-    document.getElementById('alert-banner-msg').textContent = latest.message;
+    var latest = bannerAlerts[0];
+    var msgEl = document.getElementById('alert-banner-msg');
+    msgEl.textContent = latest.type === 'agent_down' ? _cmAgentDownBannerCopy(latest.message) : latest.message;
+    // Stuck-session deep-link: dashboard.py:_check_stuck_sessions emits
+    // rule_id = `stuck_session_<full-session-id>`. Surface an "Open session →"
+    // button on the banner so users go from "what's wrong" to "look at it"
+    // in one click. Idempotent across polls — remove any prior button first.
+    var existingOpen = document.getElementById('alert-banner-open-session');
+    if (existingOpen && existingOpen.parentNode) existingOpen.parentNode.removeChild(existingOpen);
+    if (latest && latest.type === 'stuck_session' && typeof latest.rule_id === 'string') {
+      var sid = latest.rule_id.indexOf('stuck_session_') === 0
+        ? latest.rule_id.slice('stuck_session_'.length) : '';
+      if (sid) {
+        var openBtn = document.createElement('button');
+        openBtn.id = 'alert-banner-open-session';
+        openBtn.textContent = t("app.open_session", null, "Open session →");
+        openBtn.style.cssText = 'margin-left:12px;background:transparent;border:1px solid rgba(255,255,255,0.3);color:inherit;border-radius:6px;padding:4px 12px;font-size:12px;font-weight:600;cursor:pointer;';
+        openBtn.onclick = function () {
+          // Deep-link via hash so the Session-replay tab can pick it up
+          // either on first paint (window.location.hash) or via the
+          // hashchange listener if the tab is already mounted.
+          try { window.location.hash = 'session=' + encodeURIComponent(sid); } catch(e) {}
+          if (typeof switchTab === 'function') switchTab('transcripts');
+        };
+        // Insert before the Dismiss / ack button so it reads left-to-right.
+        var ackBtn = document.getElementById('alert-resume-btn');
+        if (ackBtn && ackBtn.parentNode) ackBtn.parentNode.insertBefore(openBtn, ackBtn);
+        else if (msgEl && msgEl.parentNode) msgEl.parentNode.appendChild(openBtn);
+      }
+    }
     banner.style.display = 'flex';
     // Show resume button if gateway is paused
     var status = await fetch('/api/budget/status').then(function(r){return r.json();});
@@ -334,12 +444,65 @@ function visibilitySetInterval(fn, ms) {
   }, ms);
 }
 
+// Tab-scoped polling. Heavy pollers (the Overview loadAll() fan-out) gate on
+// the active tab so they don't fire on every other screen. ``_cmCurrentTab``
+// is set by switchTab(); it's null on first boot, where Overview is the
+// default landing tab — so the gate treats "unset" as Overview.
+var _cmCurrentTab = null;
+function _cmIsOverviewTab() {
+  return !_cmCurrentTab || _cmCurrentTab === 'overview';
+}
+
 // Check alerts every 30s
 visibilitySetInterval(checkActiveAlerts, 30000);
 setTimeout(checkActiveAlerts, 3000);
 
 // === Anomaly Detection Banner ===
 var _anomalyBannerEl = null;
+// ── Connector-down banner (incident: a channel went deaf ~37h, no alarm) ──
+// A red top banner whenever an enabled inbound channel's poll is 'down' —
+// the agent can still SEND but can no longer RECEIVE messages on it. Driven
+// by /api/system-health.connector_liveness (loadSystemHealth). Dynamically
+// created so it works on cloud (which serves this app.js) without a template.
+var _connectorBannerEl = null;
+function _getOrCreateConnectorBanner() {
+  if (_connectorBannerEl) return _connectorBannerEl;
+  var existing = document.getElementById('connector-down-banner');
+  if (existing) { _connectorBannerEl = existing; return existing; }
+  var el = document.createElement('div');
+  el.id = 'connector-down-banner';
+  el.style.cssText = 'display:none;padding:10px 16px;background:#7f1d1d;border-bottom:2px solid #ef4444;color:#fecaca;font-size:13px;font-weight:600;align-items:center;gap:10px;';
+  el.innerHTML = '<span style="font-size:18px;">&#128227;</span><span id="connector-down-banner-msg" style="flex:1;"></span><a href="#" onclick="switchTab(\'overview\');return false;" style="color:#fecaca;text-decoration:underline;font-size:12px;margin-right:8px;">' + t("app.view", null, "View") + '</a><button onclick="document.getElementById(\'connector-down-banner\').style.display=\'none\';" style="background:#991b1b;color:#fee2e2;border:none;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;">' + t("app.dismiss", null, "Dismiss") + '</button>';
+  var alertBanner = document.getElementById('alert-banner');
+  if (alertBanner && alertBanner.parentNode) {
+    alertBanner.parentNode.insertBefore(el, alertBanner.nextSibling);
+  } else {
+    document.body.insertBefore(el, document.body.firstChild);
+  }
+  _connectorBannerEl = el;
+  return el;
+}
+
+function _renderConnectorBanner(liveness) {
+  var banner = _getOrCreateConnectorBanner();
+  var rows = Array.isArray(liveness) ? liveness : [];
+  var down = rows.filter(function(r){ return r && r.state === 'down'; });
+  if (down.length === 0) { banner.style.display = 'none'; return; }
+  function cap(s){ return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
+  var first = down[0];
+  var mins = (first.mins_ago != null) ? first.mins_ago : null;
+  var since = (mins != null)
+    ? (mins >= 120 ? Math.round(mins/60) + 'h' : mins + 'm')
+    : '';
+  var msg = '⚠️ ' + cap(first.provider) + ' is not receiving messages'
+    + (since ? '. Inbound down ' + since + '.' : '.')
+    + ' Your agent can still send, but is not hearing replies.';
+  if (down.length > 1) msg += ' (+' + (down.length - 1) + ' more channel' + (down.length > 2 ? 's' : '') + ')';
+  var msgEl = document.getElementById('connector-down-banner-msg');
+  if (msgEl) msgEl.textContent = msg;
+  banner.style.display = 'flex';
+}
+
 function _getOrCreateAnomalyBanner() {
   if (_anomalyBannerEl) return _anomalyBannerEl;
   var existing = document.getElementById('anomaly-engine-banner');
@@ -347,7 +510,7 @@ function _getOrCreateAnomalyBanner() {
   var el = document.createElement('div');
   el.id = 'anomaly-engine-banner';
   el.style.cssText = 'display:none;padding:10px 16px;background:#451a03;border-bottom:2px solid #f59e0b;color:#fbbf24;font-size:13px;font-weight:600;align-items:center;gap:10px;';
-  el.innerHTML = '<span style="font-size:18px;">&#128680;</span><span id="anomaly-banner-msg" style="flex:1;"></span><a href="#" onclick="switchTab(\'usage\');loadAnomalyPanel();checkAnomalies();return false;" style="color:#fbbf24;text-decoration:underline;font-size:12px;margin-right:8px;">View Details</a><button onclick="document.getElementById(\'anomaly-engine-banner\').style.display=\'none\';" style="background:#92400e;color:#fef3c7;border:none;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;">Dismiss</button>';
+  el.innerHTML = '<span style="font-size:18px;">&#128680;</span><span id="anomaly-banner-msg" style="flex:1;"></span><a href="#" onclick="switchTab(\'usage\');loadAnomalyPanel();checkAnomalies();return false;" style="color:#fbbf24;text-decoration:underline;font-size:12px;margin-right:8px;">' + t("app.view_details", null, "View Details") + '</a><button onclick="document.getElementById(\'anomaly-engine-banner\').style.display=\'none\';" style="background:#92400e;color:#fef3c7;border:none;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;">' + t("app.dismiss", null, "Dismiss") + '</button>';
   // Insert after alert-banner
   var alertBanner = document.getElementById('alert-banner');
   if (alertBanner && alertBanner.parentNode) {
@@ -403,7 +566,7 @@ function _ensureAnomalyPanel() {
   var panel = document.createElement('div');
   panel.id = 'anomaly-panel';
   panel.style.cssText = 'background:var(--bg-secondary);border:1px solid var(--border-primary);border-radius:12px;padding:16px;margin-top:14px;box-shadow:var(--card-shadow);';
-  panel.innerHTML = '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;"><div style="font-size:14px;font-weight:700;color:var(--text-primary);">&#128269; Anomaly Detection</div><span id="anomaly-panel-badge" style="font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;display:none;"></span></div><div id="anomaly-baselines" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;font-size:11px;"></div><div id="anomaly-list" style="max-height:300px;overflow-y:auto;"></div>';
+  panel.innerHTML = '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;"><div style="font-size:14px;font-weight:700;color:var(--text-primary);">' + t("app.128269_anomaly_detection", null, "&#128269; Anomaly Detection") + '</div><span id="anomaly-panel-badge" style="font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;display:none;"></span></div><div id="anomaly-baselines" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;font-size:11px;"></div><div id="anomaly-list" style="max-height:300px;overflow-y:auto;"></div>';
   shPanel.parentNode.insertBefore(panel, shPanel.nextSibling);
   return panel;
 }
@@ -427,7 +590,7 @@ async function loadAnomalyPanel() {
         badge.style.color = hasCrit ? '#fca5a5' : '#fbbf24';
         badge.style.display = 'inline-block';
       } else {
-        badge.textContent = 'all clear';
+        badge.textContent = t("app.all_clear", null, "all clear");
         badge.style.background = '#064e3b';
         badge.style.color = '#6ee7b7';
         badge.style.display = 'inline-block';
@@ -448,7 +611,7 @@ async function loadAnomalyPanel() {
     var listEl = document.getElementById('anomaly-list');
     if (!listEl) return;
     if (anomalies.length === 0) {
-      listEl.innerHTML = '<div style="text-align:center;padding:16px;color:var(--text-muted);font-size:12px;">No anomalies in last 48h. Baselines from 7-day rolling window.</div>';
+      listEl.innerHTML = '<div style="text-align:center;padding:16px;color:var(--text-muted);font-size:12px;">' + t("app.no_anomalies_in_last_48h_baselines_from_7_day_roll", null, "No anomalies in last 48h. Baselines from 7-day rolling window.") + '</div>';
       return;
     }
 
@@ -522,6 +685,170 @@ async function checkHeartbeatStatus() {
 visibilitySetInterval(checkHeartbeatStatus, 30000);
 setTimeout(checkHeartbeatStatus, 5000);
 
+// === Onboarding / First-Heartbeat Banner (closes #1604) =====================
+// After a fresh signup the daemon needs ~30s to come up + emit its first
+// heartbeat. Without a banner the dashboard shows empty cards that look
+// broken or - worse - might surface stale data from a prior tenant on the
+// same machine_id. We poll /api/heartbeat-status every 5s and:
+//   * status === "unknown" (no heartbeat yet) -> show "Setting up your node"
+//   * first heartbeat lands -> hide banner + trigger one full loadAll() so
+//     the live cards swap in smoothly instead of waiting for the 30s cycle.
+//   * 90s elapsed with no heartbeat -> switch copy to actionable error.
+var _cmOnboardingFirstSeenMs = 0;
+var _cmOnboardingDismissed = false;
+var _cmOnboardingTimer = null;
+var _CM_ONBOARDING_STALL_MS = 90 * 1000;
+
+// P0 user report 2026-05-18: the "Setting up your node" banner kept
+// showing on the cloud Node Detail modal even while MODEL, TOKENS,
+// SPENDING and "Connected, last sync 28s ago" were ALL clearly
+// populated from other endpoints. `/api/heartbeat-status` alone is
+// not authoritative — when any hero card has flipped from its "--"
+// placeholder to a real value, the banner is lying and must dismiss.
+function _cmAnyVisibleDataSignal(){
+  var ids = [
+    'cost-today',       // Spending
+    'model-primary',    // Model
+    'token-rate',       // Tokens
+    'tokens-today',     // Today
+    'hot-sessions-count' // Sessions
+  ];
+  for (var i = 0; i < ids.length; i++){
+    var el = document.getElementById(ids[i]);
+    if (!el) continue;
+    var txt = (el.textContent || '').trim();
+    if (!txt) continue;
+    if (/^[-—\s]*$/.test(txt)) continue;
+    if (/^loading/i.test(txt)) continue;
+    if (txt === '$0.00') continue;      // default Spending placeholder
+    if (/\d/.test(txt) || /[a-z]/i.test(txt)) return true;
+  }
+  return false;
+}
+
+async function checkOnboardingStatus() {
+  if (_cmOnboardingDismissed) return;
+  var banner = document.getElementById('onboarding-banner');
+  if (!banner) return;
+  var msgEl = document.getElementById('onboarding-banner-msg');
+  var etaEl = document.getElementById('onboarding-banner-eta');
+  var spinEl = document.getElementById('onboarding-banner-spinner');
+  // Short-circuit: if any hero card is already showing real data, the
+  // banner is lying — dismiss it permanently for this session.
+  if (_cmAnyVisibleDataSignal()) {
+    banner.style.display = 'none';
+    _cmOnboardingDismissed = true;
+    if (_cmOnboardingTimer) { clearInterval(_cmOnboardingTimer); _cmOnboardingTimer = null; }
+    return;
+  }
+  try {
+    var data = await fetch('/api/heartbeat-status').then(function(r){return r.json();});
+    var firstHeartbeatLanded = (
+      data && data.status && data.status !== 'unknown' &&
+      data.last_heartbeat_ts && data.last_heartbeat_ts > 0
+    );
+    // Belt-and-braces: even if heartbeat-status didn't update, recheck
+    // visible signals after the network round-trip in case they landed.
+    if (!firstHeartbeatLanded && _cmAnyVisibleDataSignal()) {
+      firstHeartbeatLanded = true;
+    }
+    if (firstHeartbeatLanded) {
+      // Smooth handoff: hide the banner, mark as dismissed for this session
+      // so we don't re-flash on a transient blip, and kick a fresh loadAll
+      // so the now-live cards render without waiting for the next 30s tick.
+      banner.style.display = 'none';
+      _cmOnboardingDismissed = true;
+      if (_cmOnboardingTimer) { clearInterval(_cmOnboardingTimer); _cmOnboardingTimer = null; }
+      if (typeof loadAll === 'function') {
+        try { loadAll(); } catch(e) {}
+      }
+      return;
+    }
+    // Still waiting. Show the banner; track when we first saw the empty
+    // state so we can flip to the stall message after 90s.
+    if (_cmOnboardingFirstSeenMs === 0) _cmOnboardingFirstSeenMs = Date.now();
+    var waitedMs = Date.now() - _cmOnboardingFirstSeenMs;
+    banner.style.display = 'flex';
+    if (waitedMs < _CM_ONBOARDING_STALL_MS) {
+      var remainingSec = Math.max(5, Math.round((_CM_ONBOARDING_STALL_MS - waitedMs) / 1000));
+      if (msgEl) msgEl.textContent = t("app.setting_up_your_node_first_check_in_usually_arrive", null, "Setting up your node. First check-in usually arrives in about 30 seconds.");
+      if (etaEl) etaEl.textContent = t("app.checking_again_in_5s", null, "checking again in 5s");
+      if (spinEl) spinEl.style.display = 'inline-block';
+      banner.style.background = 'linear-gradient(90deg,#0c1d3a 0%,#1a1a2e 100%)';
+      banner.style.borderColor = '#3b82f6';
+      banner.style.color = '#93c5fd';
+      void remainingSec;
+    } else {
+      // Stalled past 90s. Swap to actionable copy. No demo data, no
+      // pretend-it-worked - just tell the user what to check.
+      if (msgEl) msgEl.textContent = "Still waiting for your daemon's first check-in. Try: run 'clawmetry status' in a terminal, or restart with 'clawmetry'.";
+      if (etaEl) etaEl.textContent = t("app.still_retrying_every_5s", null, "still retrying every 5s");
+      if (spinEl) spinEl.style.display = 'none';
+      banner.style.background = '#3f2a06';
+      banner.style.borderColor = '#f59e0b';
+      banner.style.color = '#fbbf24';
+    }
+  } catch(e) {
+    // Transient fetch failure - keep the banner in its current state, do
+    // NOT dismiss (per feedback_persistent_sessions: don't surface auth /
+    // network blips as terminal user-facing errors).
+  }
+}
+
+// Poll every 15s while the banner is active (#1969: was 5s + ungated, which
+// kept hitting /api/heartbeat-status every 5s on every tab and while the
+// browser tab was hidden). First check is fast (300ms) so a returning user
+// with an already-warm daemon barely sees the banner; thereafter the gated
+// wrapper suspends the poll when the tab is hidden and the in-function
+// dismiss-on-first-heartbeat keeps the on-tab pollage short.
+_cmOnboardingTimer = visibilitySetInterval(checkOnboardingStatus, 15000);
+setTimeout(checkOnboardingStatus, 300);
+
+// === No-Agent-Detected Empty-State Banner ===================================
+// Distinct from the first-heartbeat onboarding banner above:
+//   * onboarding-banner fires when "agent installed but no heartbeat yet"
+//     (transient race that resolves in ~30s)
+//   * no-agent-banner fires when "no agent installed at all" — persistent
+//     until the user installs OpenClaw or NVIDIA NemoClaw.
+// Mutual exclusion: if openclaw or nemoclaw IS detected (heartbeat just
+// hasn't landed yet), we hide this banner and let onboarding-banner do
+// its thing. Polls every 60s — filesystem state for "did the user pip
+// install an agent" changes on the order of minutes, not seconds.
+async function checkAgentPresence() {
+  var banner = document.getElementById('no-agent-banner');
+  if (!banner) return;
+  try {
+    var data = await fetch('/api/agent-presence').then(function(r){return r.json();});
+    var noAgent = !!(data && data.no_agent === true);
+    if (noAgent) {
+      // No OpenClaw, no NemoClaw, no local data — show the persistent
+      // empty-state banner and hide the first-heartbeat one so we don't
+      // double up. Setting _cmOnboardingDismissed stops the 5s poller
+      // from re-flashing the "Setting up your node" copy.
+      var ob = document.getElementById('onboarding-banner');
+      if (ob) ob.style.display = 'none';
+      _cmOnboardingDismissed = true;
+      banner.style.display = 'flex';
+    } else {
+      // Agent appeared. Hide the no-agent banner and (if the dashboard
+      // was already showing it) reload the data so cards render.
+      var wasShown = banner.style.display !== 'none';
+      banner.style.display = 'none';
+      if (wasShown && typeof loadAll === 'function') {
+        try { loadAll(); } catch(e) {}
+      }
+    }
+  } catch(e) {
+    // Transient fetch failure. Per feedback_persistent_sessions: never
+    // surface a network blip as a terminal user-facing error. Keep the
+    // banner in whatever state it was in.
+  }
+}
+// Fast first check (500ms) so brand-new users see the banner before
+// staring at an empty dashboard. Re-poll every 60s thereafter.
+setTimeout(checkAgentPresence, 500);
+visibilitySetInterval(checkAgentPresence, 60000);
+
 function dismissPausedBanner() {
   localStorage.setItem('cm_paused_banner_dismissed', String(Date.now()));
   var banner = document.getElementById('paused-banner');
@@ -561,9 +888,9 @@ async function loadTelegramConfig() {
     if(cfg.telegram_chat_id) chatEl.value = cfg.telegram_chat_id;
     var statusEl = document.getElementById('tg-status');
     if(cfg.telegram_bot_token && cfg.telegram_chat_id) {
-      statusEl.innerHTML = '<span style="color:var(--text-success);">Configured</span>';
+      statusEl.innerHTML = '<span style="color:var(--text-success);">' + t("app.configured", null, "Configured") + '</span>';
     } else {
-      statusEl.innerHTML = '<span style="color:var(--text-muted);">Not configured</span>';
+      statusEl.innerHTML = '<span style="color:var(--text-muted);">' + t("app.not_configured", null, "Not configured") + '</span>';
     }
   } catch(e) {}
 }
@@ -576,22 +903,22 @@ async function saveTelegramConfig() {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({telegram_bot_token: token, telegram_chat_id: chatId})
   });
-  document.getElementById('tg-status').innerHTML = '<span style="color:var(--text-success);">Saved!</span>';
+  document.getElementById('tg-status').innerHTML = '<span style="color:var(--text-success);">' + t("app.saved", null, "Saved!") + '</span>';
 }
 
 async function testTelegram() {
   var statusEl = document.getElementById('tg-status');
-  statusEl.innerHTML = '<span style="color:var(--text-muted);">Sending...</span>';
+  statusEl.innerHTML = '<span style="color:var(--text-muted);">' + t("app.sending", null, "Sending...") + '</span>';
   try {
     var r = await fetch('/api/budget/test-telegram', {method: 'POST'});
     var data = await r.json();
     if(data.ok) {
-      statusEl.innerHTML = '<span style="color:var(--text-success);">Test sent!</span>';
+      statusEl.innerHTML = '<span style="color:var(--text-success);">' + t("app.test_sent", null, "Test sent!") + '</span>';
     } else {
       statusEl.innerHTML = '<span style="color:var(--text-error);">' + escHtml(data.error || 'Failed') + '</span>';
     }
   } catch(e) {
-    statusEl.innerHTML = '<span style="color:var(--text-error);">Request failed</span>';
+    statusEl.innerHTML = '<span style="color:var(--text-error);">' + t("app.request_failed", null, "Request failed") + '</span>';
   }
 }
 
@@ -635,53 +962,353 @@ function cancelAllPendingSSEDwell() {
   });
 }
 
+// ── Context Economics (PRD P1-2) ───────────────────────────────────────────
+// Interactive context-window economics: a utilization gauge over time, the
+// compaction log tagged proactive/overflow with tokens reclaimed, and the
+// repeatedly-overflow-then-retry flag. Reads /api/context-economics.
+//   - Click a session chip to scope the gauge to one conversation.
+//   - Hover a gauge bar for the per-turn ctx tokens / window / %.
+//   - Click a compaction row to expand its before/after + summary, with a
+//     "View transcript" deep-link into the global viewTranscript(sessionId).
+var _ceSessionId = null;          // active session scope (null = all)
+var _ceCompactionsCache = [];     // last-rendered compactions (for expand)
+
+function _ceShortSid(sid) {
+  sid = String(sid || '');
+  // claude_code:UUID -> UUID head; otherwise tail. Keep it short + stable.
+  var parts = sid.split(':');
+  var tail = parts[parts.length - 1] || sid;
+  return tail.slice(0, 8);
+}
+
+function _ceFmtTokens(n) {
+  n = Number(n || 0);
+  if (n >= 1000) return (n / 1000).toFixed(n >= 100000 ? 0 : 1) + 'K';
+  return String(n);
+}
+
+function _ceSelectSession(sid) {
+  _ceSessionId = (_ceSessionId === sid) ? null : sid;  // toggle off if same
+  loadContextEconomics();
+}
+
+function _ceToggleCompaction(idx) {
+  var row = document.getElementById('ce-comp-detail-' + idx);
+  if (!row) return;
+  row.style.display = (row.style.display === 'none' || !row.style.display) ? 'block' : 'none';
+}
+
+async function loadContextEconomics() {
+  var gaugeEl = document.getElementById('ce-gauge-panel');
+  var sumEl = document.getElementById('ce-summary');
+  var chipsEl = document.getElementById('ce-session-chips');
+  var compEl = document.getElementById('ce-compactions-panel');
+  var ovEl = document.getElementById('ce-overflow-panel');
+  if (!gaugeEl) return;
+  var url = '/api/context-economics?limit=400' + (_ceSessionId ? ('&session_id=' + encodeURIComponent(_ceSessionId)) : '');
+  var data;
+  try {
+    data = await fetch(url).then(function(r){ return r.json(); });
+  } catch (e) {
+    gaugeEl.innerHTML = '<div style="color:#e74c3c;font-size:13px;padding:16px;">' + t("app.failed_to_load_context_economics", null, "Failed to load context economics") + ': ' + escHtml(String(e)) + '</div>';
+    return;
+  }
+  var util = data.utilization || [];
+  var comps = data.compactions || [];
+  var overflow = data.overflow_sessions || [];
+  var chips = data.session_chips || [];
+  var s = data.summary || {};
+  _ceCompactionsCache = comps;
+
+  // ── Summary chips ──
+  if (sumEl) {
+    function chip(label, val, color) {
+      return '<div style="border:1px solid var(--border-primary);border-radius:10px;padding:10px 14px;min-width:96px;">'
+        + '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">' + escHtml(label) + '</div>'
+        + '<div style="font-size:18px;font-weight:700;color:' + (color || 'var(--text-primary)') + ';margin-top:2px;">' + escHtml(String(val)) + '</div></div>';
+    }
+    var peakColor = (s.peak_pct || 0) >= 90 ? '#ef4444' : ((s.peak_pct || 0) >= 70 ? '#d97706' : 'var(--text-primary)');
+    sumEl.innerHTML = '<div style="display:flex;gap:10px;flex-wrap:wrap;">'
+      + chip('Peak window', (s.peak_pct || 0) + '%', peakColor)
+      + chip('Compactions', s.compaction_count || 0)
+      + chip('Overflow', s.overflow_count || 0, (s.overflow_count || 0) > 0 ? '#ef4444' : 'var(--text-muted)')
+      + chip('Proactive', s.proactive_count || 0, '#16a34a')
+      + chip('Tokens reclaimed', _ceFmtTokens(s.total_reclaimed || 0), '#16a34a')
+      + chip('Overflow sessions', s.overflow_sessions || 0, (s.overflow_sessions || 0) > 0 ? '#ef4444' : 'var(--text-muted)')
+      + '</div>';
+  }
+
+  // ── Session picker chips ──
+  if (chipsEl) {
+    if (chips.length === 0) {
+      chipsEl.innerHTML = '';
+    } else {
+      var ch = '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">';
+      ch += '<span style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-right:4px;">Scope:</span>';
+      ch += '<span onclick="_ceSelectSession(null)" style="cursor:pointer;font-size:12px;font-weight:600;border-radius:14px;padding:4px 12px;border:1px solid ' + (!_ceSessionId ? '#3b82f6' : 'var(--border-primary)') + ';background:' + (!_ceSessionId ? 'rgba(59,130,246,.12)' : 'transparent') + ';color:var(--text-primary);">All sessions</span>';
+      chips.slice(0, 12).forEach(function(c) {
+        var active = (_ceSessionId === c.session_id);
+        var pk = Number(c.peak_pct || 0);
+        var dot = pk >= 90 ? '#ef4444' : (pk >= 70 ? '#d97706' : '#16a34a');
+        ch += '<span onclick="_ceSelectSession(' + JSON.stringify(c.session_id) + ')" title="' + escHtml(c.session_id) + ' · peak ' + pk + '%" style="cursor:pointer;font-size:12px;font-weight:600;border-radius:14px;padding:4px 12px;border:1px solid ' + (active ? '#3b82f6' : 'var(--border-primary)') + ';background:' + (active ? 'rgba(59,130,246,.12)' : 'transparent') + ';color:var(--text-primary);">'
+          + '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:' + dot + ';margin-right:5px;"></span>'
+          + escHtml(_ceShortSid(c.session_id)) + ' <span style="color:var(--text-muted);font-weight:500;">' + pk + '%</span></span>';
+      });
+      ch += '</div>';
+      chipsEl.innerHTML = ch;
+    }
+  }
+
+  // ── Utilization gauge over time (sparkline-style bars) ──
+  if (util.length === 0) {
+    gaugeEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;border:1px solid var(--border-primary);border-radius:10px;">' + t("app.no_context_window_readings_yet_once_your_agents_ta", null, "No context-window readings yet. Once your agents take a few turns, per-turn utilization appears here.") + '</div>';
+  } else {
+    var maxPct = Math.max(100, util.reduce(function(m, u){ return Math.max(m, Number(u.pct || 0)); }, 0));
+    var g = '<div style="border:1px solid var(--border-primary);border-radius:10px;padding:14px;">';
+    g += '<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:10px;">';
+    g += '<div style="font-size:12px;font-weight:700;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.5px;">Context-window utilization over time</div>';
+    g += '<span style="font-size:11px;color:var(--text-muted);">' + util.length + ' turns' + (_ceSessionId ? (' · ' + escHtml(_ceShortSid(_ceSessionId))) : '') + '</span></div>';
+    // Threshold guide lines (70% warn / 90% danger) behind the bars.
+    g += '<div style="position:relative;height:120px;display:flex;align-items:flex-end;gap:1px;border-bottom:1px solid var(--border-secondary);">';
+    g += '<div style="position:absolute;left:0;right:0;bottom:' + (90 / maxPct * 100) + '%;border-top:1px dashed rgba(239,68,68,.5);"></div>';
+    g += '<div style="position:absolute;left:0;right:0;bottom:' + (70 / maxPct * 100) + '%;border-top:1px dashed rgba(217,119,6,.4);"></div>';
+    util.forEach(function(u) {
+      var pct = Number(u.pct || 0);
+      var h = Math.max(2, pct / maxPct * 100);
+      var color = pct >= 90 ? '#ef4444' : (pct >= 70 ? '#d97706' : '#3b82f6');
+      var tip = (u.ts || '') + ' · ' + _ceFmtTokens(u.tokens) + ' / ' + _ceFmtTokens(u.window) + ' ctx tokens (' + pct + '%)' + (u.model ? (' · ' + u.model) : '');
+      g += '<div title="' + escHtml(tip) + '" style="flex:1;min-width:2px;height:' + h + '%;background:' + color + ';border-radius:2px 2px 0 0;cursor:crosshair;"></div>';
+    });
+    g += '</div>';
+    g += '<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--text-faint);margin-top:5px;">'
+      + '<span>oldest</span><span style="color:#d97706;">- - 70%</span><span style="color:#ef4444;">- - 90%</span><span>newest</span></div>';
+    g += '</div>';
+    gaugeEl.innerHTML = g;
+  }
+
+  // ── Compaction log (clickable rows -> before/after + summary) ──
+  if (compEl) {
+    if (comps.length === 0) {
+      compEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;border:1px solid var(--border-primary);border-radius:10px;">' + t("app.no_compactions_recorded", null, "No compactions recorded") + '' + (_ceSessionId ? ' for this session' : '') + '. Your agent compacts the transcript when the window fills; events appear here as they happen.</div>';
+    } else {
+      var c = '<div style="border:1px solid var(--border-primary);border-radius:10px;overflow:hidden;">';
+      c += '<div style="font-size:12px;font-weight:700;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.5px;padding:12px 14px;border-bottom:1px solid var(--border-primary);">Compaction events <span style="color:var(--text-faint);font-weight:500;text-transform:none;">— click a row to expand</span></div>';
+      comps.forEach(function(cp, idx) {
+        var isOverflow = cp.trigger === 'overflow';
+        var trigColor = isOverflow ? '#ef4444' : '#16a34a';
+        var trigBg = isOverflow ? 'rgba(239,68,68,.12)' : 'rgba(22,163,74,.12)';
+        var reclaimed = Number(cp.reclaimed || 0);
+        c += '<div onclick="_ceToggleCompaction(' + idx + ')" style="cursor:pointer;display:flex;align-items:center;gap:10px;padding:9px 14px;border-bottom:1px solid var(--border-secondary);font-size:12px;">';
+        c += '<span style="font-size:10px;font-weight:700;color:' + trigColor + ';background:' + trigBg + ';border-radius:4px;padding:1px 7px;text-transform:uppercase;">' + escHtml(cp.trigger || 'proactive') + '</span>';
+        c += '<span style="color:var(--text-faint);background:var(--bg-secondary);border-radius:4px;padding:1px 6px;font-size:10px;" title="' + escHtml(cp.session_id || '') + '">' + escHtml(_ceShortSid(cp.session_id)) + '</span>';
+        c += '<span style="flex:1;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escHtml(String(cp.ts || '')) + '</span>';
+        c += '<span style="color:var(--text-primary);white-space:nowrap;">' + _ceFmtTokens(cp.tokens_before) + ' &#8594; ' + _ceFmtTokens(cp.tokens_after) + '</span>';
+        if (reclaimed > 0) c += '<span style="color:#16a34a;font-weight:600;white-space:nowrap;">&#8722;' + _ceFmtTokens(reclaimed) + '</span>';
+        c += '<span style="color:var(--text-faint);">&#9662;</span>';
+        c += '</div>';
+        // Expandable detail.
+        c += '<div id="ce-comp-detail-' + idx + '" style="display:none;padding:12px 16px;background:var(--bg-secondary);border-bottom:1px solid var(--border-secondary);font-size:12px;">';
+        c += '<div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:10px;">';
+        c += '<div><div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;">Tokens before</div><div style="font-size:15px;font-weight:700;color:var(--text-primary);">' + Number(cp.tokens_before || 0).toLocaleString() + '</div></div>';
+        c += '<div><div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;">Tokens after</div><div style="font-size:15px;font-weight:700;color:var(--text-primary);">' + Number(cp.tokens_after || 0).toLocaleString() + '</div></div>';
+        c += '<div><div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;">Reclaimed</div><div style="font-size:15px;font-weight:700;color:#16a34a;">' + reclaimed.toLocaleString() + '</div></div>';
+        c += '<div><div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;">Trigger</div><div style="font-size:13px;font-weight:600;color:' + trigColor + ';">' + escHtml(cp.trigger || 'proactive') + (cp.from_hook ? ' (auto-hook)' : '') + '</div></div>';
+        c += '</div>';
+        if (cp.summary) {
+          c += '<div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;margin-bottom:4px;">Compaction summary</div>';
+          c += '<div style="max-height:160px;overflow:auto;white-space:pre-wrap;color:var(--text-secondary);line-height:1.5;border:1px solid var(--border-secondary);border-radius:6px;padding:8px;background:var(--bg-primary);">' + escHtml(String(cp.summary).slice(0, 4000)) + '</div>';
+        }
+        c += '<div style="margin-top:10px;"><a href="#" onclick="event.stopPropagation();viewTranscript(' + JSON.stringify(cp.session_id) + ');return false;" style="color:#7eb8f7;text-decoration:underline;font-weight:600;">View session transcript &#8594;</a></div>';
+        c += '</div>';
+      });
+      c += '</div>';
+      compEl.innerHTML = c;
+    }
+  }
+
+  // ── Repeatedly-overflow-then-retry flag ──
+  if (ovEl) {
+    if (overflow.length === 0) {
+      ovEl.innerHTML = '';
+    } else {
+      var o = '<div style="border:1px solid rgba(239,68,68,.4);border-radius:10px;overflow:hidden;margin-top:4px;">';
+      o += '<div style="font-size:12px;font-weight:700;color:#ef4444;text-transform:uppercase;letter-spacing:0.5px;padding:12px 14px;border-bottom:1px solid var(--border-secondary);background:rgba(239,68,68,.06);">&#9888; Sessions overflowing then retrying</div>';
+      overflow.forEach(function(os) {
+        o += '<div style="display:flex;align-items:center;gap:10px;padding:9px 14px;border-bottom:1px solid var(--border-secondary);font-size:12px;">';
+        o += '<span style="color:var(--text-faint);background:var(--bg-secondary);border-radius:4px;padding:1px 6px;font-size:10px;" title="' + escHtml(os.session_id || '') + '">' + escHtml(_ceShortSid(os.session_id)) + '</span>';
+        o += '<span style="flex:1;color:var(--text-muted);">' + (os.compaction_count || 0) + ' compactions · ' + (os.overflow_count || 0) + ' overflow</span>';
+        o += '<a href="#" onclick="_ceSelectSession(' + JSON.stringify(os.session_id) + ');return false;" style="color:#7eb8f7;text-decoration:underline;">Scope gauge</a>';
+        o += '<a href="#" onclick="viewTranscript(' + JSON.stringify(os.session_id) + ');return false;" style="color:#7eb8f7;text-decoration:underline;">Transcript &#8594;</a>';
+        o += '</div>';
+      });
+      o += '</div>';
+      ovEl.innerHTML = o;
+    }
+  }
+}
+
+
 function switchTab(name) {
+  // Track the active tab so tab-scoped pollers (Overview loadAll, etc.) only
+  // run on their own screen instead of on every tab.
+  _cmCurrentTab = name;
   // Phase 3: kill any pending SSE-open dwell from the tab we're leaving.
   cancelAllPendingSSEDwell();
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+  // Phase-1 IA refactor (issue #1659): also clear/set .active on left-nav.
+  document.querySelectorAll('.left-nav-item').forEach(function(t) { t.classList.remove('active'); });
   var page = document.getElementById('page-' + name);
   if (page) page.classList.add('active');
+  // Tell the user, on every tab, whether the selected runtime actually scopes
+  // this view (aggregate/node-wide tabs get an honest note; filterable tabs
+  // filter themselves below).
+  try { _cmApplyRuntimeScopeNote(name); } catch (e) {}
   var tabs = document.querySelectorAll('.nav-tab');
   tabs.forEach(function(t) { if (t.getAttribute('onclick') && t.getAttribute('onclick').indexOf("'" + name + "'") !== -1) t.classList.add('active'); });
-  if (!document.querySelector('.nav-tab.active') && typeof event !== 'undefined' && event && event.target) event.target.classList.add('active');
+  var leftItems = document.querySelectorAll('.left-nav-item[data-tab="' + name + '"]');
+  leftItems.forEach(function(t) { t.classList.add('active'); });
+  // Phase A beginner IA: if the selected tab lives inside a collapsed drawer
+  // (Developer / Advanced), reveal that drawer so the active item is visible.
+  // Reveal only - do NOT persist, so the drawer stays collapsed-by-default on
+  // the next visit unless the user opened it themselves.
+  leftItems.forEach(function(t) {
+    var drawer = t.closest('#left-nav-live-list, #left-nav-advanced-list');
+    if (drawer && drawer.hasAttribute('hidden')) {
+      drawer.removeAttribute('hidden');
+      var toggleId = drawer.id === 'left-nav-live-list' ? 'left-nav-live-toggle' : 'left-nav-advanced-toggle';
+      var btn = document.getElementById(toggleId);
+      if (btn) btn.setAttribute('aria-expanded', 'true');
+    }
+  });
+  if (!document.querySelector('.nav-tab.active') && !document.querySelector('.left-nav-item.active') && typeof event !== 'undefined' && event && event.target) event.target.classList.add('active');
+  // Auto-close mobile drawer when a nav item is picked.
+  var leftNav = document.getElementById('left-nav');
+  if (leftNav && leftNav.classList.contains('open')) leftNav.classList.remove('open');
   // Stop cron auto-refresh when leaving crons tab
   if (name !== 'crons' && _cronAutoRefreshTimer) { clearInterval(_cronAutoRefreshTimer); _cronAutoRefreshTimer = null; }
+  if (name === 'inventory') { if (typeof renderInventory === 'function') renderInventory(); }
   if (name === 'overview') loadAll();
-  if (name === 'overview') { if (typeof _velocityPollTimer !== 'undefined' && _velocityPollTimer) clearInterval(_velocityPollTimer); if (typeof loadTokenVelocity === 'function') _velocityPollTimer = visibilitySetInterval(loadTokenVelocity, 30000); }
+  if (name === 'overview') { if (typeof _velocityPollTimer !== 'undefined' && _velocityPollTimer) clearInterval(_velocityPollTimer); if (typeof loadTokenVelocity === 'function') _velocityPollTimer = visibilitySetInterval(function() { if (!_cmIsOverviewTab()) return; loadTokenVelocity(); }, 30000); }
   if (name === 'usage') loadUsage();
+  // Agent Graph (#3315): the original wiring landed in the DEAD first
+  // DASHBOARD_HTML's inline switchTab in dashboard.py, so the loader never
+  // fired and the tab sat on its static "Loading..." forever (founder
+  // report 2026-07-02). The LIVE switchTab is this one.
+  if (name === 'agents') loadAgentGraph();
   if (name === 'skills') loadSkills();
   if (name === 'crons') loadCrons();
   if (name === 'memory') loadMemory();
   if (name === 'transcripts') loadTranscripts();
   if (name === 'version-impact') loadVersionImpact();
   if (name === 'clusters') loadClusters();
-  if (name === 'limits') loadRateLimits();
   if (name === 'flow') initFlow();
   if (name === 'context') loadContextInspector();
-  if (name === 'history') loadHistory();
+  if (name === 'tracing') loadTracing();
+  if (name === 'turn-anatomy') loadTurnAnatomy();
+  if (name === 'tool-catalog') { if (typeof loadToolCatalog === 'function') loadToolCatalog(); }
+  if (name === 'harness') { if (typeof loadHarness === 'function') loadHarness(); }
+  if (name === 'context-economics') { if (typeof loadContextEconomics === 'function') loadContextEconomics(); }
   if (name === 'brain') loadBrainPage();
   if (name === 'selfevolve') loadSelfEvolvePage();
   if (name === 'notifications') { if (typeof loadNotificationsPage === 'function') loadNotificationsPage(); }
   if (name === 'security') { loadSecurityPage(); loadSecurityPosture(); }
+  if (name === 'policy') { if (typeof loadToolPolicy === 'function') loadToolPolicy(); }
   if (name === 'approvals') { if (typeof loadApprovalsTab === 'function') loadApprovalsTab(); }
   if (name === 'alerts') { if (typeof loadAlertsPage === 'function') loadAlertsPage(); }
+  if (name === 'dives') { if (typeof loadDivesPage === 'function') loadDivesPage(); }
   if (name === 'actions') loadQAHistory();
-  if (name === 'logs') {
-    // Phase 3 (#1252): defer the SSE handshake until the user actually
-    // dwells on the Logs tab for ≥2 s. Initial loadLogs() still fires
-    // immediately so the page paints content from cache.
-    if (!logStream || logStream.readyState === EventSource.CLOSED) {
-      dwellOpenSSE('logs', startLogStream);
-    }
-    loadLogs();
-  }
   if (name === 'models') loadModelAttribution();
   if (name === 'nemoclaw') { loadNemoClaw(); _startNcApprovalsAutoRefresh(); }
   if (name !== 'nemoclaw') _stopNcApprovalsAutoRefresh();
-  if (name === 'subagents') { loadSubagents(); if (!_subagentsTimer) _subagentsTimer = visibilitySetInterval(loadSubagents, 5000); }
+  if (name === 'subagents') { loadOrchestration(); loadRunLedger(); loadSubagents(); if (!_subagentsTimer) _subagentsTimer = visibilitySetInterval(function(){ loadOrchestration(); loadRunLedger(); loadSubagents(); }, 5000); }
   if (name !== 'subagents' && _subagentsTimer) { clearInterval(_subagentsTimer); _subagentsTimer = null; }
+  if (name === 'swimlane') { loadSwimlane(); if (!_swimlaneTimer) _swimlaneTimer = visibilitySetInterval(loadSwimlane, 3000); }
+  if (name !== 'swimlane' && _swimlaneTimer) { clearInterval(_swimlaneTimer); _swimlaneTimer = null; }
 }
+
+// ── Left-nav Advanced drawer + mobile toggle (Phase 1 IA refactor #1659) ─
+function toggleAdvancedDrawer() {
+  var btn = document.getElementById('left-nav-advanced-toggle');
+  var list = document.getElementById('left-nav-advanced-list');
+  if (!btn || !list) return;
+  var nowOpen = list.hasAttribute('hidden');
+  if (nowOpen) {
+    list.removeAttribute('hidden');
+    btn.setAttribute('aria-expanded', 'true');
+  } else {
+    list.setAttribute('hidden', '');
+    btn.setAttribute('aria-expanded', 'false');
+  }
+  try { localStorage.setItem('cm_advanced_open', nowOpen ? '1' : '0'); }
+  catch (e) { /* localStorage blocked */ }
+}
+
+function toggleLeftNavMobile() {
+  var leftNav = document.getElementById('left-nav');
+  if (!leftNav) return;
+  leftNav.classList.toggle('open');
+}
+
+// Developer expandable group (Phase A beginner IA, UX_AUDIT.md).
+// Default-collapsed; remembers an explicit user open via localStorage.
+function toggleLiveDrawer() {
+  var btn = document.getElementById('left-nav-live-toggle');
+  var list = document.getElementById('left-nav-live-list');
+  if (!btn || !list) return;
+  var nowOpen = list.hasAttribute('hidden');
+  if (nowOpen) {
+    list.removeAttribute('hidden');
+    btn.setAttribute('aria-expanded', 'true');
+  } else {
+    list.setAttribute('hidden', '');
+    btn.setAttribute('aria-expanded', 'false');
+  }
+  try { localStorage.setItem('cm_live_open', nowOpen ? '1' : '0'); }
+  catch (e) { /* localStorage blocked */ }
+}
+
+// Restore Advanced + Live drawer state on page load.
+(function _restoreNavDrawers() {
+  if (typeof document === 'undefined') return;
+  var apply = function() {
+    // Advanced drawer (default-collapsed).
+    var advBtn = document.getElementById('left-nav-advanced-toggle');
+    var advList = document.getElementById('left-nav-advanced-list');
+    if (advBtn && advList) {
+      var advOpen = false;
+      try { advOpen = localStorage.getItem('cm_advanced_open') === '1'; }
+      catch (e) { /* localStorage blocked */ }
+      if (advOpen) {
+        advList.removeAttribute('hidden');
+        advBtn.setAttribute('aria-expanded', 'true');
+      }
+    }
+    // Developer drawer (Phase A beginner IA, UX_AUDIT.md: default-COLLAPSED so
+    // a first-timer sees seven plain items; re-opens only if the user
+    // explicitly opened it before).
+    var liveBtn = document.getElementById('left-nav-live-toggle');
+    var liveList = document.getElementById('left-nav-live-list');
+    if (liveBtn && liveList) {
+      var liveOpen = false;
+      try {
+        if (localStorage.getItem('cm_live_open') === '1') liveOpen = true;
+      } catch (e) { /* localStorage blocked */ }
+      if (liveOpen) {
+        liveList.removeAttribute('hidden');
+        liveBtn.setAttribute('aria-expanded', 'true');
+      } else {
+        liveList.setAttribute('hidden', '');
+        liveBtn.setAttribute('aria-expanded', 'false');
+      }
+    }
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', apply);
+  } else {
+    apply();
+  }
+})();
 
 function exportUsageData() {
   window.location.href = '/api/usage/export';
@@ -744,6 +1371,151 @@ function _friendlyBytes(n) {
 }
 
 // ── Autonomy: how independently your agent runs ──────────────────────────────
+// Issue #1614 — outcome tile loader. Reads /api/outcomes for the "today"
+// window and renders the 1-line summary (Today: N tasks, X% success, Y
+// escalated, Z failed). Drill-down is lazy-loaded on click. Per memory
+// `feedback_no_em_dashes_in_user_facing_copy.md`, copy uses commas not
+// em-dashes.
+// UI-coverage audit: today's activity counters strip. Reads /api/activity-today
+// (local: cached DuckDB rollup; cloud: cm-cloud-activity serves it from the
+// snapshot's activityToday slice). Hidden until there is any activity today.
+async function loadActivityToday() {
+  var strip = document.getElementById('activity-today-strip');
+  if (!strip) return;
+  var _rt = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+  var _q = (_rt && _rt !== 'all') ? ('?runtime=' + encodeURIComponent(_rt)) : '';
+  var d = {};
+  try { d = await fetchJsonWithTimeout('/api/activity-today' + _q, 4000) || {}; } catch (e) { return; }
+  var tool = d.tool_calls_today || 0, exec = d.exec_calls_today || 0,
+      brow = d.browser_actions_today || 0, msgs = d.messages_today || 0,
+      uniq = d.unique_tools_today || 0;
+  if (!(tool || exec || brow || msgs || uniq)) { strip.style.display = 'none'; return; }
+  var set = function(id, v){ var el = document.getElementById(id); if (el) el.textContent = v; };
+  set('at-tool-calls', tool); set('at-exec-calls', exec); set('at-browser-actions', brow);
+  set('at-messages', msgs); set('at-unique-tools', uniq);
+  strip.style.display = '';
+}
+
+async function loadOutcomeTile() {
+  var summaryEl = document.getElementById('outcome-tile-summary');
+  if (!summaryEl) return;
+  var _ocRt = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+  var _ocQ = (_ocRt && _ocRt !== 'all') ? ('&runtime=' + encodeURIComponent(_ocRt)) : '';
+  try {
+    var d = await fetchJsonWithTimeout('/api/outcomes?window=1d' + _ocQ, 3000);
+    if (!d || d.total === 0) {
+      summaryEl.textContent = t("app.no_completed_tasks_yet_today_outcomes_will_appear_", null, "No completed tasks yet today. Outcomes will appear once sessions finish.");
+      return;
+    }
+    var pct = Math.round((d.success_rate || 0) * 100);
+    var parts = [];
+    parts.push(d.total + ' tasks');
+    parts.push(pct + '% success');
+    if (d.escalated > 0) parts.push(d.escalated + ' needed human');
+    if (d.failed > 0) parts.push(d.failed + ' failed');
+    if (d.ongoing > 0) parts.push(d.ongoing + ' running');
+    summaryEl.innerHTML = parts.map(function(p, i){
+      // First chip = primary, success% gets the colored chip.
+      var color = '';
+      if (i === 1) color = pct >= 80 ? 'color:#22c55e;font-weight:700;' : pct >= 60 ? 'color:#f59e0b;font-weight:700;' : 'color:#ef4444;font-weight:700;';
+      return '<span style="' + color + '">' + p + '</span>';
+    }).join('  ·  ');
+  } catch (e) {
+    summaryEl.textContent = t("app.task_outcomes_unavailable_right_now", null, "Task outcomes unavailable right now.");
+  }
+}
+
+// Drill-down: lazy-load failed + escalated lists when the user clicks the tile.
+async function toggleOutcomeDrilldown() {
+  var dd = document.getElementById('outcome-drilldown');
+  var chev = document.getElementById('outcome-tile-chevron');
+  if (!dd) return;
+  if (dd.style.display !== 'none') {
+    dd.style.display = 'none';
+    if (chev) chev.textContent = t("app.show_details", null, "show details");
+    return;
+  }
+  dd.style.display = 'block';
+  if (chev) chev.textContent = t("app.hide_details", null, "hide details");
+  var body = document.getElementById('outcome-drilldown-body');
+  if (!body) return;
+  body.textContent = t("app.loading", null, "Loading...");
+  try {
+    var failed = await fetchJsonWithTimeout('/api/outcomes/sessions?outcome=failed&window=1d&limit=10', 3000).catch(function(){return {sessions:[]};});
+    var esc    = await fetchJsonWithTimeout('/api/outcomes/sessions?outcome=escalated&window=1d&limit=10', 3000).catch(function(){return {sessions:[]};});
+    function row(s) {
+      var title = s.title || s.session_id || 'untitled';
+      var when = s.last_active_at ? (s.last_active_at.slice(11, 16)) : '';
+      return '<div style="padding:4px 0;border-bottom:1px dashed var(--border-secondary);"><span style="color:var(--text-primary);">' + escapeHtml(title) + '</span> <span style="color:var(--text-muted);font-size:11px;">' + when + '</span></div>';
+    }
+    var html = '';
+    if ((failed.sessions || []).length === 0 && (esc.sessions || []).length === 0) {
+      html = '<div style="color:var(--text-muted);">Nothing flagged today. Everything ran clean.</div>';
+    } else {
+      if ((failed.sessions || []).length > 0) {
+        html += '<div style="font-weight:700;color:#ef4444;margin-bottom:4px;">Failed (' + failed.sessions.length + ')</div>';
+        html += failed.sessions.map(row).join('');
+      }
+      if ((esc.sessions || []).length > 0) {
+        html += '<div style="font-weight:700;color:#f59e0b;margin:8px 0 4px;">Needed a human (' + esc.sessions.length + ')</div>';
+        html += esc.sessions.map(row).join('');
+      }
+    }
+    body.innerHTML = html;
+  } catch (e) {
+    body.textContent = t("app.could_not_load_drill_down", null, "Could not load drill-down.");
+  }
+}
+
+// Fills the Overview RELIABILITY stat card (#reliability-direction-lt /
+// -detail-lt / -icon-lt). This function used to be CALLED in loadAll() but was
+// NEVER DEFINED, so the card stayed a dangling "--" forever. /api/reliability
+// returns a behavioral-trend object; on a fresh node with no history it returns
+// {"direction":"insufficient_data", ...} — in that case we show an HONEST
+// "No data yet" empty state, never a bare "--" that reads as broken.
+async function loadReliabilityCard() {
+  var dirEl = document.getElementById('reliability-direction-lt');
+  var detEl = document.getElementById('reliability-detail-lt');
+  var iconEl = document.getElementById('reliability-icon-lt');
+  if (!dirEl) return;
+  try {
+    var d = await fetchJsonWithTimeout('/api/reliability', 5000);
+    d = d || {};
+    var dir = d.direction || 'insufficient_data';
+    var sessionCount = Number(d.session_count || 0);
+    // No usable history yet (this node's case): honest empty state.
+    if (dir === 'insufficient_data' || d.error || sessionCount <= 0) {
+      dirEl.textContent = t('overview.reliability_no_data', null, 'No data yet');
+      if (detEl) detEl.textContent = '';
+      if (iconEl) iconEl.textContent = '🔄';
+      return;
+    }
+    // Map the trend direction to a short word + neutral/positive/negative icon.
+    var word, icon;
+    if (dir === 'improving') { word = t('overview.reliability_improving', null, 'Improving'); icon = '📈'; }
+    else if (dir === 'degrading') { word = t('overview.reliability_degrading', null, 'Degrading'); icon = '📉'; }
+    else { word = t('overview.reliability_stable', null, 'Stable'); icon = '🔄'; }
+    dirEl.textContent = word;
+    if (iconEl) iconEl.textContent = icon;
+    if (detEl) {
+      // Sub-text: success rate over the window, when present.
+      var sr = Number(d.success_rate);
+      if (isFinite(sr) && sr > 0) {
+        detEl.textContent = Math.round(sr * 100) + '% ' + t('overview.reliability_success', null, 'success');
+      } else {
+        detEl.textContent = '';
+      }
+    }
+  } catch (e) {
+    // Never throw out of a stat-card loader; show the honest empty state.
+    try {
+      dirEl.textContent = t('overview.reliability_no_data', null, 'No data yet');
+      if (detEl) detEl.textContent = '';
+      if (iconEl) iconEl.textContent = '🔄';
+    } catch (e2) {}
+  }
+}
+
 async function loadAutonomy() {
   var labelEl = document.getElementById('autonomy-score-label');
   var badgeEl = document.getElementById('autonomy-trend-badge');
@@ -766,9 +1538,9 @@ async function loadAutonomy() {
       : fetch('/api/autonomy').then(function(r){return r.json();}));
 
     if (d.score == null) {
-      labelEl.textContent = 'Just getting started';
+      labelEl.textContent = t("app.just_getting_started", null, "Just getting started");
       labelEl.style.color = 'var(--text-muted)';
-      if (gapEl) gapEl.textContent = 'Use your agent a bit and we\u2019ll show how independent it\u2019s becoming.';
+      if (gapEl) gapEl.textContent = t("app.use_your_agent_a_bit", null, "Use your agent a bit and we\u2019ll show how independent it\u2019s becoming.");
       if (badgeEl) { badgeEl.textContent = ''; badgeEl.style.background = ''; badgeEl.style.border = ''; }
       if (trendEl) trendEl.textContent = '';
       if (sampEl) sampEl.textContent = '';
@@ -780,7 +1552,7 @@ async function loadAutonomy() {
     labelEl.style.color = lbl.color;
 
     if (gapEl && d.median_gap_seconds_7d != null) {
-      gapEl.textContent = 'You check in about every ' + _friendlyDuration(d.median_gap_seconds_7d) + '.';
+      gapEl.textContent = t("app.you_check_in_about_every", null, "You check in about every ") + _friendlyDuration(d.median_gap_seconds_7d) + '.';
     } else if (gapEl) {
       gapEl.textContent = '';
     }
@@ -841,7 +1613,7 @@ async function loadAutonomy() {
         });
         svgEl.innerHTML = svgContent;
       } else {
-        svgEl.innerHTML = '<text x="80" y="28" text-anchor="middle" fill="var(--text-muted)" font-size="10">Not enough data yet</text>';
+        svgEl.innerHTML = '<text x="80" y="28" text-anchor="middle" fill="var(--text-muted)" font-size="10">' + t("app.not_enough_data_yet", null, "Not enough data yet") + '</text>';
       }
     }
   } catch(e) {
@@ -908,13 +1680,13 @@ async function loadHeartbeat() {
 
     if (lastBeat) {
       if (status === 'never') {
-        lastBeat.textContent = 'not yet';
+        lastBeat.textContent = t("app.not_yet", null, "not yet");
         lastBeat.style.color = '#9ca3af';
       } else if (d.last_heartbeat_age_seconds !== null && d.last_heartbeat_age_seconds !== undefined) {
         lastBeat.textContent = _friendlyAgo(d.last_heartbeat_age_seconds);
         lastBeat.style.color = colors[status] || '#9ca3af';
       } else {
-        lastBeat.textContent = 'not yet';
+        lastBeat.textContent = t("app.not_yet", null, "not yet");
         lastBeat.style.color = '#9ca3af';
       }
     }
@@ -924,9 +1696,9 @@ async function loadHeartbeat() {
       if (c.expected_beats === 0) {
         cadenceEl.textContent = '';
       } else if (c.actual_beats === 0) {
-        cadenceEl.textContent = 'Expected ' + c.expected_beats + ' check-ins today, got none yet';
+        cadenceEl.textContent = t("app.expected", null, "Expected ") + c.expected_beats + ' check-ins today, got none yet';
       } else {
-        cadenceEl.textContent = 'Checked in ' + c.actual_beats + ' of ' + c.expected_beats + ' expected today';
+        cadenceEl.textContent = t("app.checked_in", null, "Checked in ") + c.actual_beats + ' of ' + c.expected_beats + ' expected today';
       }
     }
 
@@ -949,7 +1721,7 @@ async function loadHeartbeat() {
         return '<span title="' + title + '" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:' + cc + ';"></span>';
       }).join('');
     } else if (sparkEl) {
-      sparkEl.innerHTML = '<span style="font-size:11px;color:var(--text-muted);">none yet</span>';
+      sparkEl.innerHTML = '<span style="font-size:11px;color:var(--text-muted);">' + t("app.none_yet", null, "none yet") + '</span>';
     }
   } catch(e) { console.warn('heartbeat panel load failed', e); }
 }
@@ -982,12 +1754,25 @@ function _escapeHtml(s) {
                   .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-// Render markdown to HTML if marked is available, otherwise escaped <pre>.
-function _renderMarkdown(text) {
-  if (typeof marked !== 'undefined' && marked.parse) {
-    try { return marked.parse(text || ''); } catch (_) {}
+// Sanitize markdown -> HTML that is safe to assign to innerHTML.
+// marked does NOT sanitize: any raw HTML in the source (agent output, tool
+// args, exec commands, inbound chat-channel messages) passes through verbatim,
+// so its output MUST go through DOMPurify before touching the DOM. This is the
+// ONLY sanctioned path from transcript text to innerHTML — never feed marked
+// output straight into the DOM. Falls back to an escaped <pre> when either lib
+// is missing (so it degrades safe, never to raw HTML).
+function cmSafeMarkdown(text) {
+  var src = text || '';
+  if (typeof marked !== 'undefined' && marked.parse &&
+      typeof DOMPurify !== 'undefined' && DOMPurify.sanitize) {
+    try { return DOMPurify.sanitize(marked.parse(src)); } catch (_) {}
   }
-  return '<pre style="white-space:pre-wrap;font-family:inherit;margin:0;">' + _escapeHtml(text || '') + '</pre>';
+  return '<pre style="white-space:pre-wrap;font-family:inherit;margin:0;">' + _escapeHtml(src) + '</pre>';
+}
+
+// Render markdown to HTML (sanitized) if available, otherwise escaped <pre>.
+function _renderMarkdown(text) {
+  return cmSafeMarkdown(text);
 }
 
 // Tracked file metadata (for history + sensitive flag) — populated from
@@ -1016,7 +1801,7 @@ function _folderIconSvg() {
 async function loadSelfConfig() {
   var inner = document.getElementById('selfconfig-files-inner');
   if (!inner) return;
-  inner.innerHTML = '<span style="color:var(--text-muted);font-size:12px;padding:6px;">Loading\u2026</span>';
+  inner.innerHTML = '<span style="color:var(--text-muted);font-size:12px;padding:6px;">' + t("app.loading_2", null, "Loading\u2026") + '</span>';
   try {
     // Fetch tracked-file metadata (for sensitive/history flags) and the
     // real filesystem listing in parallel.
@@ -1033,7 +1818,7 @@ async function loadSelfConfig() {
     tracked.forEach(function(t) { _selfconfigTrackedMeta[t.name] = t; });
 
     if (!realFiles.length) {
-      inner.innerHTML = '<span style="color:var(--text-muted);font-size:12px;padding:6px;">No markdown files yet.</span>';
+      inner.innerHTML = '<span style="color:var(--text-muted);font-size:12px;padding:6px;">' + t("app.no_markdown_files_yet", null, "No markdown files yet.") + '</span>';
       return;
     }
 
@@ -1082,7 +1867,7 @@ async function loadSelfConfig() {
       selfconfigOpenFile(_selfconfigCurrentFile, _selfconfigSelectedTs);
     }
   } catch(e) {
-    inner.innerHTML = '<span style="color:var(--text-muted);font-size:12px;padding:6px;">Couldn\u2019t load right now.</span>';
+    inner.innerHTML = '<span style="color:var(--text-muted);font-size:12px;padding:6px;">' + t("app.couldnt_load_right_now", null, "Couldn\u2019t load right now.") + '</span>';
   }
 }
 
@@ -1155,14 +1940,14 @@ async function _selfconfigRenderTimeline(filename) {
   if (!wrap || !list) return;
   wrap.style.display = 'block';
   if (heading) heading.textContent = 'History \u00B7 ' + filename;
-  list.innerHTML = '<span style="color:var(--text-muted);font-size:12px;padding:6px;">Loading...</span>';
+  list.innerHTML = '<span style="color:var(--text-muted);font-size:12px;padding:6px;">' + t("app.loading", null, "Loading...") + '</span>';
   try {
     var d = await (typeof fetchJsonWithTimeout === 'function'
       ? fetchJsonWithTimeout('/api/selfconfig/' + encodeURIComponent(filename), 5000)
       : fetch('/api/selfconfig/' + encodeURIComponent(filename)).then(function(r){return r.json();}));
     _selfconfigRevisions = d.revisions || [];
     if (!_selfconfigRevisions.length) {
-      list.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:8px 6px;">No changes yet. When your agent updates this, it\u2019ll show up here.</div>';
+      list.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:8px 6px;">' + t("app.no_changes_yet", null, "No changes yet. When your agent updates this, it\u2019ll show up here.") + '</div>';
       return;
     }
     // Pre-fetch summaries for each adjacent pair in the background (non-blocking).
@@ -1181,7 +1966,7 @@ async function _selfconfigRenderTimeline(filename) {
     });
     _renderTimelineRows(filename);
   } catch(e) {
-    list.innerHTML = '<span style="color:var(--text-muted);font-size:12px;padding:6px;">Couldn\u2019t load.</span>';
+    list.innerHTML = '<span style="color:var(--text-muted);font-size:12px;padding:6px;">' + t("app.couldnt_load", null, "Couldn\u2019t load.") + '</span>';
   }
 }
 
@@ -1252,7 +2037,7 @@ async function _selfconfigRenderReader(filename, ts) {
 
   if (titleEl) titleEl.textContent = filename;
   if (badgeEl) badgeEl.style.display = (meta && meta.is_values_file) ? 'inline-block' : 'none';
-  if (bodyEl) bodyEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:0;">Loading\u2026</div>';
+  if (bodyEl) bodyEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:0;">' + t("app.loading_2", null, "Loading\u2026") + '</div>';
 
   // Edit toolbar is available for live files (any, tracked or not). Past
   // versions are only reachable for tracked files — they remain read-only.
@@ -1263,7 +2048,7 @@ async function _selfconfigRenderReader(filename, ts) {
       bannerEl.style.display = 'none';
     } else {
       bannerEl.style.display = 'flex';
-      if (bannerText) bannerText.textContent = 'Viewing the version from ' + _friendlyTimestamp(ts);
+      if (bannerText) bannerText.textContent = t("app.viewing_the_version_from", null, "Viewing the version from ") + _friendlyTimestamp(ts);
     }
   }
 
@@ -1291,9 +2076,9 @@ async function _selfconfigRenderReader(filename, ts) {
     }
     if (bodyEl) {
       if (!d.exists && ts == null) {
-        bodyEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:0;">This file hasn\u2019t been created yet. Click <strong>Edit</strong> above to write the first version.</div>';
+        bodyEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:0;">This file hasn\u2019t been created yet. Click <strong>' + t("app.edit", null, "Edit") + '</strong> above to write the first version.</div>';
       } else if (!d.content || !d.content.trim()) {
-        bodyEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:0;">This file is empty.</div>';
+        bodyEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:0;">' + t("app.this_file_is_empty", null, "This file is empty.") + '</div>';
       } else {
         // Show raw markdown source, not rendered HTML — these files ARE the
         // agent's source-of-truth and editing them has agent-behaviour
@@ -1305,7 +2090,7 @@ async function _selfconfigRenderReader(filename, ts) {
     }
     _selfconfigUpdateStatusBar(filename, ts, d);
   } catch(e) {
-    if (bodyEl) bodyEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:0;">Couldn\u2019t load this version.</div>';
+    if (bodyEl) bodyEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:0;">' + t("app.couldnt_load_this_version", null, "Couldn\u2019t load this version.") + '</div>';
   }
 }
 
@@ -1325,8 +2110,8 @@ function _selfconfigUpdateStatusBar(filename, ts, d) {
     sizeEl.textContent = lines + ' line' + (lines === 1 ? '' : 's') + ' \u00B7 ' + _friendlyBytes(bytes);
   }
   if (updatedEl) {
-    if (ts != null) updatedEl.textContent = 'Viewing ' + _friendlyTimestamp(ts);
-    else if (d && d.ts) updatedEl.textContent = 'Updated ' + _friendlyTimestamp(d.ts);
+    if (ts != null) updatedEl.textContent = t("app.viewing", null, "Viewing ") + _friendlyTimestamp(ts);
+    else if (d && d.ts) updatedEl.textContent = t("app.updated", null, "Updated ") + _friendlyTimestamp(d.ts);
     else updatedEl.textContent = '';
   }
 }
@@ -1389,7 +2174,7 @@ function selfconfigSyncGutterScroll() {
 function selfconfigDiscardEdit() {
   var textarea = document.getElementById('selfconfig-editor-textarea');
   if (textarea && textarea.value !== _selfconfigOriginal) {
-    if (!confirm('Discard unsaved changes?')) return;
+    if (!confirm(t("app.discard_unsaved_changes", null, "Discard unsaved changes?"))) return;
   }
   selfconfigSetMode('preview');
 }
@@ -1435,7 +2220,7 @@ async function selfconfigSave() {
 
 async function selfconfigRestoreVersion() {
   if (_selfconfigSelectedTs == null || !_selfconfigCurrentFile) return;
-  if (!confirm('Restore this version? The current content will be replaced (but saved as a new version in history).')) return;
+  if (!confirm(t("app.restore_this_version_the_current_content_will_be_r", null, "Restore this version? The current content will be replaced (but saved as a new version in history)."))) return;
   try {
     // Fetch the historical version's content, then save it as the live file.
     var url = '/api/selfconfig/' + encodeURIComponent(_selfconfigCurrentFile) + '/content?ts=' + _selfconfigSelectedTs;
@@ -1478,16 +2263,11 @@ async function loadSkills() {
   var summaryEl = document.getElementById('skills-summary-row');
   var listEl = document.getElementById('skills-list');
   if (!summaryEl || !listEl) return;
-  // Cloud iframes don't have access to the local skills filesystem — the
-  // cloud server returns 410 Gone for /api/skills, which the browser logs
-  // as a console error every time the user opens the Skills tab. Render
-  // an inline empty-state instead so the network call never fires.
-  if (window.CLOUD_MODE) {
-    listEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;">Skills inspector is local-only. Open the dashboard on the host running OpenClaw to view installed skills.</div>';
-    summaryEl.innerHTML = '';
-    return;
-  }
-  listEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;">Loading...</div>';
+  // Cloud serves skills from the encrypted snapshot via the cm-cloud-skills
+  // interceptor (the daemon ships snapshot.skills). When the snapshot is cold
+  // the route is oss-passthrough and returns an empty list (graceful), so the
+  // fetch is safe in cloud too — no more "local-only" dead end.
+  listEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;">' + t("app.loading", null, "Loading...") + '</div>';
   try {
     var data = await fetch('/api/skills').then(function(r) { return r.json(); });
     var skills = data.skills || [];
@@ -1504,16 +2284,26 @@ async function loadSkills() {
         + '</div>';
     }
 
+    // QW9: the verdict comes from the rows. Green "all good" only when every
+    // installed skill has at least one use; never-used skills get a neutral
+    // gray verdict instead of a contradictory green check.
+    var unusedCount = skills.filter(function(s) { return s && s.status === 'unused'; }).length;
+    var verdictCard = '';
+    if (dead === 0 && stuck === 0 && installed > 0) {
+      verdictCard = unusedCount > 0
+        ? card(t('skills.never_used_title', null, 'Never used yet'), unusedCount, '#94a3b8',
+               t('skills.never_used_verdict', { n: unusedCount }, unusedCount + ' skill(s) installed, never used yet.'))
+        : card(t('skills.all_good', null, 'All good'), '\u2713', '#22c55e',
+               t('skills.all_good_sub', null, 'every skill is being used'));
+    }
     summaryEl.innerHTML =
       card('Installed', installed, 'var(--text-primary)') +
       (dead   > 0 ? card('Safe to remove', dead,  '#ef4444', 'never used') : '') +
       (stuck  > 0 ? card('Not working',    stuck, '#f59e0b', 'broken or misdescribed') : '') +
-      (dead === 0 && stuck === 0 && installed > 0
-        ? card('All good', '\u2713', '#22c55e', 'every skill is being used')
-        : '');
+      verdictCard;
 
     if (skills.length === 0) {
-      listEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;">Nothing installed yet. Skills let your agent handle specific tasks \u2014 add some to get started.</div>';
+      listEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;">' + t("app.nothing_installed_yet_skills", null, "Nothing installed yet. Skills let your agent handle specific tasks \u2014 add some to get started.") + '</div>';
       return;
     }
 
@@ -1563,7 +2353,7 @@ async function loadSkills() {
     html += '</tbody></table>';
     listEl.innerHTML = html;
   } catch (e) {
-    if (listEl) listEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;">Couldn\u2019t load right now.</div>';
+    if (listEl) listEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;">' + t("app.couldnt_load_right_now", null, "Couldn\u2019t load right now.") + '</div>';
   }
 }
 
@@ -1577,8 +2367,8 @@ async function openSkillBrowser(skillName) {
 
   listEl.style.display = 'none';
   browserEl.style.display = '';
-  treeEl.innerHTML = '<div style="padding:12px;color:var(--text-muted);">Loading...</div>';
-  contentEl.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:60px;">Loading skill...</div>';
+  treeEl.innerHTML = '<div style="padding:12px;color:var(--text-muted);">' + t("app.loading", null, "Loading...") + '</div>';
+  contentEl.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:60px;">' + t("app.loading_skill", null, "Loading skill...") + '</div>';
 
   try {
     var data = await fetch('/api/skills/' + encodeURIComponent(skillName)).then(function(r) { return r.json(); });
@@ -1615,7 +2405,7 @@ async function openSkillBrowser(skillName) {
 async function loadSkillFile(skillName, filePath) {
   var contentEl = document.getElementById('skills-browser-content');
   if (!contentEl) return;
-  contentEl.innerHTML = '<div style="color:var(--text-muted);padding:20px;">Loading...</div>';
+  contentEl.innerHTML = '<div style="color:var(--text-muted);padding:20px;">' + t("app.loading", null, "Loading...") + '</div>';
 
   try {
     var data = await fetch('/api/skills/' + encodeURIComponent(skillName) + '/file?path=' + encodeURIComponent(filePath)).then(function(r) { return r.json(); });
@@ -1880,11 +2670,494 @@ function renderOauthBanner(overview) {
   }
 }
 
-async function loadAll() {
+// Per-runtime sparkline of recent runs (#2196 item #4). Hides the card
+// when no runtime has dots, so a clean install never shows an empty box.
+async function loadHealthTimeline() {
+  var card = document.getElementById('health-timeline-card');
+  var body = document.getElementById('health-timeline-body');
+  if (!card || !body) return;
+  var data;
   try {
+    var resp = await fetch('/api/health-timeline');
+    if (!resp.ok) { card.style.display = 'none'; return; }
+    data = await resp.json();
+  } catch (e) { card.style.display = 'none'; return; }
+  var runtimes = (data && data.runtimes) || [];
+  if (!runtimes.length || !runtimes.some(function(r){ return (r.dots||[]).length; })) {
+    card.style.display = 'none';
+    return;
+  }
+  var sevColor = {
+    red:    'var(--err, #ef4444)',
+    yellow: 'var(--warn, #eab308)',
+    green:  'var(--ok, #22c55e)'
+  };
+  var html = '';
+  runtimes.forEach(function (r) {
+    var dots = r.dots || [];
+    if (!dots.length) return;
+    var dotsHtml = dots.map(function (d) {
+      var bits = [];
+      if (d.error_count) bits.push(d.error_count + ' err');
+      if (d.flag_count)  bits.push(d.flag_count + ' flag');
+      if (d.cost_usd)    bits.push('$' + (d.cost_usd < 0.01 ? d.cost_usd.toFixed(4) : d.cost_usd.toFixed(2)));
+      var when = d.started_at ? new Date(d.started_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '?';
+      var tip = when + (bits.length ? ' · ' + bits.join(' · ') : ' · ok');
+      var fill = sevColor[d.severity] || sevColor.green;
+      return '<span title="' + tip.replace(/"/g,'&quot;') + '" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:' + fill + ';margin-right:3px;"></span>';
+    }).join('');
+    var summary = dots.length + ' runs';
+    var reds = dots.filter(function (d) { return d.severity === 'red'; }).length;
+    if (reds) summary += ', ' + reds + ' err';
+    html += '<div style="display:grid;grid-template-columns:140px 1fr auto;align-items:center;gap:10px;padding:4px 0;">'
+         +    '<div style="font-size:12px;color:var(--text-primary);font-weight:600;">' + escapeHtmlSafe(r.runtime) + '</div>'
+         +    '<div style="line-height:1;">' + dotsHtml + '</div>'
+         +    '<div style="font-size:11px;color:var(--text-muted);">' + summary + '</div>'
+         +  '</div>';
+  });
+  body.innerHTML = html;
+  card.style.display = '';
+}
+
+// Minimal HTML escape for the runtime label; the rest of the values are
+// hand-built from numbers/timestamps so they're safe without escaping.
+function escapeHtmlSafe(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// ── Per-run compare modal (#2196 item #2) ───────────────────────────────────
+
+function _cmCompareFmt(key, v) {
+  if (v == null) return '—';
+  if (key === 'cost_usd') return '$' + (v < 0.01 ? v.toFixed(4) : v.toFixed(2));
+  if (key === 'cache_hit_rate') return Math.round(v * 100) + '%';
+  if (key === 'eval_score') return Number(v).toFixed(2) + ' / 5';
+  if (key === 'max_tool_result_bytes') return v < 1024 ? v + ' B' : v < 1048576 ? (v / 1024).toFixed(1) + ' KB' : (v / 1048576).toFixed(1) + ' MB';
+  if (typeof v === 'number' && Math.abs(v) >= 1000) return v.toLocaleString();
+  return String(v);
+}
+
+// Outcome label -> plain-language chip (color + words). Mirrors the
+// classifier's vocabulary; failure-ish labels are red, success green.
+function _cmOutcomeChip(outcome) {
+  if (!outcome) return '<span style="color:var(--text-muted);">—</span>';
+  var map = {
+    success:         { label: 'Succeeded',  color: 'var(--ok, #22c55e)' },
+    escalated:       { label: 'Escalated',  color: 'var(--warn, #eab308)' },
+    ongoing:         { label: 'Ongoing',    color: 'var(--text-muted)' },
+    failed:          { label: 'Failed',     color: 'var(--err, #ef4444)' },
+    tool_call_stuck: { label: 'Tool stuck', color: 'var(--err, #ef4444)' },
+    cognitive_loop:  { label: 'Stuck in a loop', color: 'var(--err, #ef4444)' },
+  };
+  var m = map[outcome] || { label: outcome, color: 'var(--text-muted)' };
+  return '<span style="display:inline-block;padding:1px 7px;border-radius:9px;font-size:11px;font-weight:600;'
+       + 'background:color-mix(in srgb, ' + m.color + ' 16%, transparent);color:' + m.color + ';">'
+       + escapeHtmlSafe(m.label) + '</span>';
+}
+
+// Verdict for the outcome row: improved / regressed / same. Plain words.
+function _cmOutcomeVerdict(verdict) {
+  if (!verdict) return '';
+  var map = {
+    improved:  { label: 'better',  color: 'var(--ok, #22c55e)' },
+    regressed: { label: 'worse',   color: 'var(--err, #ef4444)' },
+    same:      { label: 'same',    color: 'var(--text-muted)' },
+  };
+  var m = map[verdict];
+  if (!m) return '';
+  return ' <span style="color:' + m.color + ';font-size:11px;font-weight:600;">' + m.label + '</span>';
+}
+
+function _cmCompareDelta(key, d) {
+  if (!d) return '';
+  var color = d.favorable ? 'var(--ok, #22c55e)' : 'var(--err, #ef4444)';
+  if (d.abs === 0 || d.abs === 0.0) color = 'var(--text-muted)';
+  var sign = d.abs > 0 ? '+' : '';
+  var pct = d.pct == null ? '' : ' (' + (d.pct > 0 ? '+' : '') + d.pct.toFixed(1) + '%)';
+  return ' <span style="color:' + color + ';font-size:11px;font-weight:600;">' + sign + _cmCompareFmt(key, d.abs) + pct + '</span>';
+}
+
+async function submitCompare() {
+  var a = (document.getElementById('compare-input-a').value || '').trim();
+  var b = (document.getElementById('compare-input-b').value || '').trim();
+  var body = document.getElementById('compare-runs-body');
+  if (!a || !b) { body.innerHTML = '<div style="color:var(--err);font-size:12px;">' + t("app.both_session_ids_are_required", null, "Both session ids are required.") + '</div>'; return; }
+  body.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">' + t("app.loading_2", null, "Loading…") + '</div>';
+  var resp;
+  try {
+    resp = await fetch('/api/run-compare?a=' + encodeURIComponent(a) + '&b=' + encodeURIComponent(b));
+  } catch (e) { body.innerHTML = '<div style="color:var(--err);font-size:12px;">' + t("app.network_error", null, "Network error") + ': ' + escapeHtmlSafe(e.message) + '</div>'; return; }
+  if (!resp.ok) {
+    var msg = 'Request failed (' + resp.status + ')';
+    try { var err = await resp.json(); if (err && err.error) msg = err.error; } catch (e) {}
+    body.innerHTML = '<div style="color:var(--err);font-size:12px;">' + escapeHtmlSafe(msg) + '</div>';
+    return;
+  }
+  var data = await resp.json();
+  renderCompareResult(data);
+}
+
+function renderCompareResult(data) {
+  var body = document.getElementById('compare-runs-body');
+  if (!data || !data.a || !data.b) { body.innerHTML = '<div style="color:var(--text-muted);">' + t("app.no_data", null, "No data.") + '</div>'; return; }
+  var rows = [
+    ['cost_usd', 'Cost'],
+    ['total_tokens', 'Tokens'],
+    ['step_count', 'Steps'],
+    ['max_event_token_count', 'Max context'],
+    ['max_tool_result_bytes', 'Max tool result'],
+    ['cache_hit_rate', 'Cache hit'],
+    ['error_count', 'Errors'],
+    ['flag_count', 'Waste flags'],
+  ];
+  var sevColor = { red: 'var(--err, #ef4444)', yellow: 'var(--warn, #eab308)', green: 'var(--ok, #22c55e)' };
+  var header = function (s) {
+    var sev = sevColor[s.severity] || sevColor.green;
+    return '<div style="font-family:monospace;font-size:11px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;">' + escapeHtmlSafe(s.session_id) + '</div>'
+         + '<div style="font-size:11px;color:var(--text-muted);">' + escapeHtmlSafe(s.runtime || '') + ' · <span style="color:' + sev + ';font-weight:600;">' + escapeHtmlSafe(s.severity || '') + '</span></div>';
+  };
+  var html = '<div style="display:grid;grid-template-columns:160px 1fr 1fr;gap:10px;font-size:12px;">'
+           + '<div></div><div>' + header(data.a) + '</div><div>' + header(data.b) + '</div>';
+  rows.forEach(function (kv) {
+    var key = kv[0], label = kv[1];
+    var va = data.a[key], vb = data.b[key];
+    var d = (data.deltas || {})[key];
+    html += '<div style="color:var(--text-muted);padding:4px 0;border-top:1px solid var(--border-primary);">' + label + '</div>'
+         +  '<div style="padding:4px 0;border-top:1px solid var(--border-primary);">' + escapeHtmlSafe(_cmCompareFmt(key, va)) + '</div>'
+         +  '<div style="padding:4px 0;border-top:1px solid var(--border-primary);">' + escapeHtmlSafe(_cmCompareFmt(key, vb)) + _cmCompareDelta(key, d) + '</div>';
+  });
+
+  // ── Quality rows (eval->monitor loop) ──────────────────────────────────
+  // Only render when at least one side has a quality signal, so older runs
+  // (never scored / classified) don't show two empty dashes.
+  var hasEval = data.a.eval_score != null || data.b.eval_score != null;
+  var hasOutcome = !!(data.a.outcome || data.b.outcome);
+  if (hasEval || hasOutcome) {
+    if (hasEval) {
+      var ed = (data.deltas || {})['eval_score'];
+      html += '<div style="color:var(--text-muted);padding:4px 0;border-top:1px solid var(--border-primary);">'
+            + t("app.compare_quality_score", null, "Quality score") + '</div>'
+            + '<div style="padding:4px 0;border-top:1px solid var(--border-primary);">' + escapeHtmlSafe(_cmCompareFmt('eval_score', data.a.eval_score)) + '</div>'
+            + '<div style="padding:4px 0;border-top:1px solid var(--border-primary);">' + escapeHtmlSafe(_cmCompareFmt('eval_score', data.b.eval_score)) + _cmCompareDelta('eval_score', ed) + '</div>';
+    }
+    if (hasOutcome) {
+      html += '<div style="color:var(--text-muted);padding:4px 0;border-top:1px solid var(--border-primary);">'
+            + t("app.compare_outcome", null, "Outcome") + '</div>'
+            + '<div style="padding:4px 0;border-top:1px solid var(--border-primary);">' + _cmOutcomeChip(data.a.outcome) + '</div>'
+            + '<div style="padding:4px 0;border-top:1px solid var(--border-primary);">' + _cmOutcomeChip(data.b.outcome) + _cmOutcomeVerdict(data.outcome_verdict) + '</div>';
+    }
+  }
+
+  html += '</div>';
+  body.innerHTML = html;
+}
+
+// ── Error triage (#2196 item #5) ────────────────────────────────────────────
+
+async function loadTriageList() {
+  var body = document.getElementById('triage-list-body');
+  if (!body) return;
+  var data;
+  try {
+    var resp = await fetch('/api/error-triage/resolved');
+    if (!resp.ok) { body.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">' + t("app.triage_unavailable", null, "Triage unavailable.") + '</div>'; return; }
+    data = await resp.json();
+  } catch (e) { body.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">' + t("app.triage_offline", null, "Triage offline.") + '</div>'; return; }
+  var resolved = (data && data.resolved) || {};
+  var keys = Object.keys(resolved);
+  if (!keys.length) { body.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">' + t("app.nothing_resolved_yet_paste_an_event_id_above_to_mu", null, "Nothing resolved yet. Paste an event id above to mute a known error.") + '</div>'; return; }
+  // Sort most-recent-first by resolved_at.
+  keys.sort(function (a, b) { return (resolved[b].resolved_at || 0) - (resolved[a].resolved_at || 0); });
+  var html = '<div style="display:grid;grid-template-columns:1fr 2fr auto auto;gap:8px;font-size:12px;">'
+           + '<div style="color:var(--text-muted);font-weight:600;">Event id</div>'
+           + '<div style="color:var(--text-muted);font-weight:600;">Note</div>'
+           + '<div style="color:var(--text-muted);font-weight:600;">When</div>'
+           + '<div></div>';
+  keys.forEach(function (k) {
+    var r = resolved[k];
+    var when = r.resolved_at ? new Date(r.resolved_at).toLocaleString() : '?';
+    html += '<div style="font-family:monospace;overflow:hidden;text-overflow:ellipsis;border-top:1px solid var(--border-primary);padding:4px 0;">' + escapeHtmlSafe(k) + '</div>'
+         +  '<div style="border-top:1px solid var(--border-primary);padding:4px 0;color:var(--text-muted);">' + escapeHtmlSafe(r.note || '—') + '</div>'
+         +  '<div style="border-top:1px solid var(--border-primary);padding:4px 0;color:var(--text-muted);font-size:11px;">' + escapeHtmlSafe(when) + '</div>'
+         +  '<div style="border-top:1px solid var(--border-primary);padding:4px 0;"><button onclick="unresolveError(\'' + k.replace(/'/g, "\\'") + '\')" style="padding:3px 8px;border:1px solid var(--border-primary);border-radius:6px;background:transparent;color:var(--text-primary);font-size:11px;cursor:pointer;">Unresolve</button></div>';
+  });
+  html += '</div>';
+  body.innerHTML = html;
+}
+
+async function submitResolveError() {
+  var idEl = document.getElementById('triage-input-id');
+  var noteEl = document.getElementById('triage-input-note');
+  var eid = (idEl.value || '').trim();
+  var note = (noteEl.value || '').trim() || null;
+  if (!eid) { idEl.focus(); return; }
+  try {
+    var resp = await fetch('/api/error-triage/resolve', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({event_id: eid, note: note}),
+    });
+    if (resp.ok) { idEl.value = ''; noteEl.value = ''; loadTriageList(); }
+  } catch (e) {}
+}
+
+async function unresolveError(eid) {
+  try {
+    var resp = await fetch('/api/error-triage/resolve?event_id=' + encodeURIComponent(eid), {method: 'DELETE'});
+    if (resp.ok) loadTriageList();
+  } catch (e) {}
+}
+
+// #1969: coalesce concurrent + back-to-back loadAll() callers. Heartbeat-
+// landed handlers, connection-restored, switchTab('overview'), and the
+// periodic refresh interval can all fire within the same second; pre-fix
+// each one independently ran the /api/overview + 8 secondary fetch
+// fan-out, producing the "3× /api/overview in 1 second" burst.
+var _loadAllInFlight = null;
+var _loadAllLastFinishedMs = 0;
+var _LOADALL_COALESCE_MS = 2000;
+// Human-first Overview hero (FLYWHEEL vision). Answers, in plain words a
+// first-timer gets in ~5s: is my agent alive, what did it just do, is it
+// healthy, what did it cost. Reads only already-fetched state (no new request):
+// alive-state from /api/subagents (window._cmAgentBusy), last reply from the
+// transcript loadActivityStream already pulled (window._cmLastAgentSay), model
+// + session count from the cached /api/overview, cost from the rendered stat.
+// Idempotent + self-healing: called after each overview/active-tasks refresh.
+function _renderWasteSummary() {
+  // Overview "recoverable spend" card — the fleet roll-up of the per-session
+  // cost-intel waste signals (the productivity-gains framework as a live number).
+  var page = document.getElementById('page-overview');
+  if (!page) return;
+  fetch('/api/waste-summary').then(function(r){ return r.json(); }).then(function(w){
+    var ex = document.getElementById('cm-waste-summary');
+    if (!w || typeof w !== 'object') { if (ex) ex.remove(); return; }
+    var rows = [];
+    if (Number(w.reasoning_cost_usd) > 0) rows.push(['🧠', '$' + Number(w.reasoning_cost_usd).toFixed(2) + ' on reasoning', '(' + (w.reasoning_pct_of_cost || 0) + '% of spend — billed, no deliverable)']);
+    if (Number(w.low_cache_sessions) > 0) rows.push(['⚡', w.low_cache_sessions + ' session' + (w.low_cache_sessions == 1 ? '' : 's'), 'with low cache hit (context re-sent at full price)']);
+    if (Number(w.reread_tax_usd) > 0) rows.push(['⏱', '$' + Number(w.reread_tax_usd).toFixed(2) + ' re-read tax', 'rebuilding the prompt cache after its 5-min TTL expired (' + w.reread_tax_sessions + ' session' + (w.reread_tax_sessions == 1 ? '' : 's') + ')']);
+    if (!Number(w.reread_tax_usd) && Number(w.cache_expiry_sessions) > 0) rows.push(['⏱', w.cache_expiry_count + ' cache ' + (w.cache_expiry_count == 1 ? 'expiry' : 'expiries'), 'idle gaps crossed the 5-min cache TTL in ' + w.cache_expiry_sessions + ' session' + (w.cache_expiry_sessions == 1 ? '' : 's') + ' (context re-derived)']);
+    if (Number(w.compressible_sessions) > 0) rows.push(['🗜', (Number(w.compressible_usd) > 0 ? '$' + Number(w.compressible_usd).toFixed(2) + ' recoverable' : '~' + Math.round(Number(w.compressible_tokens)/1000) + 'k tokens'), 'compressible tool output (JSON / logs / diffs) in ' + w.compressible_sessions + ' session' + (w.compressible_sessions == 1 ? '' : 's')]);
+    if (Number(w.tool_failing_sessions) > 0) rows.push(['⚠', w.tool_failing_sessions + ' session' + (w.tool_failing_sessions == 1 ? '' : 's'), 'with a tool failing (tokens burned on retries)']);
+    if (Number(w.compaction_heavy_sessions) > 0) rows.push(['♻', w.compaction_heavy_sessions + ' session' + (w.compaction_heavy_sessions == 1 ? '' : 's'), 'thrashing context (re-summarised repeatedly)']);
+    if (Number(w.model_fallback_sessions) > 0) rows.push(['🔀', w.model_fallback_sessions + ' session' + (w.model_fallback_sessions == 1 ? '' : 's'), 'on a silent model fallback']);
+    if (!rows.length || !Number(w.flagged_session_count)) { if (ex) ex.remove(); return; }
+    var inner = rows.map(function(r){
+      return '<div style="display:flex;gap:8px;align-items:baseline;font-size:13px;color:var(--text-secondary);padding:4px 0;">'
+        + '<span>' + r[0] + '</span><strong style="color:var(--text-primary);">' + escHtml(r[1]) + '</strong>'
+        + '<span style="color:var(--text-muted);">' + escHtml(r[2]) + '</span></div>';
+    }).join('');
+    // "Start here" — the single highest-leverage fix, picked from the fields
+    // (works the same in cloud + self-hosted; no backend needed).
+    var _opps = [];
+    if (Number(w.reasoning_cost_usd) > 0 && Number(w.total_cost_usd) > 0 && (w.reasoning_cost_usd / w.total_cost_usd) > 0.15)
+      _opps.push([w.reasoning_cost_usd * 2, 'Reasoning is $' + Number(w.reasoning_cost_usd).toFixed(2) + ' of your spend — lower the reasoning effort, or use a cheaper model for routine work.']);
+    if (Number(w.tool_failing_sessions) > 0)
+      _opps.push([Number(w.tool_failing_sessions) * 1.5, 'Fix the failing tool in ' + w.tool_failing_sessions + ' session' + (w.tool_failing_sessions == 1 ? '' : 's') + ' — you\'re paying tokens on the retries.']);
+    if (Number(w.low_cache_sessions) > 0)
+      _opps.push([Number(w.low_cache_sessions), w.low_cache_sessions + ' session' + (w.low_cache_sessions == 1 ? '' : 's') + ' re-send context at full price — keep the prompt stable to warm the cache.']);
+    if (Number(w.reread_tax_usd) > 0)
+      _opps.push([Number(w.reread_tax_usd) * 2, '$' + Number(w.reread_tax_usd).toFixed(2) + ' went to rebuilding the prompt cache after its 5-min TTL expired — keep sessions warm (a heartbeat or batched turns) so context is read at ~0.1x instead of re-written at full price.']);
+    if (Number(w.compaction_heavy_sessions) > 0)
+      _opps.push([Number(w.compaction_heavy_sessions) * 0.8, w.compaction_heavy_sessions + ' session' + (w.compaction_heavy_sessions == 1 ? '' : 's') + ' thrash context with repeated compaction — work in a smaller window.']);
+    if (Number(w.compressible_sessions) > 0)
+      _opps.push([(Number(w.compressible_usd) || 0) * 3 + Number(w.compressible_sessions), (Number(w.compressible_usd) > 0 ? '$' + Number(w.compressible_usd).toFixed(2) + ' of tool output' : '~' + Math.round(Number(w.compressible_tokens)/1000) + 'k tokens of tool output') + ' is compressible without changing answers (bloated JSON / logs / diffs in ' + w.compressible_sessions + ' session' + (w.compressible_sessions == 1 ? '' : 's') + ') — trim or compress large tool results before they hit the model.']);
+    _opps.sort(function(a, b){ return b[0] - a[0]; });
+    var startHere = _opps.length ? ('<div style="font-size:12px;color:#22c55e;background:rgba(34,197,94,0.08);border-radius:6px;padding:7px 10px;margin-top:10px;"><strong>Start here:</strong> ' + escHtml(_opps[0][1]) + '</div>') : '';
+    var html = '<div id="cm-waste-summary" style="background:var(--bg-secondary,#161b22);border:1px solid var(--border-primary,#30363d);border-left:3px solid #E5443A;border-radius:10px;padding:14px 18px;margin:0 0 16px;">'
+      + '<div style="font-size:13px;font-weight:700;color:var(--text-primary,#e6edf3);margin-bottom:8px;">💡 Recoverable spend '
+      + '<span style="font-weight:500;color:var(--text-muted,#6b7280);">— ' + w.flagged_session_count + ' of ' + w.session_count + ' recent sessions show a waste signal</span></div>'
+      + inner
+      + startHere
+      + '<div style="font-size:12px;color:var(--text-muted,#6b7280);margin-top:8px;">Drill into each on the Cost tab. <a href="https://clawmetry.com/blog/estimating-productivity-gains" target="_blank" rel="noopener" style="color:#E5443A;">How to estimate what this is worth →</a></div>'
+      + '</div>';
+    var heroEl = document.getElementById('overview-hero');
+    if (ex) { ex.outerHTML = html; }
+    else if (heroEl && heroEl.parentNode) { heroEl.insertAdjacentHTML('afterend', html); }
+    else { page.insertAdjacentHTML('afterbegin', html); }
+  }).catch(function(){});
+}
+
+function _renderOutLoopSources() {
+  // Overview "out-loop sources" card — surfaces named sources reported by
+  // clawmetry.track.set_source()/CLAWMETRY_SOURCE from production agents built
+  // on any SDK (OpenAI Agents, LangChain, Vercel AI SDK, E2B, …). Self-removing
+  // when no source is tagged, so it is invisible for users who don't use it.
+  var page = document.getElementById('page-overview');
+  if (!page) return;
+  fetch('/api/local/external-calls?limit=2000').then(function(r){ return r.json(); }).then(function(d){
+    var ex = document.getElementById('cm-outloop-sources');
+    var rows = (d && Array.isArray(d.rows)) ? d.rows : (Array.isArray(d) ? d : []);
+    var named = rows.filter(function(c){ return c && c.source; });
+    if (!named.length) { if (ex) ex.remove(); return; }
+    var by = {};
+    named.forEach(function(c){
+      var k = String(c.source);
+      var g = by[k] || (by[k] = { calls: 0, errors: 0, lat: 0, cost: 0, tokens: 0, hosts: {}, models: {} });
+      g.calls += 1;
+      if (Number(c.status_code) >= 400) g.errors += 1;
+      g.lat += Number(c.latency_ms) || 0;
+      g.cost += Number(c.cost_usd) || 0;
+      g.tokens += (Number(c.input_tokens) || 0) + (Number(c.output_tokens) || 0);
+      if (c.host) g.hosts[c.host] = 1;
+      if (c.model) g.models[c.model] = 1;
+    });
+    var keys = Object.keys(by).sort(function(a, b){ return by[b].cost - by[a].cost || by[b].calls - by[a].calls; });
+    var fleetCost = keys.reduce(function(s, k){ return s + by[k].cost; }, 0);
+    function _fmtCost(v){ return v >= 1 ? ('$' + v.toFixed(2)) : ('$' + v.toFixed(4)); }
+    function _fmtTok(n){ return n >= 1000 ? (Math.round(n / 100) / 10) + 'k' : String(n); }
+    var inner = keys.map(function(k){
+      var g = by[k];
+      var hosts = Object.keys(g.hosts);
+      var models = Object.keys(g.models);
+      var avg = g.calls ? Math.round(g.lat / g.calls) : 0;
+      var errPct = g.calls ? Math.round((g.errors / g.calls) * 100) : 0;
+      var meta = g.calls + ' call' + (g.calls == 1 ? '' : 's')
+        + (g.tokens ? ' · ' + _fmtTok(g.tokens) + ' tok' : '')
+        + ' · ' + (models.length === 1 ? models[0] : hosts.length + ' provider' + (hosts.length == 1 ? '' : 's'))
+        + ' · ~' + avg + 'ms'
+        + (g.errors ? ' · ' + errPct + '% errors' : '');
+      var costStr = g.cost > 0 ? _fmtCost(g.cost) : '';
+      return '<div style="display:flex;gap:8px;align-items:baseline;font-size:13px;color:var(--text-secondary);padding:4px 0;">'
+        + '<span>🔌</span><strong style="color:var(--text-primary);">' + escHtml(k) + '</strong>'
+        + (costStr ? '<strong style="color:#8b5cf6;">' + escHtml(costStr) + '</strong>' : '')
+        + '<span style="color:var(--text-muted);">' + escHtml(meta) + '</span></div>';
+    }).join('');
+    var fleetStr = fleetCost > 0 ? (' · ' + _fmtCost(fleetCost) + ' total') : '';
+    var html = '<div id="cm-outloop-sources" style="background:var(--bg-secondary,#161b22);border:1px solid var(--border-primary,#30363d);border-left:3px solid #8b5cf6;border-radius:10px;padding:14px 18px;margin:0 0 16px;">'
+      + '<div style="font-size:13px;font-weight:700;color:var(--text-primary,#e6edf3);margin-bottom:8px;">🔌 Out-loop sources '
+      + '<span style="font-weight:500;color:var(--text-muted,#6b7280);">— ' + keys.length + ' production agent' + (keys.length == 1 ? '' : 's') + ' reporting via the SDK' + fleetStr + '</span></div>'
+      + inner
+      + '<div style="font-size:12px;color:var(--text-muted,#6b7280);margin-top:8px;">Tag any SDK agent with <code style="background:rgba(139,92,246,0.12);padding:1px 5px;border-radius:4px;">clawmetry.track.set_source("name")</code> to attribute its cost here.</div>'
+      + '</div>';
+    var anchor = document.getElementById('cm-waste-summary');
+    if (ex) { ex.outerHTML = html; }
+    else if (anchor && anchor.parentNode) { anchor.insertAdjacentHTML('afterend', html); }
+    else {
+      var heroEl = document.getElementById('overview-hero');
+      if (heroEl && heroEl.parentNode) { heroEl.insertAdjacentHTML('afterend', html); }
+      else { page.insertAdjacentHTML('afterbegin', html); }
+    }
+  }).catch(function(){});
+}
+
+function _renderOverviewHero() {
+  var hero = document.getElementById('overview-hero');
+  if (!hero) return;
+  function _txt(id) { var e = document.getElementById(id); return e ? e.textContent.trim() : ''; }
+  var ov = window._cmOverview || {};
+  var busy = !!window._cmAgentBusy;
+  var stateWord = busy ? 'working' : 'idle';
+  var dot = busy ? '#22c55e' : '#3b82f6';
+  // When a runtime is selected, the hero must mirror the (runtime-scoped) stat
+  // cards, not the node-wide overview. _cmRuntimeScope is set by loadMiniWidgets
+  // from the v1 API (FLYWHEEL §1c); null = node-wide. Note: prefer the scoped
+  // model card over ov.model here, else the hero kept showing the node's
+  // dominant model (e.g. "running claude-opus-4-8" while PicoClaw is selected).
+  var _scope = window._cmRuntimeScope;
+  var cost = _scope ? ('$' + _scope.cost.toFixed(2)) : (_txt('cost-today') || '$0.00');
+  var model = _scope ? (_txt('model-primary') || _scope.model || '—')
+                     : (ov.model || _txt('model-primary') || 'your model');
+  var sessions = _scope ? _scope.sessions
+                        : ((typeof ov.sessionCount === 'number') ? ov.sessionCount : null);
+  var free = cost === '$0.00' || cost === '$0' ||
+             /oauth/i.test((document.getElementById('cost-trend') || {}).textContent || '');
+  var say = window._cmLastAgentSay;
+  var sayText = say && say.text ? String(say.text).replace(/\s+/g, ' ').trim() : '';
+  if (sayText.length > 90) sayText = sayText.slice(0, 90) + '…';
+
+  var lastLine = sayText
+    ? 'Last thing it did: replied <strong style="color:var(--text-primary);">“' + escHtml(sayText) + '”</strong>.'
+    : (busy ? 'It’s working on something right now.'
+            : 'Send it a message and you’ll see what it does, right here.');
+  var stats = [];
+  // When scoped to a runtime, `sessions` is that runtime's TOTAL footprint
+  // (matches the switcher), so don't append "today" — the runtime may have 0
+  // sessions today but N on record, and "N sessions today" would be wrong while
+  // "0 sessions today" reads as gone. For all-runtimes it stays the live "today".
+  if (sessions != null) stats.push('💬 <strong style="color:var(--text-primary);">' + sessions + (sessions === 1 ? ' session' : ' sessions') + '</strong>' + (_scope ? '' : ' today'));
+  stats.push('💸 <strong style="color:var(--text-primary);">' + escHtml(cost) + '</strong>' + (free ? ' <span style="color:#22c55e;">free on your plan</span>' : ''));
+  // Efficiency chip (design spec §1a): grade next to cost answers "what did it
+  // cost me, and is that reasonable?" in one read. Renders only when the
+  // daemon slice is fresh for the CURRENT runtime filter and passes the trust
+  // gate (_cmEffUsable) — otherwise nothing, never a placeholder grade. When
+  // the cache is cold/stale, kick ONE load and repaint on arrival (the flag
+  // prevents a render loop: a fresh cache never re-enters the else-branch).
+  try {
+    var _effC = window._cmEff || {}, _effRt = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+    if (_effC.rt === _effRt && _effC.data !== undefined && (Date.now() - _effC.ts) < 60000) {
+      var _effChip = _cmEffChipHtml(_effC.data);
+      if (_effChip) stats.push(_effChip);
+    } else if (!window._cmEffHeroWait) {
+      window._cmEffHeroWait = true;
+      _cmLoadEfficiency(function () { window._cmEffHeroWait = false; try { _renderOverviewHero(); } catch (e) {} });
+    }
+  } catch (_e) {}
+  stats.push('🧠 running <strong style="color:var(--text-primary);">' + escHtml(model) + '</strong>');
+  // Live throughput (⚡ tok/s) from the today-token delta between renders —
+  // matches `clawmetry status --live`. Shown only while the agent is producing.
+  try {
+    var _nowMs = Date.now(), _tt = Number(window._cmTodayTokensRaw || 0), _prevT = window._cmHeroTpsPrev;
+    if (busy && _prevT && _nowMs > _prevT.t) {
+      var _tps = (_tt - _prevT.k) / ((_nowMs - _prevT.t) / 1000);
+      if (_tps > 0.5) stats.push('⚡ <strong style="color:var(--text-primary);">' + Math.round(_tps) + '</strong> tok/s');
+    }
+    window._cmHeroTpsPrev = { k: _tt, t: _nowMs };
+  } catch (_e) {}
+
+  hero.innerHTML =
+    '<div style="display:flex;align-items:center;gap:11px;">'
+      + '<span style="position:relative;display:inline-flex;width:14px;height:14px;flex-shrink:0;">'
+        + '<span style="position:absolute;inset:0;border-radius:50%;background:' + dot + ';opacity:.35;animation:cmHeroPulse 2s ease-out infinite;"></span>'
+        + '<span style="position:relative;margin:auto;width:10px;height:10px;border-radius:50%;background:' + dot + ';"></span>'
+      + '</span>'
+      + '<span style="font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-muted);">' + t('overview.hero_eyebrow', null, 'Your agent') + '</span>'
+    + '</div>'
+    + '<div style="font-family:Georgia,\'Times New Roman\',serif;font-size:32px;line-height:1.15;font-weight:600;color:var(--text-primary);margin:10px 0 4px;">'
+      + (busy ? 'It’s working right now.' : 'It’s idle right now.') + '</div>'
+    + '<div style="font-size:15px;color:var(--text-secondary);margin-bottom:18px;">' + lastLine + '</div>'
+    + '<div style="display:flex;flex-wrap:wrap;gap:8px 24px;align-items:baseline;font-size:15px;color:var(--text-secondary);">'
+      + stats.map(function (s) { return '<span>' + s + '</span>'; }).join('') + '</div>';
+  hero.style.display = '';
+
+  if (!document.getElementById('cm-hero-kf')) {
+    var st = document.createElement('style'); st.id = 'cm-hero-kf';
+    st.textContent = '@keyframes cmHeroPulse{0%{transform:scale(1);opacity:.35}70%{transform:scale(2.4);opacity:0}100%{opacity:0}}';
+    document.head.appendChild(st);
+  }
+
+  // Demote the power tools (autonomy / run-health / compare / triage) into a
+  // collapsed "Advanced" disclosure — present for power users, out of the
+  // newcomer's first view. Idempotent: only relocate once.
+  var page = document.getElementById('page-overview');
+  var adv = document.getElementById('overview-advanced');
+  if (page && !adv) {
+    adv = document.createElement('details');
+    adv.id = 'overview-advanced';
+    adv.style.cssText = 'margin:6px 0 14px;border:1px solid var(--border-primary);border-radius:12px;background:var(--bg-secondary);';
+    adv.innerHTML = '<summary style="cursor:pointer;padding:12px 18px;font-size:13px;font-weight:600;color:var(--text-secondary);list-style:none;">⚙️ ' + t('overview.advanced_tools', null, 'Advanced tools') + ' <span style="color:var(--text-muted);font-weight:400;">— independence, run health, compare runs, error triage</span></summary><div id="overview-advanced-body" style="padding:0 14px 8px;"></div>';
+    page.appendChild(adv);
+    var body = adv.querySelector('#overview-advanced-body');
+    ['autonomy-card', 'health-timeline-card', 'compare-runs-card', 'triage-card'].forEach(function (id) {
+      var c = document.getElementById(id);
+      if (c && body) { c.style.marginBottom = '12px'; body.appendChild(c); }
+    });
+  }
+}
+
+async function loadAll() {
+  if (_loadAllInFlight) return _loadAllInFlight;
+  if (Date.now() - _loadAllLastFinishedMs < _LOADALL_COALESCE_MS) return;
+  _loadAllInFlight = (async function () {
+  try {
+    // Runtime scope banner on first paint (showTab only fires on tab switch).
+    try { _cmApplyRuntimeScopeNote('overview'); } catch (e) {}
     // Render overview quickly; do not block on heavy usage aggregation.
     var overview = await fetchJsonWithTimeout('/api/overview', 3000);
+    window._cmOverview = overview;
     try { renderOauthBanner(overview); } catch(e) {}
+    try { _renderOverviewHero(); } catch(e) {}
 
     // Start only critical secondary panels immediately. Expensive/non-critical
     // cards are staggered below so the initial widget load does not stampede
@@ -1900,7 +3173,12 @@ async function loadAll() {
     if (typeof loadHeartbeat === 'function') loadHeartbeat().catch(function(e){console.warn('heartbeat panel failed',e)});
     if (typeof loadAutonomy === 'function') setTimeout(function(){ loadAutonomy().catch(function(e){console.warn('autonomy failed',e)}); }, 2600);
     if (typeof loadAnomalyPanel === 'function') setTimeout(function(){ loadAnomalyPanel().catch(function(e){console.warn('anomaly panel failed',e)}); }, 3600);
-    document.getElementById('refresh-time').textContent = 'Updated ' + new Date().toLocaleTimeString();
+    if (typeof loadActivityHeatmap === 'function') setTimeout(function(){ loadActivityHeatmap().catch(function(e){console.warn('activity heatmap failed',e)}); }, 4500);
+    // Issue #1614 — outcome tile (Today: N tasks, X% success).
+    if (typeof loadOutcomeTile === 'function') setTimeout(function(){ loadOutcomeTile().catch(function(e){console.warn('outcome tile failed',e)}); }, 800);
+    // UI-coverage audit — today's activity counters strip.
+    if (typeof loadActivityToday === 'function') setTimeout(function(){ loadActivityToday().catch(function(e){console.warn('activity today failed',e)}); }, 900);
+    document.getElementById('refresh-time').textContent = t("app.updated", null, "Updated ") + new Date().toLocaleTimeString();
 
     if (overview.infra) {
       var i = overview.infra;
@@ -1930,12 +3208,23 @@ async function loadAll() {
       // Keep UI responsive with placeholder values until next refresh.
       loadMiniWidgets(overview, {todayCost:0, weekCost:0, monthCost:0, month:0, today:0});
     }
+    // Health timeline (#2196 item #4) — fire-and-forget; renderer hides the
+    // card if there's nothing to show.
+    try { loadHealthTimeline(); } catch (e) {}
+    // Error-triage list (#2196 item #5) — also fire-and-forget.
+    try { loadTriageList(); } catch (e) {}
     return true;
   } catch (e) {
     console.error('Initial load failed', e);
-    document.getElementById('refresh-time').textContent = 'Load failed - retrying...';
+    document.getElementById('refresh-time').textContent = t("app.load_failed_retrying", null, "Load failed - retrying...");
     return false;
   }
+  })();
+  _loadAllInFlight.finally(function () {
+    _loadAllLastFinishedMs = Date.now();
+    _loadAllInFlight = null;
+  });
+  return _loadAllInFlight;
 }
 
 async function loadMiniWidgets(overview, usage) {
@@ -1959,7 +3248,7 @@ async function loadMiniWidgets(overview, usage) {
   if (isOauthLikely) {
     if (badgeEl) {
       badgeEl.style.display = '';
-      badgeEl.textContent = 'est. equivalent if billed - OAuth likely';
+      badgeEl.textContent = t("app.est_equivalent_if_billed_oauth_likely", null, "est. equivalent if billed - OAuth likely");
     }
     trendEl.style.display = 'none';
   } else {
@@ -1990,24 +3279,107 @@ async function loadMiniWidgets(overview, usage) {
   function fmtTokens(n) { return n >= 1000000 ? (n/1000000).toFixed(1) + 'M' : n >= 1000 ? (n/1000).toFixed(0) + 'K' : String(n); }
   document.getElementById('token-rate').textContent = fmtTokens(usage.month || 0);
   document.getElementById('tokens-today').textContent = fmtTokens(usage.today || 0);
+  // Raw today-token total (unformatted) so the hero can compute live tokens/sec.
+  window._cmTodayTokensRaw = Number(usage.today || 0);
   
-  // 🔥 Hot Sessions -- use /api/sessions for consistency with modal
-  fetch('/api/sessions').then(function(r){return r.json()}).then(function(sd) {
-    var sl = sd.sessions || sd || [];
-    if (!Array.isArray(sl)) sl = [];
-    document.getElementById('hot-sessions-count').textContent = sl.length;
-  }).catch(function() {
-    document.getElementById('hot-sessions-count').textContent = overview.sessionCount || 0;
-  });
-  
-  // 📈 Model Mix
-  document.getElementById('model-primary').textContent = overview.model || 'unknown';
+  // SESSIONS card — show "sessions today" (overview.sessionCount), the SAME
+  // definition as the Overview hero. Previously this card showed the LENGTH of
+  // /api/sessions (active/recent list, =1) while the hero showed sessionCount
+  // (today, =2) with no label saying which — two cards silently disagreeing,
+  // and it briefly read "0" on a slow/failed fetch. Set synchronously from the
+  // value already in hand so the card is never blank and never contradicts the
+  // hero. (Card relabeled "Sessions today" in overview.html.)
+  document.getElementById('hot-sessions-count').textContent = overview.sessionCount || 0;
+
+  // 📈 Runtime scope — when a runtime is selected, the Overview stat cards
+  // (sessions / tokens / cost / model) must show ONLY that runtime's data
+  // (FLYWHEEL §1c). Without this the cards stayed node-wide while the switcher
+  // said e.g. "PicoClaw · 1 session" (node showed 68 sessions / 3.8M tokens).
+  //
+  // Source of truth: the public v1 API, which filters SERVER-SIDE by ?runtime=
+  // (cloud mode). period=day -> the "today" cards, period=month -> token-rate.
+  // Local mode has no v1 API, so it falls back to the /api/runtime-summary slice
+  // (per-runtime totals; the model already used this). `_cmRuntimeScope` is the
+  // override the hero reads; null = node-wide (unchanged path).
+  var _ovModel = overview.model || 'unknown';
+  window._cmRuntimeScope = null;
+  try {
+    var _ovRt = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+    if (_ovRt && _ovRt !== 'all') {
+      var _rsd = await fetchJsonWithTimeout('/api/runtime-summary', 4000);
+      var _rs = _rsd && _rsd.runtimes && _rsd.runtimes[_ovRt];
+      _ovModel = (_rs && _rs.primary_model) ? _rs.primary_model : '—';
+      // The SESSIONS card must match what the runtime switcher promises
+      // ("OpenClaw · 2 sessions"), NOT a today-window that's empty for a runtime
+      // whose sessions are older than today. Otherwise selecting an idle-today
+      // runtime reads as "sessions gone" (founder report 2026-06-03: OpenClaw has
+      // 2 sessions on record but the Overview showed 0). Use the switcher's
+      // per-runtime total; fall back to the period count if it's not populated.
+      var _rtTotal = (window._cmGlobalRtCounts && window._cmGlobalRtCounts[_ovRt]) || 0;
+      var _scope = null;
+      if (window.CLOUD_MODE) {
+        // Server-side filtered, period-accurate (the founder's chosen contract).
+        try {
+          var _b = '/api/v1/usage?node_id=' + encodeURIComponent(window.CLOUD_NODE_ID || '') + '&runtime=' + encodeURIComponent(_ovRt);
+          var _dR = await fetch(_b + '&period=day'), _wR = await fetch(_b + '&period=week'), _mR = await fetch(_b + '&period=month');
+          if (_dR.ok && _wR.ok && _mR.ok) {
+            var _d = ((await _dR.json()) || {}).data || {}, _w = ((await _wR.json()) || {}).data || {}, _m = ((await _mR.json()) || {}).data || {};
+            // Guard against an echo/stale mismatch (only trust a response that
+            // confirms it filtered to the runtime we asked for).
+            if (String(_d.runtime || '') === _ovRt) {
+              _scope = { runtime: _ovRt, sessions: _rtTotal || (_m.sessions_count | 0) || (_d.sessions_count | 0),
+                         sessionsToday: _d.sessions_count | 0,
+                         tokensToday: _d.total_tokens | 0, tokensMonth: _m.total_tokens | 0,
+                         cost: +_m.total_cost || 0, costWeek: +_w.total_cost || 0,
+                         costMonth: +_m.total_cost || 0, model: _ovModel };
+            }
+          }
+        } catch (e2) { /* fall through to slice */ }
+      }
+      if (!_scope && _rs) {
+        // Local-mode fallback: the runtime-summary slice has per-runtime totals
+        // (not period-split, but scoped to the runtime — better than node-wide).
+        _scope = { runtime: _ovRt, sessions: _rtTotal || (_rs.sessions | 0),
+                   sessionsToday: _rs.sessions | 0,
+                   tokensToday: _rs.tokens | 0, tokensMonth: _rs.tokens | 0,
+                   cost: +_rs.cost_usd || 0, costWeek: +_rs.cost_usd || 0,
+                   costMonth: +_rs.cost_usd || 0, model: _ovModel };
+      }
+      if (_scope) {
+        window._cmRuntimeScope = _scope;
+        var _fmtT = function (n) { return n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(0) + 'K' : String(n); };
+        var _set = function (id, v) { var e = document.getElementById(id); if (e) e.textContent = v; };
+        _set('hot-sessions-count', _scope.sessions);
+        _set('tokens-today', _fmtT(_scope.tokensToday));
+        _set('token-rate', _fmtT(_scope.tokensMonth));
+        _set('cost-today', '$' + _scope.cost.toFixed(2));
+        // SPENDING wk/mo sub-figures scope too (were node-wide projections).
+        if (_scope.costWeek != null) _set('cost-week', fmtCost(_scope.costWeek));
+        if (_scope.costMonth != null) _set('cost-month', fmtCost(_scope.costMonth));
+        window._cmTodayTokensRaw = _scope.tokensToday;
+      }
+    }
+  } catch (e) { /* keep the node-dominant values */ }
+  document.getElementById('model-primary').textContent = _ovModel;
+  // Relabel the SESSIONS tile: scoped shows the runtime's TOTAL (matches the
+  // switcher) so "today" would be wrong; node-wide stays the live "today".
+  try {
+    var _slbl = document.getElementById('hot-sessions-label');
+    if (_slbl) _slbl.textContent = window._cmRuntimeScope
+      ? t('overview.sessions', null, 'Sessions')
+      : t('overview.sessions_today', null, 'Sessions today');
+  } catch (e) {}
+  // Re-render the hero so its headline (sessions / cost / model) reflects the
+  // scope just applied (it may have first painted node-wide from loadAll).
+  try { if (typeof _renderOverviewHero === 'function') _renderOverviewHero(); } catch (e) {}
   var modelLabel = document.getElementById('main-activity-model');
-  if (modelLabel && overview.model) {
-    var m = overview.model;
+  if (modelLabel && _ovModel && _ovModel !== '—') {
+    var m = _ovModel;
     if (m.indexOf('/') !== -1) m = m.split('/').pop();
     m = m.replace(/-/g, ' ').replace(/\b\w/g, function(c){return c.toUpperCase();});
     modelLabel.textContent = m;
+  } else if (modelLabel && _ovModel === '—') {
+    modelLabel.textContent = '—';
   }
   var modelBreakdown = '';
   if (usage.modelBreakdown && usage.modelBreakdown.length > 0) {
@@ -2024,15 +3396,269 @@ async function loadMiniWidgets(overview, usage) {
   
   // 🐝 Worker Bees (Sub-Agents)
   loadSubAgents();
-  
+
+  // Issue #1619 Phase 1 — eval score tile. Lazy, non-blocking; tile shows
+  // a dash on miss so a slow daemon doesn't gate the overview render.
+  loadEvalSummary();
+  // Phase 3 — regression-replay mini-line under the eval tile.
+  loadEvalRegressionSummary();
+  // Named evaluator library — the catalogue of quality / reliability /
+  // efficiency / safety / agent checks ClawMetry runs. Static + cloud-safe.
+  loadEvaluators();
+}
+
+// Named evaluator library. Reads /api/evaluators (static catalogue, cloud-safe)
+// and renders each named evaluator as a card with a category chip, a tier badge,
+// and an honest live / coming-soon state. Newcomer-plain language by design.
+async function loadEvaluators() {
+  var listEl = document.getElementById('evaluators-list');
+  var countEl = document.getElementById('evaluators-count');
+  if (!listEl) return;
+  var data = await fetch('/api/evaluators').then(function(r){return r.json();}).catch(function(){return null;});
+  var evs = (data && data.evaluators) || [];
+  if (!evs.length) {
+    listEl.innerHTML = '<div style="font-size:12px;color:var(--text-muted);">' +
+      t("evaluators.empty", null, "Evaluator library unavailable.") + '</div>';
+    if (countEl) countEl.textContent = '';
+    return;
+  }
+  if (countEl) {
+    var liveN = evs.filter(function(e){ return e.status === 'live'; }).length;
+    countEl.textContent = liveN + ' / ' + evs.length + ' ' +
+      t("evaluators.live_now", null, "live now");
+  }
+  // Category → chip color + plain label.
+  var CAT = {
+    quality:     { c: '#8b5cf6', label: t("evaluators.cat_quality", null, "Quality") },
+    reliability: { c: '#3b82f6', label: t("evaluators.cat_reliability", null, "Reliability") },
+    efficiency:  { c: '#f59e0b', label: t("evaluators.cat_efficiency", null, "Efficiency") },
+    safety:      { c: '#ef4444', label: t("evaluators.cat_safety", null, "Safety") },
+    agent:       { c: '#10b981', label: t("evaluators.cat_agent", null, "Agent") }
+  };
+  var html = '';
+  evs.forEach(function(e) {
+    var cat = CAT[e.category] || { c: 'var(--text-muted)', label: e.category };
+    var statusLabel, statusColor;
+    if (e.status === 'live') {
+      statusLabel = t("evaluators.status_live", null, "Live"); statusColor = '#22c55e';
+    } else if (e.status === 'partial') {
+      statusLabel = t("evaluators.status_partial", null, "Early"); statusColor = '#f59e0b';
+    } else {
+      statusLabel = t("evaluators.status_soon", null, "With Pro"); statusColor = 'var(--text-muted)';
+    }
+    var tierBadge = '';
+    if (e.tier === 'pro') {
+      tierBadge = '<span style="font-size:10px;font-weight:700;padding:1px 7px;border-radius:10px;' +
+        'background:rgba(139,92,246,0.14);color:#8b5cf6;border:1px solid rgba(139,92,246,0.35);">PRO</span>';
+    }
+    html += '<div style="background:var(--bg-primary);border:1px solid var(--border-primary);border-radius:10px;padding:12px 14px;' +
+      (e.locked ? 'opacity:0.78;' : '') + '">';
+    html += '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;">';
+    html += '<span style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:' + cat.c + ';">' + escHtml(cat.label) + '</span>';
+    html += '<span style="display:flex;align-items:center;gap:6px;">' + tierBadge +
+      '<span style="font-size:10px;font-weight:600;color:' + statusColor + ';">' + escHtml(statusLabel) + '</span></span>';
+    html += '</div>';
+    html += '<div style="font-size:13px;font-weight:700;color:var(--text-primary);margin-bottom:4px;">' + escHtml(e.name) + '</div>';
+    html += '<div style="font-size:11px;color:var(--text-muted);line-height:1.45;">' + escHtml(e.description) + '</div>';
+    if (e.locked) {
+      html += '<div style="margin-top:8px;font-size:11px;"><a href="/upgrade?source=evaluators" style="color:#8b5cf6;font-weight:600;text-decoration:none;">' +
+        t("evaluators.unlock", null, "Unlock with Pro") + ' &rarr;</a></div>';
+    }
+    html += '</div>';
+  });
+  listEl.innerHTML = html;
+}
+
+// Issue #1619 Phase 1 — pull aggregate score for the overview tile.
+// Reads /api/evals/summary?window=24h and renders avg + coverage. Score
+// is shown as "4.2 / 5" with a color band; coverage as "220 / 247 scored".
+async function loadEvalSummary() {
+  var avgEl = document.getElementById('eval-avg-score');
+  var covEl = document.getElementById('eval-coverage');
+  var checkEl = document.getElementById('eval-title-check');
+  // QW7: the green check only appears when there is an actual score.
+  function setTitleCheck(show) { if (checkEl) checkEl.style.display = show ? '' : 'none'; }
+  if (!avgEl) return;
+  try {
+    var data = await fetch('/api/evals/summary?window=24h').then(function(r){return r.json();}).catch(function(){return null;});
+    if (!data || typeof data.scored !== 'number') {
+      setTitleCheck(false);
+      avgEl.textContent = '--';
+      if (covEl) covEl.textContent = '';
+      return;
+    }
+    if (data.scored === 0) {
+      setTitleCheck(false);
+      avgEl.textContent = '';
+      avgEl.style.color = 'var(--text-muted)';
+      if (covEl) covEl.textContent = t("overview.eval_empty", null, "No sessions judged yet today. The judge runs automatically after each session.");
+      return;
+    }
+    setTitleCheck(true);
+    var avg = Number(data.avg_score || 0);
+    avgEl.textContent = avg.toFixed(1) + ' / 5';
+    // Color band: 4+ green, 3-4 yellow, <3 red. Matches the per-session pill.
+    avgEl.style.color = avg >= 4 ? '#22c55e' : avg >= 3 ? '#f59e0b' : '#ef4444';
+    if (covEl) covEl.textContent = data.scored + ' / ' + data.total + ' scored';
+  } catch (e) {
+    setTitleCheck(false);
+    avgEl.textContent = '--';
+    if (covEl) covEl.textContent = '';
+  }
+}
+
+// Issue #1619 Phase 3 — regression-replay summary line under the eval tile.
+// Reads /api/evals/regression-summary?window=7d and renders a single-line
+// status like "Regression: 8 fixed since last week". Silent on a fresh
+// install (tested=0) so the tile doesn't dangle a useless zero.
+async function loadEvalRegressionSummary() {
+  var el = document.getElementById('eval-regression-line');
+  if (!el) return;
+  try {
+    var data = await fetch('/api/evals/regression-summary?window=7d').then(function(r){return r.json();}).catch(function(){return null;});
+    if (!data || typeof data.tested !== 'number' || data.tested === 0) {
+      el.textContent = '';
+      return;
+    }
+    var parts = [];
+    if (data.improved > 0) parts.push(data.improved + ' fixed');
+    if (data.regressed > 0) parts.push(data.regressed + ' regressed');
+    if (data.same > 0) parts.push(data.same + ' same');
+    if (!parts.length) { el.textContent = ''; return; }
+    el.textContent = t("app.regression", null, "Regression: ") + parts.join(', ') + ' (7d)';
+    // Subtle color signal: red if anything regressed, green if any fixed
+    // and none regressed, muted otherwise.
+    if (data.regressed > 0) {
+      el.style.color = '#ef4444';
+    } else if (data.improved > 0) {
+      el.style.color = '#22c55e';
+    } else {
+      el.style.color = 'var(--text-muted)';
+    }
+  } catch (e) {
+    el.textContent = '';
+  }
+}
+
+// Issue #1619 Phase 1 — rubric editor. Modal opens with the current YAML;
+// Save POSTs back to /api/evals/rubric which validates parse before write.
+async function openEvalRubricModal() {
+  var modal = document.getElementById('eval-rubric-modal');
+  var ta = document.getElementById('eval-rubric-yaml');
+  var status = document.getElementById('eval-rubric-status');
+  var pathEl = document.getElementById('eval-rubric-path');
+  if (!modal || !ta) return;
+  modal.style.display = 'flex';
+  loadEvalKeyStatus();
+  if (status) status.textContent = t("app.loading", null, "Loading...");
+  try {
+    var data = await fetch('/api/evals/rubric').then(function(r){return r.json();});
+    ta.value = data.yaml || '';
+    if (pathEl && data.rubric_path) pathEl.textContent = data.rubric_path;
+    if (status) {
+      status.textContent = data.enabled === false
+        ? 'Evals are disabled (CLAWMETRY_EVALS_ENABLED=0).'
+        : 'Loaded.';
+    }
+  } catch (e) {
+    if (status) status.textContent = t("app.failed_to_load_2", null, "Failed to load: ") + e.message;
+  }
+}
+
+// Judge API key: presence-only status (never the value) so the user knows
+// whether scoring can run, and can paste a key to enable it without an env var.
+async function loadEvalKeyStatus() {
+  var el = document.getElementById('eval-key-status');
+  var sel = document.getElementById('eval-key-provider');
+  if (!el) return;
+  try {
+    var d = await fetch('/api/evals/key').then(function(r){return r.json();}).catch(function(){return null;});
+    var present = (d && d.present) || {};
+    var prov = sel ? sel.value : 'anthropic';
+    if (present[prov]) {
+      el.textContent = '✓ key set';
+      el.style.color = '#22c55e';
+    } else if (d && d.any) {
+      el.textContent = 'set for another provider';
+      el.style.color = 'var(--text-muted)';
+    } else {
+      el.textContent = 'not set — scoring paused';
+      el.style.color = '#f59e0b';
+    }
+  } catch (e) {
+    el.textContent = '';
+  }
+}
+
+// Save the judge API key (or clear it with an empty value). POSTs to
+// /api/evals/key, which stores it locally chmod 600; never echoed back.
+async function saveEvalKey() {
+  var sel = document.getElementById('eval-key-provider');
+  var inp = document.getElementById('eval-key-input');
+  var el = document.getElementById('eval-key-status');
+  if (!sel || !inp) return;
+  if (el) { el.textContent = t("app.saving", null, "Saving..."); el.style.color = 'var(--text-muted)'; }
+  try {
+    var resp = await fetch('/api/evals/key', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({provider: sel.value, api_key: inp.value || ''})
+    }).then(function(r){return r.json();});
+    if (resp && resp.ok) {
+      inp.value = '';  // never keep the secret in the DOM after save
+      loadEvalKeyStatus();
+    } else if (el) {
+      el.textContent = (resp && resp.error) || 'Save failed';
+      el.style.color = '#ef4444';
+    }
+  } catch (e) {
+    if (el) { el.textContent = 'Save failed: ' + e.message; el.style.color = '#ef4444'; }
+  }
+}
+
+function closeEvalRubricModal() {
+  var modal = document.getElementById('eval-rubric-modal');
+  if (modal) modal.style.display = 'none';
+}
+
+async function saveEvalRubric() {
+  var ta = document.getElementById('eval-rubric-yaml');
+  var status = document.getElementById('eval-rubric-status');
+  if (!ta) return;
+  var body = JSON.stringify({yaml: ta.value || ''});
+  if (status) status.textContent = t("app.saving", null, "Saving...");
+  try {
+    var resp = await fetch('/api/evals/rubric', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: body,
+    });
+    var data = await resp.json();
+    if (!resp.ok || data.error) {
+      if (status) status.textContent = t("app.save_failed_2", null, "Save failed: ") + (data.error || resp.status);
+      return;
+    }
+    if (status) status.textContent = t("app.saved_new_scores_use_this_rubric_on_the_next_sched", null, "Saved. New scores use this rubric on the next scheduler tick.");
+    setTimeout(closeEvalRubricModal, 1200);
+  } catch (e) {
+    if (status) status.textContent = t("app.save_failed_2", null, "Save failed: ") + e.message;
+  }
 }
 
 async function loadSubAgents() {
   try {
-    var data = await fetch('/api/subagents').then(r => r.json());
+    var _saResp = await fetch('/api/subagents').then(async function(r) { return {s: r.status, b: await r.json()}; });
+    var data = _saResp.b || {};
+    // Issue #1804: show outage banner when ingest is offline (503 envelope).
+    if (_saResp.s === 503 && data && data.error === 'local_store ingest is offline') {
+      document.getElementById('subagents-status').textContent = t("app.ingest_offline", null, "Ingest offline");
+      var _saPrev = document.getElementById('subagents-preview');
+      if (_saPrev) _saPrev.innerHTML = '<div style="background:#fff7ed;border:1px solid #f59e0b;color:#92400e;padding:12px 16px;border-radius:6px;font-size:12px;"><strong>' + t("app.ingest_temporarily_offline", null, "Ingest temporarily offline.") + '</strong> Sub-agent data unavailable; the local_store writer is not responding.</div>';
+      return;
+    }
     var counts = data.counts;
     var subagents = data.subagents;
-    
+
     // Update main counter
     document.getElementById('subagents-count').textContent = counts.total;
     
@@ -2077,8 +3703,8 @@ async function loadSubAgents() {
     
   } catch(e) {
     document.getElementById('subagents-count').textContent = '?';
-    document.getElementById('subagents-status').textContent = 'Error loading sub-agents';
-    document.getElementById('subagents-preview').innerHTML = '<div style="color:#e74c3c;font-size:11px;">Failed to load workforce</div>';
+    document.getElementById('subagents-status').textContent = t("app.error_loading_sub_agents", null, "Error loading sub-agents");
+    document.getElementById('subagents-preview').innerHTML = '<div style="color:#e74c3c;font-size:11px;">' + t("app.failed_to_load_workforce", null, "Failed to load workforce") + '</div>';
   }
 }
 
@@ -2153,6 +3779,9 @@ async function loadActiveTasks() {
     var RECENT_MS = 10 * 60 * 1000;
     var now = Date.now();
     var all = (saData.subagents || []);
+    // Scope to the selected runtime (sub-agent sessionId prefix = runtime).
+    var _atRt = (typeof _cmRuntimeFilter === 'function') ? _cmClientFilterRt(_cmRuntimeFilter()) : 'all';
+    if (_atRt !== 'all') all = all.filter(function(a) { return _cmRuntimeOf(a) === _atRt; });
     var live = all.filter(function(a) { return a.status === 'active' || a.status === 'idle'; });
     var recentFailed = all.filter(function(a) {
       return a.status === 'failed' && (now - (a.updatedAt || 0)) < RECENT_MS;
@@ -2254,7 +3883,7 @@ async function loadToolActivity() {
     });
     
     document.getElementById('tools-active').textContent = recentTools.slice(0, 3).join(', ') || 'Idle';
-    document.getElementById('tools-recent').textContent = 'Last ' + Math.min(logs.lines.length, 100) + ' log entries';
+    document.getElementById('tools-recent').textContent = t("app.last", null, "Last ") + Math.min(logs.lines.length, 100) + ' log entries';
     
     var sparks = document.querySelectorAll('.tool-spark span');
     sparks[0].textContent = toolCounts.exec;
@@ -2276,7 +3905,21 @@ async function loadActivityStream() {
       try {
         var transcript = await fetchJsonWithTimeout('/api/transcript/' + recent.id, 4000);
         var recentMessages = transcript.messages.slice(-10); // Last 10 messages
-        
+        // Stash the latest assistant reply for the Overview hero ("Last thing
+        // it did: …") — reuses this already-fetched transcript, no new request.
+        try {
+          for (var _mi = transcript.messages.length - 1; _mi >= 0; _mi--) {
+            var _m = transcript.messages[_mi];
+            if (_m && _m.role === 'assistant' && _m.content && String(_m.content).trim()) {
+              window._cmLastAgentSay = { text: String(_m.content).trim(), when: _m.timestamp || null };
+              break;
+            }
+          }
+          try { if (typeof _renderOverviewHero === 'function') _renderOverviewHero(); } catch (_e_hero) {}
+          try { if (typeof _renderWasteSummary === 'function') _renderWasteSummary(); } catch (_e2) {}
+          try { if (typeof _renderOutLoopSources === 'function') _renderOutLoopSources(); } catch (_e3) {}
+        } catch (_e) {}
+
         recentMessages.forEach(function(msg) {
           if (msg.role === 'assistant' && msg.content) {
             var content = msg.content.toLowerCase();
@@ -2317,7 +3960,7 @@ async function loadActivityStream() {
     
     document.getElementById('activity-stream').innerHTML = html;
   } catch(e) {
-    document.getElementById('activity-stream').innerHTML = '<div style="color:#666;">Error loading activity stream</div>';
+    document.getElementById('activity-stream').innerHTML = '<div style="color:#666;">' + t("app.error_loading_activity_stream", null, "Error loading activity stream") + '</div>';
   }
 }
 
@@ -2452,27 +4095,119 @@ function _provenancePillHtml(meta, bodyHtml) {
 // Detects the "Sender (untrusted metadata)" / "Conversation info ..." JSON
 // prefix that channel adapters prepend to user messages. Returns
 // { meta:{...}, body:"<remaining text>" } or null.
+//
+// Adapters STACK more than one such block — a Telegram user message arrives as
+//
+//     Conversation info (untrusted metadata):
+//     ```json { "chat_id": "telegram:…", "sender": "Vivek Chand", … } ```
+//     Sender (untrusted metadata):
+//     ```json { "label": "Vivek Chand (…)", "id": "…", "name": "Vivek Chand" } ```
+//     <real message body>
+//
+// We strip EVERY leading provenance block (not just the first) so the same
+// identity isn't echoed 2-3× under the pill. The pill summarises the first
+// (richest) block; later blocks are redundant with it and dropped entirely.
 function _parseProvenancePrefix(s) {
   if (!s || typeof s !== 'string') return null;
-  // Match: optional "<label> (untrusted metadata):" header, then a ```json
-  // block, then the rest is the real body. Header is optional because some
-  // payloads ship just the json fence at the top.
-  var m = s.match(/^(?:[^\n]*\(untrusted metadata\)[^\n]*\n)?\s*```json\s*([\s\S]*?)```\s*([\s\S]*)$/);
-  if (!m) return null;
-  try {
-    var meta = JSON.parse(m[1]);
-    if (!meta || typeof meta !== 'object') return null;
-    // Require at least one provenance-y key so we don't eat unrelated json.
-    if (meta.chat_id == null && meta.sender == null && meta.message_id == null) {
-      return null;
+  var rest = s;
+  var firstMeta = null;
+  // One leading block: optional "<label> (untrusted metadata):" header, then a
+  // ```json fence. ``\n?`` swallows the newline between stacked blocks.
+  var blockRe = /^\s*([^\n]*\(untrusted metadata\)[^\n]*\n)?[ \t]*```json\s*([\s\S]*?)```[ \t]*\n?/;
+  while (true) {
+    var m = rest.match(blockRe);
+    if (!m) break;
+    var hadHeader = !!m[1];
+    var meta;
+    try { meta = JSON.parse(m[2]); } catch(e) { break; }
+    if (!meta || typeof meta !== 'object') break;
+    var looksProv = (meta.chat_id != null || meta.sender != null || meta.message_id != null);
+    // Without the "(untrusted metadata)" header we only strip a block that is
+    // clearly provenance, so a real ```json code block in the message body is
+    // never eaten. With the header the adapter already declared it plumbing.
+    if (!hadHeader && !looksProv) break;
+    if (firstMeta === null) firstMeta = meta;
+    rest = rest.slice(m[0].length);
+  }
+  if (firstMeta === null) return null;
+  return { meta: firstMeta, body: rest.trim() };
+}
+
+// Coerce an arbitrary brain-event `detail` (which may arrive as a string,
+// an array of content blocks, or a raw object — e.g. from the live SSE
+// before the server flattens it) into a readable string. NEVER produces the
+// literal "[object Object]" / "[object Object],[object Object]" leak that
+// `String(arr)` / array.join() caused. Pulls text/thinking out of Anthropic
+// content blocks; otherwise falls back to a length-capped JSON dump.
+function _brainDetailToString(detail) {
+  if (detail == null) return '';
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    var parts = [];
+    for (var i = 0; i < detail.length; i++) {
+      var b = detail[i];
+      if (b == null) continue;
+      if (typeof b === 'string') { parts.push(b); continue; }
+      if (typeof b === 'object') {
+        // Anthropic content blocks: {type:'text',text}/{type:'thinking',thinking}
+        if (typeof b.text === 'string' && b.text) { parts.push(b.text); continue; }
+        if (typeof b.thinking === 'string' && b.thinking) { parts.push(b.thinking); continue; }
+        // tool_use / tool_result and friends: a compact label, never [object Object].
+        if (b.type === 'tool_use' && b.name) { parts.push('🔧 ' + b.name); continue; }
+        if (b.type === 'tool_result') { parts.push(_brainDetailToString(b.content)); continue; }
+        // Unknown object block: short JSON, not [object Object].
+        try { parts.push(JSON.stringify(b)); } catch (e) {}
+      }
     }
-    return { meta: meta, body: (m[2] || '').trim() };
-  } catch(e) { return null; }
+    return parts.filter(function(p){return p;}).join('\n');
+  }
+  if (typeof detail === 'object') {
+    if (typeof detail.text === 'string' && detail.text) return detail.text;
+    try { return JSON.stringify(detail); } catch (e) { return ''; }
+  }
+  return String(detail);
+}
+
+// Detect + summarise an OpenClaw `<task-notification>` envelope so the Brain
+// feed shows a compact friendly line (summary + a status chip) instead of
+// dumping the raw XML/JSON blob. Returns an HTML string, or null if `s` is
+// not a task-notification.
+function _renderTaskNotification(s) {
+  if (s.indexOf('<task-notification') < 0) return null;
+  var sumMatch = s.match(/<summary>([\s\S]*?)<\/summary>/i);
+  var statMatch = s.match(/<status>([\s\S]*?)<\/status>/i);
+  var summary = sumMatch ? sumMatch[1].trim() : '';
+  var status = statMatch ? statMatch[1].trim().toLowerCase() : '';
+  if (!summary) {
+    // No parseable summary: truncate the raw blob rather than dumping it all.
+    var trunc = s.length > 200 ? s.slice(0, 200) + '…' : s;
+    summary = trunc;
+  }
+  if (summary.length > 240) summary = summary.slice(0, 240) + '…';
+  var chip = '';
+  if (status) {
+    var ok = status === 'completed' || status === 'success' || status === 'done';
+    var col = ok ? '#10b981' : (status === 'failed' || status === 'error' ? '#ef4444' : '#94a3b8');
+    var label = status.charAt(0).toUpperCase() + status.slice(1);
+    chip = '<span style="margin-left:6px;padding:1px 7px;border-radius:10px;font-size:10px;font-weight:700;background:' + col + '22;color:' + col + ';white-space:nowrap;">' + escHtml(label) + '</span>';
+  }
+  var tnLabel = (typeof t === 'function') ? t('brain.task_notification', null, 'Task') : 'Task';
+  return '<span style="white-space:pre-wrap;word-break:break-word;">'
+    + '<span style="color:var(--text-muted);font-size:10px;">📋 ' + escHtml(tnLabel) + ':</span> '
+    + escHtml(summary) + chip + '</span>';
 }
 
 function renderBrainDetail(detail) {
+  // Defensive: detail can arrive as an array/object (live SSE) — coerce to a
+  // readable string first so we never render "[object Object]". (BUG: the
+  // Unified Activity Stream showed "[object Object],[object Object]" + raw
+  // <task-notification> blobs.)
+  detail = _brainDetailToString(detail);
   if (!detail) return '';
   var s = detail.trim();
+  // task-notification envelope → compact friendly summary (not raw XML/JSON).
+  var tn = _renderTaskNotification(s);
+  if (tn) return tn;
   // Provenance prefix → channel pill + body
   var prov = _parseProvenancePrefix(s);
   if (prov) {
@@ -2505,6 +4240,135 @@ var _brainFilter = 'all';
 var _brainTypeFilter = 'all';
 var _brainChannelFilter = 'all';
 var _brainAllEvents = [];
+var _brainSSEEverConnected = false;
+
+// ── Date-time range filter ("what happened at 3AM?") ────────────────────
+// null = Live (streaming default). Otherwise {since, until, label} with
+// since/until as UTC ISO strings the server compares against event ts.
+// While a range is active the SSE stream is stopped and every live-refresh
+// path (SSE reconnect flush, poll fallback) is gated so the historical
+// view can't be clobbered by new events.
+var _brainRange = null;
+var _brainRangeRetries = 0; // relay_pending poll budget (hosted dashboards)
+
+function _brainRangeIso(d) {
+  // Second-precision UTC ISO ("2026-07-10T03:00:00Z") — matches the
+  // lexicographic ts compare in the store; ms would also work but this
+  // keeps URLs and cache keys tidy.
+  return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+function _brainRangeHuman(sinceIso, untilIso) {
+  try {
+    var opts = {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'};
+    var s = new Date(sinceIso), u = new Date(untilIso);
+    return s.toLocaleString([], opts) + ' → ' + u.toLocaleString([], opts);
+  } catch (e) { return sinceIso + ' → ' + untilIso; }
+}
+
+function _brainSetRangeActiveBtn(key) {
+  document.querySelectorAll('#brain-range-bar .brain-range-btn').forEach(function(b) {
+    b.classList.toggle('active', b.getAttribute('data-range') === String(key));
+  });
+}
+
+function _brainUpdateRangeUI() {
+  var banner = document.getElementById('brain-history-banner');
+  var bannerText = document.getElementById('brain-history-banner-text');
+  var label = document.getElementById('brain-density-label');
+  var feedLabel = document.querySelector('#brain-feed [data-i18n="brain.live_event_stream"]');
+  if (_brainRange) {
+    if (banner) banner.style.display = 'flex';
+    if (bannerText) bannerText.textContent = _brainRangeHuman(_brainRange.since, _brainRange.until);
+    if (label) label.textContent = t('brain.activity_density_window', null, 'Activity density · selected window');
+    if (feedLabel) feedLabel.textContent = t('brain.history_event_stream', null, 'Events in this window (newest first)');
+  } else {
+    if (banner) banner.style.display = 'none';
+    if (label) label.textContent = t('brain.activity_density', null, 'Activity density · last 60 min (30s buckets)');
+    if (feedLabel) feedLabel.textContent = t('brain.live_event_stream', null, 'Live event stream (newest first)');
+  }
+  if (typeof _updateBrainLiveIndicator === 'function') _updateBrainLiveIndicator();
+}
+
+function setBrainTimeRange(secondsOrLive, el) {
+  var custom = document.getElementById('brain-custom-range');
+  if (custom) custom.style.display = 'none';
+  _brainRangeRetries = 0;
+  if (secondsOrLive === 'live') {
+    _brainRange = null;
+    _brainSetRangeActiveBtn('live');
+    _brainUpdateRangeUI();
+    loadBrainPage(); // restarts SSE via the dwell hook
+    return;
+  }
+  var secs = parseInt(secondsOrLive, 10) || 3600;
+  var now = new Date();
+  _brainRange = {
+    since: _brainRangeIso(new Date(now.getTime() - secs * 1000)),
+    until: _brainRangeIso(now),
+  };
+  _brainSetRangeActiveBtn(secs);
+  _enterBrainHistoryMode();
+}
+
+function toggleBrainCustomRange(el) {
+  var custom = document.getElementById('brain-custom-range');
+  if (!custom) return;
+  var showing = custom.style.display !== 'none';
+  custom.style.display = showing ? 'none' : 'flex';
+  if (!showing) {
+    // Prefill a sensible investigation window: the last hour, in the
+    // user's local time (datetime-local inputs are local wall time).
+    var to = document.getElementById('brain-range-to');
+    var from = document.getElementById('brain-range-from');
+    var pad = function(n) { return (n < 10 ? '0' : '') + n; };
+    var fmt = function(d) {
+      return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+             'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+    };
+    var now = new Date();
+    if (to && !to.value) to.value = fmt(now);
+    if (from && !from.value) from.value = fmt(new Date(now.getTime() - 3600 * 1000));
+  }
+}
+
+function _brainOpenPicker(inp) {
+  // Open the native calendar popup on a click anywhere in the field, not
+  // just the tiny indicator icon (which is easy to miss on the dark theme).
+  // showPicker needs a user gesture and does not exist on Safari, so any
+  // failure is non-fatal: the field still accepts typed input.
+  try {
+    if (inp && typeof inp.showPicker === 'function') inp.showPicker();
+  } catch (e) {}
+}
+
+function applyBrainCustomRange() {
+  var from = document.getElementById('brain-range-from');
+  var to = document.getElementById('brain-range-to');
+  if (!from || !from.value || !to || !to.value) return;
+  // new Date(<datetime-local value>) parses as LOCAL time; toISOString
+  // converts to the UTC instant the server's ts compare expects.
+  var s = new Date(from.value), u = new Date(to.value);
+  if (isNaN(s.getTime()) || isNaN(u.getTime())) return;
+  if (s.getTime() > u.getTime()) { var tmp = s; s = u; u = tmp; }
+  _brainRange = {since: _brainRangeIso(s), until: _brainRangeIso(u)};
+  _brainRangeRetries = 0;
+  _brainSetRangeActiveBtn('custom');
+  _enterBrainHistoryMode();
+}
+
+function _enterBrainHistoryMode() {
+  // Freeze the live machinery, then fetch the window.
+  try { if (typeof _stopBrainSSE === 'function') _stopBrainSSE(); } catch (e) {}
+  if (typeof _brainRefreshTimer !== 'undefined' && _brainRefreshTimer) {
+    clearTimeout(_brainRefreshTimer);
+    _brainRefreshTimer = null;
+  }
+  _brainUpdateRangeUI();
+  var streamEl = document.getElementById('brain-stream');
+  if (streamEl) streamEl.innerHTML = '<div style="color:var(--text-muted);padding:20px;font-size:13px;">' + t('brain.loading_window', null, 'Loading this time window…') + '</div>';
+  loadBrainPage();
+}
 
 // Provider → emoji + display name. Mirrors routes/brain.py `_CHANNEL_ICON`
 // and clawmetry/sync.py `_CHANNEL_DIRS` (the canonical 21-adapter list).
@@ -2638,6 +4502,11 @@ function _extractChannelInfo(ev) {
   if (raw && typeof raw === 'object' && raw.body_capture === 'ack_only') {
     ackOnly = true;
   }
+  // Issue #1203: local-store fast-path strips ev.data so raw_blob is never
+  // present; brain.py now exposes body_capture as a flat field instead.
+  if (!ackOnly && ev.body_capture === 'ack_only') {
+    ackOnly = true;
+  }
   var bodyMissing = direction === 'out' && (ackOnly || !hasBodyText);
 
   return {
@@ -2702,6 +4571,28 @@ var _brainTypeIcons = {
 };
 
 
+// Issue #53 — apply the same filter pills that drive the list view to the
+// graph view, so toggling a source/type/channel hides matching neurons.
+function _brainApplyFilters(events) {
+  var out = Array.isArray(events) ? events : [];
+  if (_brainFilter && _brainFilter !== 'all') {
+    out = out.filter(function(ev) { return ev && ev.source === _brainFilter; });
+  }
+  if (_brainTypeFilter && _brainTypeFilter !== 'all') {
+    out = out.filter(function(ev) { return ev && ev.type === _brainTypeFilter; });
+  }
+  if (_brainChannelFilter && _brainChannelFilter !== 'all') {
+    out = out.filter(function(ev) { return ev && (ev.channel || '') === _brainChannelFilter; });
+  }
+  return out;
+}
+function _brainRefreshGraphIfActive() {
+  if (_brainViewMode !== 'graph') return;
+  if (typeof syncBrainGraph === 'function') {
+    syncBrainGraph(_brainApplyFilters(_brainAllEvents));
+  }
+}
+
 function setBrainTypeFilter(type, btn) {
   _brainTypeFilter = type;
   document.querySelectorAll('.brain-type-chip').forEach(function(b) {
@@ -2710,6 +4601,7 @@ function setBrainTypeFilter(type, btn) {
     b.style.fontWeight = isActive ? '600' : '400';
   });
   renderBrainFeed();
+  _brainRefreshGraphIfActive();
 }
 function setBrainFilter(source, btn) {
   _brainFilter = source;
@@ -2724,6 +4616,7 @@ function setBrainFilter(source, btn) {
   btn.style.fontWeight = '700';
   btn.style.boxShadow = '0 0 8px ' + (btn.style.borderColor || '#a855f7');
   renderBrainStream(_brainAllEvents);
+  _brainRefreshGraphIfActive();
 }
 
 function scrollBrainToTop() {
@@ -2742,6 +4635,16 @@ window.toggleBrainFilterExpanded = function() {
 function _brainChipHtml(s) {
   var isActive = _brainFilter === s.id;
   var icon = s.icon || (s.id === 'main' ? '🧠' : '🤖');
+  // Per-source runtime mascot, keyed off the source's runtime (explicit
+  // runtime/agent_type field or the session-id prefix). The "main" aggregate
+  // chip keeps the 🧠 glyph; a source whose runtime resolves to a known mascot
+  // shows the pixel logo instead of the generic 🤖.
+  if (s.id !== 'main' && typeof _cmRuntimeOf === 'function' && typeof window.cmRuntimeIcon === 'function') {
+    var _brt = _cmRuntimeOf({ id: s.id, runtime: s.runtime, agent_type: s.agent_type });
+    if (typeof window.cmRuntimeKnown === 'function' && window.cmRuntimeKnown(_brt)) {
+      icon = window.cmRuntimeIcon(_brt, 14, { title: _cmRuntimeLabel(_brt) });
+    }
+  }
   // Add 🧠 badge if this source has any THINK events (reasoning sessions)
   var hasReasoning = (_brainAllEvents || []).some(function(ev) {
     return ev.source === s.id && ev.type === 'THINK';
@@ -2851,6 +4754,7 @@ function setBrainChannelFilter(ch, btn) {
   _brainChannelFilter = ch;
   renderBrainChannelChips(window._brainChannelCounts || {});
   renderBrainStream(_brainAllEvents);
+  _brainRefreshGraphIfActive();
 }
 
 // Collapse runs of body-less outbound channel events from the same chat
@@ -2932,17 +4836,77 @@ function _toggleBrainCollapsedRun(btn, key) {
   if (event && event.stopPropagation) event.stopPropagation();
 }
 
-// Plumbing event types: internal queue housekeeping that's noise to anyone
-// debugging an actual conversation. Hidden by default; toggle in the Brain
-// header reveals them. Match is case-insensitive on type AND detail to
-// catch QUEUE-OPERATION / queue_operation / "queue-operation" alike.
+// Hallucination Risk Indicator (issue #567).
+// Backend stamps each LLM-call event with {risk_level, risk_explanation}.
+// We paint a tiny coloured pill next to the chip type. Tooltip explains
+// which signals tripped the band so a developer can act on it without
+// needing to crack open the raw event JSON.
+// Plain copy, no em-dashes (memory: feedback_no_em_dashes_in_user_facing_copy.md).
+var _riskBadgeStyles = {
+  low:    { dot: '🟢', label: 'Low risk',    color: '#16a34a', bg: 'rgba(22,163,74,0.12)' },
+  medium: { dot: '🟡', label: 'Medium risk', color: '#d97706', bg: 'rgba(217,119,6,0.14)' },
+  high:   { dot: '🔴', label: 'High risk',   color: '#dc2626', bg: 'rgba(220,38,38,0.16)' }
+};
+
+function renderRiskBadge(ev) {
+  if (!ev || typeof ev !== 'object') return '';
+  var risk = ev.risk;
+  if (!risk || typeof risk !== 'object') return '';
+  var lvl = String(risk.risk_level || '').toLowerCase();
+  var cfg = _riskBadgeStyles[lvl];
+  if (!cfg) return '';
+  var explanation = String(risk.risk_explanation || cfg.label);
+  // Title attr is plain text; escHtml double-escapes when interpolated
+  // inside an attribute, so we use escHtml exactly once.
+  var tip = cfg.label + '. ' + explanation;
+  return '<span class="brain-risk brain-risk-' + lvl + '" ' +
+    'data-risk-level="' + lvl + '" ' +
+    'style="display:inline-flex;align-items:center;gap:3px;background:' + cfg.bg +
+    ';color:' + cfg.color + ';padding:1px 6px;border-radius:3px;font-size:10px;' +
+    'font-weight:600;flex-shrink:0;white-space:nowrap;" ' +
+    'title="' + escHtml(tip) + '">' + cfg.dot + ' ' + cfg.label + '</span>';
+}
+
+// Walk a Brain event list and return true when any LLM-call event hit
+// the "high" band. Drives the session-row warning icon (issue #567).
+function sessionHasHighRisk(events, sessionId) {
+  if (!events || !events.length || !sessionId) return false;
+  for (var i = 0; i < events.length; i++) {
+    var ev = events[i];
+    if (!ev || !ev.risk) continue;
+    var lvl = String(ev.risk.risk_level || '').toLowerCase();
+    if (lvl !== 'high') continue;
+    // Match by sessionId, src, or source — Brain events tag via different
+    // fields depending on the source path (local-store vs JSONL parser).
+    var sid = ev.sessionId || ev.src || ev.source || '';
+    if (!sid) continue;
+    // Allow suffix match: sessions list often shortens to gateway key.
+    if (sid === sessionId || sessionId.indexOf(sid) >= 0 || sid.indexOf(sessionId) >= 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Plumbing event types: internal queue housekeeping + gateway CPU/RAM metrics
+// that are noise to anyone debugging an actual conversation. Hidden by default;
+// toggle in the Brain header reveals them. Match is case-insensitive and
+// separator-insensitive on type AND role to catch QUEUE-OPERATION /
+// queue_operation and GATEWAY.METRIC / gateway_metric alike.
 function _isPlumbingEvent(ev) {
   if (!ev) return false;
-  var t = String(ev.type || '').toLowerCase().replace(/[_-]/g, '');
-  if (t === 'queueoperation') return true;
-  // Belt-and-suspenders: some ingests stuff "queue-operation" into role/detail
-  var role = String(ev.role || '').toLowerCase().replace(/[_-]/g, '');
-  if (role === 'queueoperation') return true;
+  // Infra/plumbing event types: machine noise, not agent content, so they're
+  // hidden by default behind "Show plumbing". gateway.metric is a CPU/RAM ping
+  // emitted ~every 40s — left unfiltered it floods the stream and buries real
+  // activity (the Brain tab looked broken when the agent was idle).
+  // Normalise (lowercase, drop . _ -) so "gateway.metric", "GATEWAY.METRIC"
+  // and "queue-operation" all collapse to one comparable token.
+  var PLUMBING = { queueoperation: 1, gatewaymetric: 1 };
+  var t = String(ev.type || '').toLowerCase().replace(/[._-]/g, '');
+  if (PLUMBING[t]) return true;
+  // Belt-and-suspenders: some ingests stuff the type into role/detail.
+  var role = String(ev.role || '').toLowerCase().replace(/[._-]/g, '');
+  if (PLUMBING[role]) return true;
   return false;
 }
 
@@ -2955,6 +4919,13 @@ function renderBrainStream(events) {
   }
   if (_brainChannelFilter !== 'all') {
     filtered = filtered.filter(function(ev) { return (ev.channel || '') === _brainChannelFilter; });
+  }
+  // Global runtime switcher (header): scope the activity stream to one runtime
+  // so Brain stops mixing OpenClaw with Claude Code / Codex / etc. Each event
+  // carries `sessionId`, whose prefix is the runtime discriminator.
+  var _brainRt = (typeof _cmRuntimeFilter === 'function') ? _cmClientFilterRt(_cmRuntimeFilter()) : 'all';
+  if (_brainRt && _brainRt !== 'all') {
+    filtered = filtered.filter(function(ev) { return _cmRuntimeOf(ev) === _brainRt; });
   }
   // Plumbing toggle: hide QUEUE-OPERATION rows unless user opted in.
   // Updates the "Show plumbing (N hidden)" label as a side-effect so the
@@ -2980,10 +4951,31 @@ function renderBrainStream(events) {
   // (filter changes, auto-refresh) recompute from the source of truth.
   filtered = _collapseBodylessOutbound(filtered);
   if (!filtered || filtered.length === 0) {
-    el.innerHTML = '<div style="color:var(--text-muted);padding:20px">No activity yet</div>';
+    // Runtime-aware empty state: the header switcher counts SESSIONS on record
+    // (lifetime), but this feed only shows RECENT events. Selecting a runtime
+    // with sessions but no recent activity used to read a bare "No activity
+    // yet", which contradicts the switcher's "Goose · 3 sessions". Explain it.
+    var _bf = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+    var _bmsg = 'No activity yet';
+    if (_bf && _bf !== 'all') {
+      var _blbl = (_CM_RT_LABEL && _CM_RT_LABEL[_bf]) || _bf;
+      var _bn = (_cmGlobalRtCounts && _cmGlobalRtCounts[_bf]) || 0;
+      _bmsg = 'No recent ' + escHtml(_blbl) + ' activity in this live feed.'
+        + (_bn ? ' ' + escHtml(_blbl) + ' has ' + _bn + ' session' + (_bn === 1 ? '' : 's')
+            + ' on record (older than this window) — open the Tracing tab to explore them.' : '');
+    }
+    el.innerHTML = '<div style="color:var(--text-muted);padding:20px;line-height:1.6;">' + _bmsg + '</div>';
     return;
   }
+  // Issue #1203: one-line banner when Telegram outbound rows are visible so
+  // users don't mistake the "(no body captured)" affordance for a broken tool.
+  var hasTelegramAck = filtered.some(function(ev) {
+    return (ev.provider === 'telegram' || ev.channel === 'telegram') && ev.direction === 'out';
+  });
   var html = '';
+  if (hasTelegramAck) {
+    html += '<div style="display:flex;align-items:center;gap:6px;padding:5px 10px;margin-bottom:6px;background:rgba(37,99,235,0.08);border:1px solid rgba(37,99,235,0.2);border-radius:6px;font-size:11px;color:#60a5fa;">📱 Telegram body capture pending OpenClaw upstream — outbound counts only</div>';
+  }
   filtered.forEach(function(ev) {
     var color = ev.color || brainSourceColor(ev.source || 'main');
     var evType = ev.type || 'TOOL';
@@ -3034,6 +5026,11 @@ function renderBrainStream(events) {
         taskBadge = '<span class="brain-task-type" style="color:' + _ttCfg[1] + ';font-size:10px;flex-shrink:0;white-space:nowrap;" title="Task type: ' + _ttCfg[2] + '">' + _ttCfg[0] + ' ' + _ttCfg[2] + '</span>';
       }
     }
+    // Hallucination risk badge (issue #567). Only painted on LLM-call
+    // chips that the backend stamped with a {risk_level, risk_explanation}
+    // dict. Green/yellow/red dot + tooltip — readable without ML internals
+    // per feedback_simple_ui_for_nontechnical.md.
+    var riskBadge = renderRiskBadge(ev);
     // Build turn timeline for USER events (Phase 4: Agent Runtime Timeline)
     var turnTimeline = '';
     if (evType === 'USER') {
@@ -3102,14 +5099,61 @@ function renderBrainStream(events) {
           turnTimeline += '<span style="color:var(--text-faint);min-width:50px;flex-shrink:0;">' + teTime + '</span>';
           turnTimeline += '<span style="color:' + teCol + ';min-width:55px;font-weight:600;flex-shrink:0;">' + teIcon + ' ' + te.type + '</span>';
           turnTimeline += '<span style="color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escHtml(teDetail) + '</span>';
+          var _rcSid = te.source || 'main';
+          var _rcContainerId = null;
           if (te.type === 'THINK') {
-            var _rcSid = te.source || 'main';
-            var _rcContainerId = 'rc-' + _rcSid.slice(0, 8) + '-' + (te.time || '').replace(/[^0-9]/g, '').slice(-6);
+            _rcContainerId = 'rc-' + _rcSid.slice(0, 8) + '-' + (te.time || '').replace(/[^0-9]/g, '').slice(-6);
             turnTimeline += '<button onclick="event.stopPropagation();loadReasoningChain(\'' + escHtml(_rcSid) + '\',\'' + escHtml(_rcContainerId) + '\')" style="flex-shrink:0;padding:1px 7px;border-radius:10px;border:1px solid #6366f1;background:transparent;color:#818cf8;font-size:10px;cursor:pointer;white-space:nowrap;">&#129504; View chain</button>';
-            turnTimeline += '</div>';
+          }
+          // Issue #568: per-LLM-call Timeline button on AGENT / THINK rows.
+          // Only renders when the row carries an eventId (local-store fast
+          // path); falls back gracefully when older JSONL-only data lacks it.
+          var _tlContainerId = null;
+          if ((te.type === 'AGENT' || te.type === 'THINK') && te.eventId) {
+            var _tlSid = te.sessionId || te.source || '';
+            _tlContainerId = 'timeline-' + (te.eventId || '').replace(/[^a-z0-9-]/gi, '').slice(0, 24);
+            turnTimeline += '<button onclick="event.stopPropagation();loadLlmCallTimeline(\'' + escHtml(te.eventId) + '\',\'' + escHtml(_tlSid) + '\',\'' + escHtml(_tlContainerId) + '\')" style="flex-shrink:0;padding:1px 7px;border-radius:10px;border:1px solid #22c55e;background:transparent;color:#22c55e;font-size:10px;cursor:pointer;white-space:nowrap;" title="Per-LLM-call lifecycle timeline">&#128202; Timeline</button>';
+          }
+          // Issue #563: per-LLM-call Token Confidence button on AGENT rows.
+          // Renders heatmap when upstream captured logprobs; otherwise shows
+          // a single-line "not available" hint with how to enable it.
+          var _tcContainerId = null;
+          if (te.type === 'AGENT') {
+            _tcContainerId = 'tokconf-' + ((te.eventId || (te.time || '') + (te.source || '')) + '').replace(/[^a-z0-9-]/gi, '').slice(0, 24);
+            turnTimeline += '<button onclick="event.stopPropagation();toggleTokenConfidence(this,\'' + escHtml(_tcContainerId) + '\')" data-tc=\'' + escHtml(JSON.stringify(te.token_confidence || null)) + '\' style="flex-shrink:0;padding:1px 7px;border-radius:10px;border:1px solid #38bdf8;background:transparent;color:#38bdf8;font-size:10px;cursor:pointer;white-space:nowrap;" title="How confident was the model in each word?">&#128202; Confidence</button>';
+          }
+          // Issue #1616: per-tool-call Alternatives toggle on tool rows.
+          // Shows the options the model considered before picking this tool
+          // (from OpenAI logprobs or Claude/Gemini extended-thinking). When
+          // no real alternatives data is available we paint an honest
+          // "not available for this model" hint — never invent options.
+          var _altContainerId = null;
+          if (te.tool_alternatives) {
+            _altContainerId = 'toolalt-' + ((te.eventId || (te.time || '') + (te.source || '')) + '').replace(/[^a-z0-9-]/gi, '').slice(0, 24);
+            turnTimeline += '<button onclick="event.stopPropagation();toggleToolAlternatives(this,\'' + escHtml(_altContainerId) + '\')" data-ta=\'' + escHtml(JSON.stringify(te.tool_alternatives || null)) + '\' style="flex-shrink:0;padding:1px 7px;border-radius:10px;border:1px solid #a78bfa;background:transparent;color:#a78bfa;font-size:10px;cursor:pointer;white-space:nowrap;" title="What other tools did the model consider before picking this one?">&#9879; Alternatives</button>';
+          }
+          // Issue #1414: "Why did this happen?" — LLM-narrated explanation for AGENT turns.
+          var _whyContainerId = null;
+          if (te.type === 'AGENT' && te.eventId) {
+            var _whySid = te.sessionId || '';
+            _whyContainerId = 'why-' + te.eventId.replace(/[^a-z0-9-]/gi, '').slice(0, 24);
+            turnTimeline += '<button onclick="event.stopPropagation();loadBrainWhy(\'' + escHtml(_whySid) + '\',\'' + escHtml(te.eventId) + '\',\'' + escHtml(_whyContainerId) + '\')" style="flex-shrink:0;padding:1px 7px;border-radius:10px;border:1px solid #f43f5e;background:transparent;color:#fb7185;font-size:10px;cursor:pointer;white-space:nowrap;" title="Why did this happen? (AI narration)">&#128269; Why?</button>';
+          }
+          turnTimeline += '</div>';
+          if (_rcContainerId) {
             turnTimeline += '<div id="' + escHtml(_rcContainerId) + '" style="margin:2px 0 4px 56px;"></div>';
-          } else {
-            turnTimeline += '</div>';
+          }
+          if (_tlContainerId) {
+            turnTimeline += '<div id="' + escHtml(_tlContainerId) + '" class="llm-call-timeline-host" style="margin:2px 0 4px 56px;"></div>';
+          }
+          if (_tcContainerId) {
+            turnTimeline += '<div id="' + escHtml(_tcContainerId) + '" class="token-confidence-host" style="margin:2px 0 4px 56px;"></div>';
+          }
+          if (_altContainerId) {
+            turnTimeline += '<div id="' + escHtml(_altContainerId) + '" class="tool-alternatives-host" style="margin:2px 0 4px 56px;"></div>';
+          }
+          if (_whyContainerId) {
+            turnTimeline += '<div id="' + escHtml(_whyContainerId) + '" class="brain-why-host" style="margin:2px 0 4px 56px;"></div>';
           }
         });
         if (currentSubagent) turnTimeline += '</div>'; // close last sub-agent group
@@ -3193,6 +5237,7 @@ function renderBrainStream(events) {
     }
     html += skillBadge;
     html += taskBadge;
+    html += riskBadge;
     html += '</div>';
     html += '<span class="brain-detail">' + renderBrainDetail(ev.detail || '') + '</span>';
     html += turnTimeline;
@@ -3220,7 +5265,7 @@ function loadReasoningChain(sessionId, containerId) {
     container.dataset.loaded = '0';
     return;
   }
-  container.innerHTML = '<span style="color:var(--text-muted);font-size:10px;">Loading\u2026</span>';
+  container.innerHTML = '<span style="color:var(--text-muted);font-size:10px;">' + t("app.loading_2", null, "Loading\u2026") + '</span>';
   fetch('/api/reasoning?session=' + encodeURIComponent(sessionId))
     .then(function(r) { return r.json(); })
     .then(function(data) {
@@ -3228,7 +5273,7 @@ function loadReasoningChain(sessionId, containerId) {
       var chains = data.chains || [];
       var summary = data.summary || {};
       if (!chains.length) {
-        container.innerHTML = '<span style="color:var(--text-muted);font-size:10px;">No reasoning chains found.</span>';
+        container.innerHTML = '<span style="color:var(--text-muted);font-size:10px;">' + t("app.no_reasoning_chains_found", null, "No reasoning chains found.") + '</span>';
         return;
       }
       var html = '';
@@ -3240,13 +5285,20 @@ function loadReasoningChain(sessionId, containerId) {
       if (summary.avg_efficiency > 0) {
         html += '<span>&#9889; Efficiency: ' + summary.avg_efficiency + ':1</span>';
       }
+      if (summary.avg_coherence_score !== undefined) {
+        var cScore = summary.avg_coherence_score;
+        var cLabel = summary.avg_coherence_label || 'low';
+        var cCol = cLabel === 'high' ? '#22c55e' : (cLabel === 'medium' ? '#eab308' : '#ef4444');
+        html += '<span title="Coherence: how much thinking vocabulary appeared in the answer (0–100)" style="display:inline-flex;align-items:center;gap:3px;padding:0 6px;border-radius:10px;background:' + cCol + '22;color:' + cCol + ';font-size:9px;font-weight:700;">&#127919; ' + cScore + ' ' + cLabel + '</span>';
+      }
       html += '<span>' + chains.length + ' chain' + (chains.length > 1 ? 's' : '') + '</span>';
       html += '</div>';
       // Render each chain
       chains.forEach(function(chain, ci) {
         html += '<div style="padding:4px 8px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;margin-bottom:4px;">';
         if (chains.length > 1) {
-          html += '<div style="font-size:10px;color:var(--text-muted);margin-bottom:3px;">Chain ' + (ci + 1) + ' &mdash; ' + chain.thinking_tokens + ' tokens</div>';
+          var cc = chain.coherence_label === 'high' ? '#22c55e' : (chain.coherence_label === 'medium' ? '#eab308' : '#ef4444');
+          html += '<div style="display:flex;gap:6px;align-items:center;font-size:10px;color:var(--text-muted);margin-bottom:3px;">Chain ' + (ci + 1) + ' — ' + chain.thinking_tokens + ' tokens' + (chain.coherence_score !== undefined ? '<span style="padding:0 5px;border-radius:8px;background:' + cc + '22;color:' + cc + ';font-size:9px;font-weight:700;">' + chain.coherence_score + ' ' + (chain.coherence_label || '') + '</span>' : '') + '</div>';
         }
         (chain.steps || []).forEach(function(step) {
           var col = _rcStepColors[step.type] || '#6b7280';
@@ -3269,50 +5321,434 @@ function loadReasoningChain(sessionId, containerId) {
       container.innerHTML = html;
     })
     .catch(function(err) {
-      container.innerHTML = '<span style="color:#ef4444;font-size:10px;">Error loading reasoning chain.</span>';
+      container.innerHTML = '<span style="color:#ef4444;font-size:10px;">' + t("app.error_loading_reasoning_chain", null, "Error loading reasoning chain.") + '</span>';
     });
+}
+
+// Issue #1414: "Why did this happen?" — fetch LLM narration for one AGENT turn.
+function loadBrainWhy(sessionId, eventId, containerId) {
+  var container = document.getElementById(containerId);
+  if (!container) return;
+  // Toggle: second click clears the panel.
+  if (container.dataset.loaded === '1') {
+    container.innerHTML = '';
+    container.dataset.loaded = '0';
+    return;
+  }
+  container.innerHTML = '<span style="color:var(--text-muted);font-size:10px;">Asking AI…</span>';
+  fetch('/api/brain/why/' + encodeURIComponent(sessionId) + '/' + encodeURIComponent(eventId))
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      container.dataset.loaded = '1';
+      var narration = data.narration || '(no narration)';
+      var anomaly = data.anomaly || false;
+      var html = '<div style="padding:6px 10px;background:rgba(244,63,94,0.08);border:1px solid rgba(244,63,94,0.2);border-radius:6px;font-size:11px;line-height:1.5;">';
+      if (anomaly) {
+        html += '<div style="color:#f43f5e;font-weight:700;margin-bottom:4px;">⚠ Anomaly detected</div>';
+      }
+      html += '<div style="color:var(--text-secondary);">🔍 ' + escHtml(narration) + '</div>';
+      if (data.model && data.model !== 'none') {
+        html += '<div style="color:var(--text-faint);font-size:9px;margin-top:4px;">via ' + escHtml(data.model) + '</div>';
+      }
+      html += '</div>';
+      container.innerHTML = html;
+    })
+    .catch(function() {
+      container.innerHTML = '<span style="color:#ef4444;font-size:10px;">Error loading explanation.</span>';
+    });
+}
+
+// ── Per-LLM-call lifecycle Timeline (issue #568) ──────────────────────────
+//
+// Renders an inline horizontal bar showing the 5 (reasoning) or 3 (non
+// reasoning) phase markers of one LLM call: prompt_received,
+// reasoning_started, reasoning_completed, first_output_token, completion.
+// Backend at /api/llm-call-timeline/<event_id> returns absolute ms offsets
+// from the prompt origin so the JS just needs to position absolute divs.
+// No chart library — pure DOM (per CLAUDE.md "no build step").
+
+var _llmTimelinePhaseColors = {
+  prompt_received:     '#60a5fa',  // blue: input
+  reasoning_started:   '#a78bfa',  // purple: thinking starts
+  reasoning_completed: '#8b5cf6',  // purple-dark: thinking ends
+  first_output_token:  '#22c55e',  // green: generation begins
+  completion:          '#10b981'   // green-dark: done
+};
+var _llmTimelinePhaseLabels = {
+  prompt_received:     'Prompt received',
+  reasoning_started:   'Reasoning started',
+  reasoning_completed: 'Reasoning completed',
+  first_output_token:  'First output token',
+  completion:          'Completion'
+};
+
+function _formatTimelineMs(ms) {
+  // Compact monospace label: 0ms / 150ms / 4.2s / 1m12s. Designed to fit
+  // under a marker without overflowing the bar.
+  if (ms == null) return '';
+  var n = Number(ms) || 0;
+  if (n < 1000) return n + 'ms';
+  if (n < 60000) return (n / 1000).toFixed(1) + 's';
+  var m = Math.floor(n / 60000);
+  var s = Math.floor((n % 60000) / 1000);
+  return m + 'm' + (s < 10 ? '0' : '') + s + 's';
+}
+
+function renderLlmCallTimeline(data) {
+  // Pure function — takes the /api/llm-call-timeline payload, returns HTML.
+  // Kept separate from loadLlmCallTimeline so unit tests can exercise it
+  // without faking fetch.
+  if (!data || !Array.isArray(data.phases) || data.phases.length === 0) {
+    return '<span style="color:var(--text-muted);font-size:10px;">No timeline data.</span>';
+  }
+  var total = Math.max(1, Number(data.total_ms) || 0);
+  var phases = data.phases;
+  var html = '';
+  html += '<div class="llm-call-timeline" style="margin:6px 0;padding:8px 10px;background:var(--bg-secondary,rgba(0,0,0,0.15));border:1px solid var(--border,rgba(255,255,255,0.08));border-radius:6px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">';
+  // Header: model + total span + reasoning flag.
+  html += '<div class="llm-call-timeline-header" style="display:flex;gap:10px;align-items:center;margin-bottom:8px;font-size:10px;color:var(--text-muted);flex-wrap:wrap;">';
+  if (data.model) {
+    html += '<span style="color:#a78bfa;">&#129302; ' + escHtml(data.model) + '</span>';
+  }
+  html += '<span>&#9202; total ' + _formatTimelineMs(total) + '</span>';
+  html += '<span>' + (data.reasoning ? '&#129504; reasoning' : 'no reasoning') + '</span>';
+  html += '<span>' + phases.length + ' phases</span>';
+  html += '</div>';
+  // The bar itself: absolute markers + a subtle baseline track.
+  html += '<div class="llm-call-timeline-bar" style="position:relative;height:14px;background:linear-gradient(90deg,rgba(96,165,250,0.10),rgba(16,185,129,0.10));border-radius:7px;margin-bottom:24px;">';
+  phases.forEach(function(p, idx) {
+    var pct = total > 0 ? (Number(p.ms) || 0) / total * 100 : 0;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    var col = _llmTimelinePhaseColors[p.phase] || '#888';
+    // Marker: 10x18 vertical pill centered on the percentage. Clamp the
+    // left % so the first/last marker don't get clipped at the bar edges.
+    var leftStyle = 'left:calc(' + pct.toFixed(2) + '% - 5px)';
+    var titleParts = [
+      _llmTimelinePhaseLabels[p.phase] || p.phase,
+      _formatTimelineMs(p.ms)
+    ];
+    if (p.tokens) titleParts.push(p.tokens + ' tokens');
+    if (p.estimated) titleParts.push('(estimated)');
+    html += '<div class="llm-call-timeline-marker" data-phase="' + escHtml(p.phase) +
+            '" title="' + escHtml(titleParts.join(' · ')) +
+            '" style="position:absolute;top:-2px;' + leftStyle +
+            ';width:10px;height:18px;background:' + col +
+            ';border-radius:3px;box-shadow:0 0 4px ' + col + '88;"></div>';
+    // ms label below the marker. Stagger odd indices down so labels
+    // overlapping in a tight cluster don't pile on top of each other.
+    var staggerTop = (idx % 2 === 0) ? '22px' : '34px';
+    html += '<div class="llm-call-timeline-label" style="position:absolute;top:' +
+            staggerTop + ';left:calc(' + pct.toFixed(2) + '% - 24px);width:48px;text-align:center;font-size:9px;color:' +
+            col + ';white-space:nowrap;">' + escHtml(_formatTimelineMs(p.ms));
+    if (p.estimated) html += '*';
+    html += '</div>';
+  });
+  html += '</div>';
+  // Legend row — one chip per phase so non-technical users can read the
+  // colour key without hovering. Kept terse: emoji + label, no jargon.
+  html += '<div class="llm-call-timeline-legend" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;font-size:9px;">';
+  phases.forEach(function(p) {
+    var col = _llmTimelinePhaseColors[p.phase] || '#888';
+    var lbl = _llmTimelinePhaseLabels[p.phase] || p.phase;
+    html += '<span style="display:inline-flex;align-items:center;gap:3px;padding:1px 6px;border-radius:8px;background:' +
+            col + '22;color:' + col + ';">';
+    html += '<span style="width:7px;height:7px;border-radius:50%;background:' + col + ';display:inline-block;"></span>';
+    html += escHtml(lbl);
+    if (p.estimated) html += ' *';
+    html += '</span>';
+  });
+  html += '</div>';
+  if (phases.some(function(p) { return p.estimated; })) {
+    html += '<div style="margin-top:4px;font-size:9px;color:var(--text-muted);font-style:italic;">* estimated: first-token timing is inferred from completion size when the model did not emit a streaming marker.</div>';
+  }
+  html += '</div>';
+  return html;
+}
+
+function loadLlmCallTimeline(eventId, sessionId, containerId) {
+  // Toggle pattern matches loadReasoningChain: second click clears.
+  var container = document.getElementById(containerId);
+  if (!container) return;
+  if (container.dataset.loaded === '1') {
+    container.innerHTML = '';
+    container.dataset.loaded = '0';
+    return;
+  }
+  container.innerHTML = '<span style="color:var(--text-muted);font-size:10px;">' + t("app.loading_timeline", null, "Loading timeline…") + '</span>';
+  var url = '/api/llm-call-timeline/' + encodeURIComponent(eventId);
+  if (sessionId) url += '?session_id=' + encodeURIComponent(sessionId);
+  fetch(url)
+    .then(function(r) {
+      if (!r.ok) {
+        return r.json().then(function(j) { throw new Error(j.error || ('HTTP ' + r.status)); });
+      }
+      return r.json();
+    })
+    .then(function(data) {
+      container.dataset.loaded = '1';
+      container.innerHTML = renderLlmCallTimeline(data);
+    })
+    .catch(function(err) {
+      container.innerHTML = '<span style="color:#ef4444;font-size:10px;">' + t("app.timeline_unavailable", null, "Timeline unavailable") + ': ' + escHtml(String(err && err.message ? err.message : err)) + '</span>';
+    });
+}
+
+// Issue #563 — Token Probability Visualizer.
+// "How confident was the model in each word?" — per-token heatmap rendered
+// inline below an AGENT row when upstream captured logprobs. When no
+// logprobs are present (every Anthropic call today), we show a single
+// explanatory line with how to enable the feature so the panel is never
+// a dead-end. Plain copy, no em-dashes (memory:
+// feedback_no_em_dashes_in_user_facing_copy.md).
+var _TOKEN_CONF_BAND = {
+  h: { color: '#16a34a', bg: 'rgba(22,163,74,0.18)',  label: 'High'   },
+  m: { color: '#d97706', bg: 'rgba(217,119,6,0.18)',  label: 'Medium' },
+  l: { color: '#ea580c', bg: 'rgba(234,88,12,0.20)',  label: 'Low'    },
+  v: { color: '#dc2626', bg: 'rgba(220,38,38,0.24)',  label: 'Very low' }
+};
+
+function _renderTokenConfidenceHeatmap(payload) {
+  if (!payload || !Array.isArray(payload.tokens) || !payload.tokens.length) return '';
+  var s = payload.summary || {};
+  var avgPct = Math.round(((s.avg_prob || 0) * 100));
+  var headline = 'Avg confidence: ' + avgPct + '% &middot; ' +
+    (s.token_count || 0) + ' tokens';
+  if (s.high_variance_count) {
+    headline += ' &middot; <span style="color:#dc2626;font-weight:600;">' +
+      s.high_variance_count + ' low-confidence</span>';
+  }
+  var html = '<div class="token-confidence-panel" style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:11px;">';
+  html += '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;">';
+  html += '<span style="color:var(--text-muted);">' + headline + '</span>';
+  html += '<span style="color:var(--text-faint);font-size:10px;">hover a token to see what else the model considered</span>';
+  html += '</div>';
+  html += '<div class="token-confidence-tokens" style="line-height:1.9;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;word-break:break-word;">';
+  payload.tokens.forEach(function(t) {
+    var cfg = _TOKEN_CONF_BAND[t.band] || _TOKEN_CONF_BAND.m;
+    var pct = Math.round((t.prob || 0) * 100);
+    var icon = (t.band === 'v') ? ' ⚡' : '';
+    // Build tooltip: chosen token + top-k alternatives + cumulative mass.
+    var tipLines = ['"' + (t.token || '') + '"  ' + pct + '%' + (t.rank > 1 ? '  (rank ' + t.rank + ')' : '')];
+    if (Array.isArray(t.top_k) && t.top_k.length) {
+      tipLines.push('');
+      tipLines.push('Top alternatives:');
+      var mass = 0;
+      t.top_k.forEach(function(alt) {
+        var ap = Math.round((alt.prob || 0) * 100);
+        tipLines.push('  ' + ap + '%  "' + (alt.token || '') + '"');
+        mass += (alt.prob || 0);
+      });
+      tipLines.push('');
+      tipLines.push(Math.round(mass * 100) + '% of probability mass in top ' + t.top_k.length);
+    }
+    var visible = (t.token || '').replace(/\n/g, '↵').replace(/\t/g, '→');
+    html += '<span class="token-conf-cell" title="' + escHtml(tipLines.join('\n')) +
+      '" style="display:inline-block;padding:1px 3px;margin:1px 1px;border-radius:3px;background:' +
+      cfg.bg + ';color:' + cfg.color + ';border-bottom:2px solid ' + cfg.color + ';cursor:help;">' +
+      escHtml(visible) + icon + '</span>';
+  });
+  if (payload.truncated) {
+    html += '<span style="color:var(--text-muted);font-style:italic;margin-left:6px;">&hellip; ' +
+      ((s.total_tokens || 0) - (s.token_count || 0)) + ' more tokens</span>';
+  }
+  html += '</div>';
+  // Legend
+  html += '<div style="display:flex;gap:10px;margin-top:8px;font-size:10px;color:var(--text-muted);flex-wrap:wrap;">';
+  ['h','m','l','v'].forEach(function(b) {
+    var cfg = _TOKEN_CONF_BAND[b];
+    html += '<span><span style="display:inline-block;width:10px;height:10px;background:' + cfg.bg +
+      ';border:1px solid ' + cfg.color + ';border-radius:2px;margin-right:3px;vertical-align:middle;"></span>' +
+      escHtml(cfg.label) + '</span>';
+  });
+  html += '</div>';
+  html += '</div>';
+  return html;
+}
+
+function _renderTokenConfidenceUnavailable() {
+  // Friendly explanation when upstream did NOT capture logprobs. Common
+  // case today since Anthropic does not expose per-token logprobs. Keep
+  // it short and tell the user what would unblock it.
+  return '<div class="token-confidence-panel token-confidence-empty" style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-size:12px;color:var(--text-secondary);">' +
+    '<div style="font-weight:600;color:var(--text-primary);margin-bottom:4px;">' +
+    '&#128202; Per-token confidence not available for this call</div>' +
+    '<div style="color:var(--text-muted);font-size:11px;line-height:1.5;">' +
+    'How confident was the model in each word? When the API provider returns ' +
+    '<code style="background:var(--bg-primary);padding:1px 4px;border-radius:3px;">logprobs</code>, ' +
+    'we paint a colour-coded heatmap here so you can spot the tokens the model was guessing on. ' +
+    'OpenAI and Gemini compatible providers support this today. ' +
+    'Anthropic does not expose per-token logprobs yet, so Claude calls fall through to this hint. ' +
+    'Track upstream work in <a href="https://github.com/vivekchand/clawmetry/issues/563" target="_blank" rel="noopener" style="color:#60a5fa;">#563</a>.' +
+    '</div></div>';
+}
+
+window.toggleTokenConfidence = function(btn, containerId) {
+  var container = document.getElementById(containerId);
+  if (!container) return;
+  if (container.dataset.loaded === '1') {
+    container.innerHTML = '';
+    container.dataset.loaded = '0';
+    return;
+  }
+  var raw = btn && btn.getAttribute ? btn.getAttribute('data-tc') : null;
+  var payload = null;
+  try { payload = raw ? JSON.parse(raw) : null; } catch (e) { payload = null; }
+  container.innerHTML = payload
+    ? _renderTokenConfidenceHeatmap(payload)
+    : _renderTokenConfidenceUnavailable();
+  container.dataset.loaded = '1';
+};
+
+// Exported for unit tests (Node + jsdom). No-op in the browser global.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports._renderTokenConfidenceHeatmap = _renderTokenConfidenceHeatmap;
+  module.exports._renderTokenConfidenceUnavailable = _renderTokenConfidenceUnavailable;
+}
+
+// ── Issue #1616 — Alternatives-considered panel ────────────────────────
+// "What else did the agent reject?" Per OpenClaw blog Pillar #2 (Decision
+// Auditing). When the model exposes alternatives (OpenAI logprobs or
+// Claude/Gemini extended-thinking), we paint the chosen tool next to the
+// rejected options so the user can spot training gaps and close calls.
+// Plain copy, no em-dashes (memory: feedback_no_em_dashes_in_user_facing_copy).
+function _renderToolAlternativesPanel(payload) {
+  if (!payload || !payload.chosen) return '';
+  var chosen = payload.chosen;
+  var chosenScore = payload.chosen_score;
+  var alts = Array.isArray(payload.alternatives) ? payload.alternatives : [];
+  var source = payload.source || 'none';
+  if (!alts.length) return _renderToolAlternativesUnavailable();
+  var chosenPct = (chosenScore != null) ? ' (' + Math.round(chosenScore * 100) / 100 + ')' : '';
+  var altText = alts.map(function(a) {
+    var nm = a && a.name ? a.name : '';
+    var sc = (a && a.score != null) ? ' (' + Math.round(a.score * 100) / 100 + ')' : '';
+    return '<code style="background:var(--bg-primary);padding:1px 4px;border-radius:3px;color:#a78bfa;">' +
+      escHtml(nm) + '</code>' + escHtml(sc);
+  }).join(', ');
+  var sourceLabel = (source === 'thinking')
+    ? 'from extended-thinking'
+    : (source === 'logprobs' ? 'from token logprobs' : '');
+  var html = '<div class="tool-alternatives-panel" style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:11px;">';
+  html += '<div style="font-size:10px;color:var(--text-muted);margin-bottom:4px;">';
+  html += 'Alternatives are other tools the model evaluated and rejected before picking this one.';
+  html += '</div>';
+  html += '<div style="font-size:12px;color:var(--text-primary);">';
+  html += 'Chose <code style="background:var(--bg-primary);padding:1px 4px;border-radius:3px;color:#22c55e;font-weight:600;">' +
+    escHtml(chosen) + '</code>' + escHtml(chosenPct) + ' over ' + altText + '.';
+  html += '</div>';
+  if (sourceLabel) {
+    html += '<div style="font-size:10px;color:var(--text-faint);margin-top:6px;">Source: ' + escHtml(sourceLabel) + '</div>';
+  }
+  html += '</div>';
+  return html;
+}
+
+function _renderToolAlternativesUnavailable() {
+  // Honest empty state — Anthropic without extended-thinking does not
+  // expose tool-selection alternatives. Don't fabricate options (user
+  // trust > fake completeness, per PR prompt).
+  return '<div class="tool-alternatives-panel tool-alternatives-empty" style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-size:12px;color:var(--text-secondary);">' +
+    '<div style="font-weight:600;color:var(--text-primary);margin-bottom:4px;">' +
+    '&#9879; Alternatives data not available for this model</div>' +
+    '<div style="color:var(--text-muted);font-size:11px;line-height:1.5;">' +
+    'Alternatives show what other tools the model considered before picking this one. ' +
+    'We extract them from OpenAI logprobs or Claude/Gemini extended-thinking. ' +
+    'This call did not carry either signal, so no alternatives can be shown. ' +
+    'Track upstream work in <a href="https://github.com/vivekchand/clawmetry/issues/1616" target="_blank" rel="noopener" style="color:#60a5fa;">#1616</a>.' +
+    '</div></div>';
+}
+
+window.toggleToolAlternatives = function(btn, containerId) {
+  var container = document.getElementById(containerId);
+  if (!container) return;
+  if (container.dataset.loaded === '1') {
+    container.innerHTML = '';
+    container.dataset.loaded = '0';
+    return;
+  }
+  var raw = btn && btn.getAttribute ? btn.getAttribute('data-ta') : null;
+  var payload = null;
+  try { payload = raw ? JSON.parse(raw) : null; } catch (e) { payload = null; }
+  container.innerHTML = (payload && Array.isArray(payload.alternatives) && payload.alternatives.length)
+    ? _renderToolAlternativesPanel(payload)
+    : _renderToolAlternativesUnavailable();
+  container.dataset.loaded = '1';
+};
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports._renderToolAlternativesPanel = _renderToolAlternativesPanel;
+  module.exports._renderToolAlternativesUnavailable = _renderToolAlternativesUnavailable;
 }
 
 function renderBrainChart(events) {
   var canvas = document.getElementById('brain-density-chart');
   if (!canvas || !canvas.getContext) return;
-  // Filter events by active pill
+  // Filter events by active pill — MUST mirror renderBrainStream so the chart
+  // and list never disagree. The previous cut filtered by source/type but NOT
+  // by the global runtime switcher or channel pill, so picking Claude Code
+  // would empty the list ("No recent Claude Code activity") yet leave the
+  // chart full of bars from other runtimes' events. Apply the same four
+  // filters here.
   if (_brainFilter !== 'all') {
     events = events.filter(function(ev) { return ev.source === _brainFilter; });
-    }
-    if (_brainTypeFilter !== 'all') {
+  }
+  if (_brainTypeFilter !== 'all') {
     events = events.filter(function(ev) { return ev.type === _brainTypeFilter; });
+  }
+  if (typeof _brainChannelFilter !== 'undefined' && _brainChannelFilter !== 'all') {
+    events = events.filter(function(ev) { return (ev.channel || '') === _brainChannelFilter; });
+  }
+  var _bcRt = (typeof _cmRuntimeFilter === 'function') ? _cmClientFilterRt(_cmRuntimeFilter()) : 'all';
+  if (_bcRt && _bcRt !== 'all') {
+    events = events.filter(function(ev) { return _cmRuntimeOf(ev) === _bcRt; });
   }
   var ctx = canvas.getContext('2d');
   var W = canvas.parentElement ? canvas.parentElement.offsetWidth : (canvas.offsetWidth || 800);
   canvas.width = W;
-  canvas.height = 80;
-  ctx.clearRect(0, 0, W, 80);
+  canvas.height = 100; // 80px bars + 20px time axis strip
+  ctx.clearRect(0, 0, W, 100);
 
   // Adaptive window: pick the shortest window that contains the events so the
   // chart actually renders bars instead of an empty 60-min background. The
   // previous hard-coded 60-min window meant any event older than an hour
   // (~typical for /api/brain-history?limit=300) was dropped silently.
+  //
+  // Historical range active: anchor the chart to the SELECTED window instead
+  // of "now" — buckets span [since, until] so a 3AM investigation paints its
+  // bars across the full chart width rather than falling off the left edge.
   var now = Date.now();
-  var WINDOWS = [
-    { ms: 3600000,   bucketMs: 30000   },  // 1h  / 30s  = 120 buckets
-    { ms: 21600000,  bucketMs: 180000  },  // 6h  / 3m   = 120 buckets
-    { ms: 86400000,  bucketMs: 720000  }   // 24h / 12m  = 120 buckets
-  ];
-  var oldestAge = 0;
-  for (var ei = 0; ei < events.length; ei++) {
-    try {
-      var ageE = now - new Date(events[ei].time).getTime();
-      if (ageE > oldestAge && ageE < 86400000 * 2) oldestAge = ageE;
-    } catch(e) {}
+  var bucketMs, numBuckets;
+  if (_brainRange) {
+    var _rs = new Date(_brainRange.since).getTime();
+    var _ru = new Date(_brainRange.until).getTime();
+    if (isFinite(_rs) && isFinite(_ru) && _ru > _rs) {
+      now = _ru; // bucket ages are measured back from the window END
+      numBuckets = 120;
+      bucketMs = Math.max(1000, Math.ceil((_ru - _rs) / numBuckets));
+    }
   }
-  var win = WINDOWS[0];
-  for (var wi = 0; wi < WINDOWS.length; wi++) {
-    if (oldestAge <= WINDOWS[wi].ms) { win = WINDOWS[wi]; break; }
-    win = WINDOWS[wi];
+  if (!bucketMs) {
+    var WINDOWS = [
+      { ms: 3600000,   bucketMs: 30000   },  // 1h  / 30s  = 120 buckets
+      { ms: 21600000,  bucketMs: 180000  },  // 6h  / 3m   = 120 buckets
+      { ms: 86400000,  bucketMs: 720000  }   // 24h / 12m  = 120 buckets
+    ];
+    var oldestAge = 0;
+    for (var ei = 0; ei < events.length; ei++) {
+      try {
+        var ageE = now - new Date(events[ei].time).getTime();
+        if (ageE > oldestAge && ageE < 86400000 * 2) oldestAge = ageE;
+      } catch(e) {}
+    }
+    var win = WINDOWS[0];
+    for (var wi = 0; wi < WINDOWS.length; wi++) {
+      if (oldestAge <= WINDOWS[wi].ms) { win = WINDOWS[wi]; break; }
+      win = WINDOWS[wi];
+    }
+    bucketMs = win.bucketMs;
+    numBuckets = Math.floor(win.ms / bucketMs);
   }
-  var bucketMs = win.bucketMs;
-  var numBuckets = Math.floor(win.ms / bucketMs);
   var buckets = {};
   events.forEach(function(ev) {
     try {
@@ -3341,23 +5777,544 @@ function renderBrainChart(events) {
     });
   }
   ctx.globalAlpha = 1;
+
+  // Time axis: label the window the bars actually span, in local wall time.
+  // The window is derived (adaptive in Live mode, explicit in history mode),
+  // so without labels the same bars could mean "last hour" or "last day".
+  var axis = _brainAxisTicks(now - numBuckets * bucketMs, now, W);
+  var _axCs = null;
+  try { _axCs = getComputedStyle(document.body); } catch (e) {}
+  var _axVar = function(name, fb) {
+    var v = _axCs && _axCs.getPropertyValue(name);
+    return (v && v.trim()) || fb;
+  };
+  ctx.strokeStyle = _axVar('--border-primary', '#273243');
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, 80.5);
+  ctx.lineTo(W, 80.5);
+  axis.ticks.forEach(function(tk) {
+    var x = Math.round(tk.frac * W) + 0.5;
+    ctx.moveTo(Math.min(x, W - 0.5), 80.5);
+    ctx.lineTo(Math.min(x, W - 0.5), 84.5);
+  });
+  ctx.stroke();
+  ctx.fillStyle = _axVar('--text-faint', '#98a2b3');
+  ctx.font = '10px -apple-system, "Segoe UI", sans-serif';
+  ctx.textBaseline = 'alphabetic';
+  axis.ticks.forEach(function(tk, ti) {
+    ctx.textAlign = ti === 0 ? 'left' : (ti === axis.ticks.length - 1 ? 'right' : 'center');
+    ctx.fillText(tk.label, tk.frac * W + (ti === 0 ? 1 : (ti === axis.ticks.length - 1 ? -1 : 0)), 96);
+  });
 }
 
-var _brainSSE = null;
-var _brainSSEConnected = false;
+// Tick positions + labels for the density chart's time axis. Pure function
+// (unit-tested via the extraction pattern in tests/test_brain_axis_ticks.js).
+// Returns {withDate, ticks: [{frac, label}]} where frac is 0..1 across the
+// chart width. Labels include the day/month whenever the window is longer
+// than ~20h or crosses midnight, so "03:00" can't be mistaken for today.
+function _brainAxisTicks(startMs, endMs, width) {
+  var span = endMs - startMs;
+  if (!isFinite(span) || span <= 0 || !(width > 0)) return { withDate: false, ticks: [] };
+  var withDate = span > 72000000 ||
+    (new Date(startMs).toDateString() !== new Date(endMs).toDateString());
+  // Date-bearing labels are ~2x wider; space ticks so labels never collide.
+  var n = Math.max(2, Math.min(withDate ? 5 : 7, Math.floor(width / (withDate ? 170 : 110)) + 1));
+  var ticks = [];
+  for (var i = 0; i < n; i++) {
+    var frac = i / (n - 1);
+    var t = new Date(startMs + span * frac);
+    var label;
+    try {
+      label = withDate
+        ? t.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+        : t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } catch (e) {
+      label = t.toISOString().slice(11, 16);
+    }
+    ticks.push({ frac: frac, label: label });
+  }
+  return { withDate: withDate, ticks: ticks };
+}
 
-function _updateBrainLiveIndicator(connected) {
-  _brainSSEConnected = connected;
-  var el = document.getElementById('brain-live-indicator');
-  if (!el) return;
-  if (connected) {
-    el.innerHTML = '<span style="display:inline-flex;align-items:center;gap:4px;background:rgba(34,197,94,0.15);color:#22c55e;padding:2px 10px;border-radius:10px;font-size:11px;font-weight:700;"><span style="width:7px;height:7px;border-radius:50%;background:#22c55e;animation:livePulse 1.5s ease-in-out infinite;"></span> LIVE</span>';
-  } else {
-    el.innerHTML = '<span style="display:inline-flex;align-items:center;gap:4px;background:rgba(100,100,100,0.15);color:#888;padding:2px 10px;border-radius:10px;font-size:11px;font-weight:600;">● POLLING</span>';
+// ── Brain Graph (neural-net visualization, refs #53) ──────────────────────
+// Force-directed canvas: each agent source is a glowing "neuron"; recent
+// events orbit their parent as smaller satellite dots; an ambient pulse
+// ripples outward every ~2s on active sources. Toggle via the Graph/List
+// buttons rendered in tabs/brain.html. Pure Canvas 2D — no deps, no WebGL.
+// Reads the existing `_brainAllEvents` array (populated by SSE), so this
+// is purely a presentational alternative to the list view; no new
+// endpoints, no extra DuckDB reads.
+var _brainViewMode = 'list';
+var _brainGraph = {
+  canvas: null, ctx: null, width: 0, height: 500, dpr: 1,
+  lastTs: 0, rafId: 0, animating: false,
+  agents: {}, agentOrder: [], events: [], lastPulseAt: 0
+};
+
+function _brainGraphHash(str) {
+  var h = 2166136261;
+  str = String(str || '');
+  for (var i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
+  }
+  return h >>> 0;
+}
+
+function _brainGraphEnsureCanvas() {
+  var canvas = document.getElementById('brain-graph-canvas');
+  if (!canvas) return false;
+  if (!_brainGraph.canvas) {
+    _brainGraph.canvas = canvas;
+    _brainGraph.ctx = canvas.getContext('2d');
+  }
+  var rect = canvas.getBoundingClientRect();
+  var dpr = Math.max(1, window.devicePixelRatio || 1);
+  var w = Math.max(320, Math.floor(rect.width || canvas.clientWidth || 800));
+  var h = 500;
+  if (canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)) {
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
+  }
+  _brainGraph.dpr = dpr;
+  _brainGraph.width = w;
+  _brainGraph.height = h;
+  return true;
+}
+
+function setBrainViewMode(mode, btn) {
+  if (mode !== 'graph' && mode !== 'list') mode = 'list';
+  _brainViewMode = mode;
+  var feed = document.getElementById('brain-feed');
+  var wrap = document.getElementById('brain-graph-wrap');
+  if (feed) feed.style.display = mode === 'list' ? '' : 'none';
+  if (wrap) wrap.style.display = mode === 'graph' ? '' : 'none';
+  document.querySelectorAll('.brain-view-btn').forEach(function(b) {
+    b.classList.toggle('active', b.dataset.view === mode);
+  });
+  if (mode === 'graph') {
+    if (typeof syncBrainGraph === 'function') syncBrainGraph(_brainApplyFilters(_brainAllEvents));
+    _startBrainGraphLoop();
+    _ensureBrainGraphClickHandler();
   }
 }
 
+function syncBrainGraph(events) {
+  events = Array.isArray(events) ? events : [];
+  var oldAgents = _brainGraph.agents || {};
+  var oldEvents = {};
+  (_brainGraph.events || []).forEach(function(node) { oldEvents[node.id] = node; });
+  var now = Date.now();
+  var centerX = (_brainGraph.width || 900) / 2;
+  var centerY = (_brainGraph.height || 500) / 2;
+  var recent = events.slice(0, 200);
+  var agentMap = {};
+  recent.forEach(function(ev) {
+    var source = ev && ev.source ? ev.source : 'main';
+    if (!agentMap[source]) {
+      agentMap[source] = {id: source, label: ev && ev.sourceLabel ? ev.sourceLabel : source, lastSeen: 0, count: 0};
+    }
+    var ts = ev && ev.time ? (new Date(ev.time).getTime() || 0) : 0;
+    if (ts > agentMap[source].lastSeen) agentMap[source].lastSeen = ts;
+    agentMap[source].count++;
+  });
+  if (!agentMap.main && recent.length) {
+    agentMap.main = {id: 'main', label: 'main', lastSeen: now, count: 1};
+  }
+  var agentIds = Object.keys(agentMap).sort(function(a, b) {
+    var da = agentMap[a], db = agentMap[b];
+    if (db.lastSeen !== da.lastSeen) return db.lastSeen - da.lastSeen;
+    return db.count - da.count;
+  }).slice(0, 20);
+  var chosen = {};
+  agentIds.forEach(function(id) { chosen[id] = true; });
+  var nextAgents = {};
+  var ringR = Math.max(90, Math.min(180, Math.min(centerX, centerY) - 40));
+  agentIds.forEach(function(id, i) {
+    var baseAngle = (Math.PI * 2 * i) / Math.max(1, agentIds.length);
+    var prev = oldAgents[id];
+    nextAgents[id] = {
+      id: id,
+      label: agentMap[id].label || id,
+      lastSeen: agentMap[id].lastSeen || 0,
+      x: prev ? prev.x : centerX + Math.cos(baseAngle) * ringR,
+      y: prev ? prev.y : centerY + Math.sin(baseAngle) * ringR,
+      vx: prev ? prev.vx : 0,
+      vy: prev ? prev.vy : 0,
+      r: 14
+    };
+  });
+  var nextEvents = [];
+  for (var ei = 0; ei < events.length && nextEvents.length < 50; ei++) {
+    var ev = events[ei];
+    var source = ev && ev.source ? ev.source : 'main';
+    if (!chosen[source]) continue;
+    var key = (ev.time || '') + '|' + source + '|' + (ev.type || '') + '|' + (ev.detail || '');
+    var id = 'ev:' + _brainGraphHash(key).toString(16);
+    var prevNode = oldEvents[id];
+    var agent = nextAgents[source];
+    var seed = _brainGraphHash(id);
+    var angle = ((seed % 6283) / 1000);
+    nextEvents.push({
+      id: id, source: source, type: ev.type || 'TOOL',
+      color: ev.color || brainSourceColor(source),
+      x: prevNode ? prevNode.x : (agent.x + Math.cos(angle) * 42),
+      y: prevNode ? prevNode.y : (agent.y + Math.sin(angle) * 42),
+      vx: prevNode ? prevNode.vx : 0,
+      vy: prevNode ? prevNode.vy : 0,
+      orbitR: 34 + (seed % 24),
+      orbitSpeed: 0.00025 + ((seed % 100) / 500000),
+      orbitPhase: angle, r: 4,
+      // Keep the raw event so clicking a neuron can show its detail.
+      raw: ev
+    });
+  }
+  _brainGraph.agents = nextAgents;
+  _brainGraph.agentOrder = agentIds;
+  _brainGraph.events = nextEvents;
+}
+
+function _startBrainGraphLoop() {
+  if (_brainGraph.animating) return;
+  _brainGraph.animating = true;
+  _brainGraph.lastTs = 0;
+  _brainGraph.rafId = requestAnimationFrame(_brainGraphTick);
+}
+
+function _brainGraphTick(ts) {
+  _brainGraph.rafId = requestAnimationFrame(_brainGraphTick);
+  if (_brainViewMode !== 'graph') return;
+  var pg = document.getElementById('page-brain');
+  if (!pg || !pg.classList.contains('active')) return;
+  if (!_brainGraphEnsureCanvas()) return;
+  var dt = _brainGraph.lastTs ? Math.min(33, ts - _brainGraph.lastTs) / 16.67 : 1;
+  _brainGraph.lastTs = ts;
+  var now = Date.now();
+  var agents = _brainGraph.agentOrder.map(function(id) { return _brainGraph.agents[id]; }).filter(Boolean);
+  var events = _brainGraph.events;
+  var W = _brainGraph.width, H = _brainGraph.height;
+  var cx = W / 2, cy = H / 2;
+  agents.forEach(function(a) {
+    a.vx += (cx - a.x) * 0.0007 * dt;
+    a.vy += (cy - a.y) * 0.0007 * dt;
+  });
+  for (var i = 0; i < agents.length; i++) {
+    for (var j = i + 1; j < agents.length; j++) {
+      var a = agents[i], b = agents[j];
+      var dx = b.x - a.x, dy = b.y - a.y;
+      var d2 = dx * dx + dy * dy + 0.01;
+      var d = Math.sqrt(d2);
+      var force = Math.min(6, 900 / d2);
+      var fx = (dx / d) * force, fy = (dy / d) * force;
+      a.vx -= fx * dt; a.vy -= fy * dt;
+      b.vx += fx * dt; b.vy += fy * dt;
+    }
+  }
+  if (ts - _brainGraph.lastPulseAt > 2000) {
+    agents.forEach(function(a) {
+      if (now - a.lastSeen < 90000) {
+        if (!a.pulses) a.pulses = [];
+        a.pulses.push({start: ts});
+      }
+    });
+    _brainGraph.lastPulseAt = ts;
+  }
+  agents.forEach(function(a) {
+    a.vx *= 0.9; a.vy *= 0.9;
+    a.x += a.vx * dt; a.y += a.vy * dt;
+    a.x = Math.max(24, Math.min(W - 24, a.x));
+    a.y = Math.max(24, Math.min(H - 24, a.y));
+  });
+  events.forEach(function(ev, idx) {
+    var agent = _brainGraph.agents[ev.source];
+    if (!agent) return;
+    var orbitA = ev.orbitPhase + ts * ev.orbitSpeed;
+    var tx = agent.x + Math.cos(orbitA) * ev.orbitR;
+    var ty = agent.y + Math.sin(orbitA) * ev.orbitR;
+    ev.vx += (tx - ev.x) * 0.04 * dt;
+    ev.vy += (ty - ev.y) * 0.04 * dt;
+    for (var k = idx + 1; k < events.length; k++) {
+      var other = events[k];
+      if (other.source !== ev.source) continue;
+      var rx = other.x - ev.x, ry = other.y - ev.y;
+      var rd2 = rx * rx + ry * ry + 0.01;
+      if (rd2 > 1200) continue;
+      var rf = 20 / rd2;
+      ev.vx -= rx * rf * dt; ev.vy -= ry * rf * dt;
+      other.vx += rx * rf * dt; other.vy += ry * rf * dt;
+    }
+    ev.vx *= 0.88; ev.vy *= 0.88;
+    ev.x += ev.vx * dt; ev.y += ev.vy * dt;
+    ev.x = Math.max(8, Math.min(W - 8, ev.x));
+    ev.y = Math.max(8, Math.min(H - 8, ev.y));
+  });
+  _drawBrainGraph(ts, now);
+}
+
+function _drawBrainGraph(ts, now) {
+  var ctx = _brainGraph.ctx;
+  if (!ctx) return;
+  var dpr = _brainGraph.dpr || 1;
+  var W = _brainGraph.width, H = _brainGraph.height;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(20,23,34,0.35)';
+  ctx.fillRect(0, 0, W, H);
+  _brainGraph.events.forEach(function(ev) {
+    var a = _brainGraph.agents[ev.source];
+    if (!a) return;
+    ctx.strokeStyle = 'rgba(148,163,184,0.22)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(ev.x, ev.y);
+    ctx.stroke();
+  });
+  _brainGraph.events.forEach(function(ev) {
+    ctx.shadowBlur = 8;
+    ctx.shadowColor = ev.color || '#60a5fa';
+    ctx.fillStyle = ev.color || '#60a5fa';
+    ctx.beginPath();
+    ctx.arc(ev.x, ev.y, ev.r, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  _brainGraph.agentOrder.forEach(function(id) {
+    var a = _brainGraph.agents[id];
+    if (!a) return;
+    var active = now - a.lastSeen < 90000;
+    var color = active ? '#a855f7' : '#f59e0b';
+    if (!a.pulses) a.pulses = [];
+    a.pulses = a.pulses.filter(function(p) { return ts - p.start < 1200; });
+    a.pulses.forEach(function(p) {
+      var t = (ts - p.start) / 1200;
+      var radius = a.r + (44 * t);
+      var alpha = Math.max(0, 0.35 * (1 - t));
+      ctx.strokeStyle = active ? 'rgba(168,85,247,' + alpha + ')' : 'rgba(245,158,11,' + alpha + ')';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(a.x, a.y, radius, 0, Math.PI * 2);
+      ctx.stroke();
+    });
+    ctx.shadowBlur = 20;
+    ctx.shadowColor = color;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(a.x, a.y, a.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'rgba(230,234,244,0.92)';
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText((a.label || a.id || 'agent').slice(0, 20), a.x, a.y + 28);
+  });
+  ctx.shadowBlur = 0;
+}
+
+// Issue #53 — click a neuron to open a detail panel with the raw event.
+// Hit-test in canvas coordinates; events first (smaller, on top), then
+// agents (larger, central). Keep this single-bind so re-entering the
+// graph view doesn't stack listeners.
+function _ensureBrainGraphClickHandler() {
+  var canvas = document.getElementById('brain-graph-canvas');
+  if (!canvas || canvas._brainClickBound) return;
+  canvas._brainClickBound = true;
+  canvas.style.cursor = 'pointer';
+  canvas.addEventListener('click', function(e) {
+    var rect = canvas.getBoundingClientRect();
+    var x = e.clientX - rect.left;
+    var y = e.clientY - rect.top;
+    var hitEv = null, hitDist = 1e9;
+    (_brainGraph.events || []).forEach(function(ev) {
+      var d = Math.hypot(ev.x - x, ev.y - y);
+      if (d < 14 && d < hitDist) { hitDist = d; hitEv = ev; }
+    });
+    if (hitEv) { _showBrainGraphDetail(hitEv.raw, hitEv); return; }
+    var hitAgent = null;
+    (_brainGraph.agentOrder || []).forEach(function(id) {
+      var a = _brainGraph.agents[id];
+      if (!a) return;
+      var d = Math.hypot(a.x - x, a.y - y);
+      if (d < (a.r + 6) && d < hitDist) { hitDist = d; hitAgent = a; }
+    });
+    if (hitAgent) {
+      _showBrainGraphDetail({
+        source: hitAgent.id,
+        sourceLabel: hitAgent.label,
+        type: 'AGENT',
+        detail: 'Agent ' + (hitAgent.label || hitAgent.id) +
+                ' — ' + ((_brainAllEvents || []).filter(function(e){return e && e.source === hitAgent.id;}).length) +
+                ' recent events'
+      }, hitAgent);
+    } else {
+      _hideBrainGraphDetail();
+    }
+  });
+}
+
+function _showBrainGraphDetail(rawEv, node) {
+  if (!rawEv) return;
+  var wrap = document.getElementById('brain-graph-wrap');
+  if (!wrap) return;
+  var panel = document.getElementById('brain-graph-detail');
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.id = 'brain-graph-detail';
+    panel.style.cssText = 'position:absolute;top:10px;right:10px;max-width:380px;max-height:460px;overflow:auto;' +
+      'background:rgba(20,23,34,0.96);border:1px solid var(--border);border-radius:8px;padding:12px 14px;' +
+      'font-size:12px;color:var(--text-primary);box-shadow:0 6px 24px rgba(0,0,0,0.45);z-index:5;';
+    if (getComputedStyle(wrap).position === 'static') wrap.style.position = 'relative';
+    wrap.appendChild(panel);
+  }
+  var typeLabel = String(rawEv.type || 'EVENT');
+  var srcLabel = String(rawEv.sourceLabel || rawEv.source || '');
+  var when = rawEv.time ? new Date(rawEv.time).toLocaleString() : '';
+  var detailText = String(rawEv.detail || rawEv.text || '');
+  // Cheap escape to avoid HTML injection from event detail payloads.
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function(c) {
+      return { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c];
+    });
+  }
+  panel.innerHTML =
+    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">' +
+      '<span style="font-weight:700;color:#c4b5fd;">' + esc(typeLabel) + '</span>' +
+      '<button onclick="_hideBrainGraphDetail()" ' +
+        'style="background:transparent;border:none;color:var(--text-muted);font-size:14px;cursor:pointer;">×</button>' +
+    '</div>' +
+    (srcLabel ? '<div style="color:var(--text-muted);font-size:11px;margin-bottom:4px;">source: ' + esc(srcLabel) + '</div>' : '') +
+    (when ? '<div style="color:var(--text-muted);font-size:11px;margin-bottom:8px;">' + esc(when) + '</div>' : '') +
+    '<div style="white-space:pre-wrap;word-break:break-word;line-height:1.5;">' + esc(detailText || '(no detail)') + '</div>';
+  panel.style.display = '';
+}
+function _hideBrainGraphDetail() {
+  var panel = document.getElementById('brain-graph-detail');
+  if (panel) panel.style.display = 'none';
+}
+// Expose for onclick attribute in the panel header.
+window._hideBrainGraphDetail = _hideBrainGraphDetail;
+
+var _brainSSE = null;
+var _brainSSEConnected = false;
+// Issue #1596 — exponential backoff state for SSE reconnect. A single
+// retry chain (no parallel storms): `_brainSSERetryTimer` holds the
+// pending setTimeout id, `_brainSSERetryAttempt` is the current attempt
+// index (0-based; 0 = fresh failure, 5+ = banner). `_brainSSEFirstFailMs`
+// is the wall-clock of the first failure in the current outage so we can
+// surface the "Connection lost" banner after 30s of failed retries.
+var _brainSSERetryTimer = null;
+var _brainSSERetryAttempt = 0;
+var _brainSSEFirstFailMs = 0;
+// Caps: 1s, 2s, 4s, 8s, 16s, then 30s forever. Matches the issue spec.
+var _BRAIN_SSE_BACKOFF_MS = [1000, 2000, 4000, 8000, 16000];
+var _BRAIN_SSE_BACKOFF_MAX_MS = 30000;
+// Banner threshold — surface explicit UI after 30s of failed retries so
+// users on flaky networks know the feed is frozen, not just quiet.
+var _BRAIN_SSE_BANNER_THRESHOLD_MS = 30000;
+
+function _updateBrainLiveIndicator(connected) {
+  // Called with no argument from the range-picker UI refresh: repaint the
+  // pill without mutating the SSE connection state.
+  if (connected !== undefined) _brainSSEConnected = connected;
+  var el = document.getElementById('brain-live-indicator');
+  if (!el) return;
+  if (_brainRange) {
+    el.innerHTML = '<span style="display:inline-flex;align-items:center;gap:4px;background:rgba(245,158,11,0.15);color:#f59e0b;padding:2px 10px;border-radius:10px;font-size:11px;font-weight:700;">🕰 ' + t('brain.indicator_history', null, 'HISTORY') + '</span>';
+    return;
+  }
+  if (_brainSSEConnected) {
+    el.innerHTML = '<span style="display:inline-flex;align-items:center;gap:4px;background:rgba(34,197,94,0.15);color:#22c55e;padding:2px 10px;border-radius:10px;font-size:11px;font-weight:700;"><span style="width:7px;height:7px;border-radius:50%;background:#22c55e;animation:livePulse 1.5s ease-in-out infinite;"></span> LIVE</span>';
+  } else {
+    el.innerHTML = '<span style="display:inline-flex;align-items:center;gap:4px;background:rgba(100,100,100,0.15);color:#888;padding:2px 10px;border-radius:10px;font-size:11px;font-weight:600;">' + t("app.polling", null, "● POLLING") + '</span>';
+  }
+}
+
+// Issue #1596 — backoff math, extracted so the unit test can exercise it
+// without a real EventSource. Returns the ms to wait before attempt
+// `attempt` (0-indexed). Caps at _BRAIN_SSE_BACKOFF_MAX_MS once the
+// table is exhausted.
+function _brainSSEBackoffMs(attempt) {
+  if (attempt < 0) attempt = 0;
+  if (attempt < _BRAIN_SSE_BACKOFF_MS.length) {
+    return _BRAIN_SSE_BACKOFF_MS[attempt];
+  }
+  return _BRAIN_SSE_BACKOFF_MAX_MS;
+}
+
+// Issue #1596 — show/hide the "Connection lost" banner above the brain
+// stream. The banner uses plain-English copy ("Reconnecting...") per
+// feedback_simple_ui_for_nontechnical.md and explicitly avoids em-dashes
+// per feedback_no_em_dashes_in_user_facing_copy.md.
+function _showBrainConnectionLostBanner() {
+  var host = document.getElementById('brain-connection-lost-banner');
+  if (!host) {
+    var streamEl = document.getElementById('brain-stream');
+    if (!streamEl || !streamEl.parentElement) return;
+    host = document.createElement('div');
+    host.id = 'brain-connection-lost-banner';
+    host.style.cssText = 'padding:10px 14px;margin-bottom:8px;font-size:13px;color:#f59e0b;border:1px solid rgba(245,158,11,0.35);border-radius:6px;background:rgba(245,158,11,0.08);display:flex;align-items:center;gap:10px;';
+    streamEl.parentElement.insertBefore(host, streamEl);
+  }
+  host.style.display = 'flex';
+  host.innerHTML =
+    '<span style="width:8px;height:8px;border-radius:50%;background:#f59e0b;animation:livePulse 1.5s ease-in-out infinite;"></span>' +
+    '<span><strong>Connection lost.</strong> Reconnecting…</span>';
+}
+function _hideBrainConnectionLostBanner() {
+  var host = document.getElementById('brain-connection-lost-banner');
+  if (host) host.style.display = 'none';
+}
+
+// Issue #1596 — schedule the next reconnect attempt. Single-chain
+// (clears any pending timer first) so back-to-back errors never spawn
+// parallel reconnect storms. Visibility-aware: when the tab is hidden,
+// the visibility guard above closes the EventSource and we should not
+// burn cycles retrying — defer until the tab regains focus.
+function _scheduleBrainSSEReconnect() {
+  // Single-chain: cancel any pending retry before scheduling a new one.
+  if (_brainSSERetryTimer) {
+    clearTimeout(_brainSSERetryTimer);
+    _brainSSERetryTimer = null;
+  }
+  // Historical window active: the live stream is deliberately stopped —
+  // do not reconnect until the user returns to Live.
+  if (_brainRange) return;
+  // Only retry while the user is actually on the brain page; otherwise
+  // the next loadBrainPage() call will kick off a fresh _startBrainSSE.
+  var page = document.getElementById('page-brain');
+  if (!page || !page.classList.contains('active')) return;
+  // Pause retries while the tab is hidden — the visibility guard will
+  // re-trigger _startBrainSSE on focus via loadBrainPage's call site.
+  if (typeof document !== 'undefined' && document.hidden) return;
+  // Banner threshold check: if we've been failing for >30s, show the
+  // explicit "Connection lost" banner so the user knows.
+  if (_brainSSEFirstFailMs && (Date.now() - _brainSSEFirstFailMs) >= _BRAIN_SSE_BANNER_THRESHOLD_MS) {
+    _showBrainConnectionLostBanner();
+  }
+  var delay = _brainSSEBackoffMs(_brainSSERetryAttempt);
+  _brainSSERetryAttempt += 1;
+  _brainSSERetryTimer = setTimeout(function() {
+    _brainSSERetryTimer = null;
+    _startBrainSSE();
+  }, delay);
+}
+
+// Issue #1596 — called from the 'connected' SSE event. Resets backoff
+// state and clears the banner. Idempotent.
+function _resetBrainSSEReconnectState() {
+  if (_brainSSERetryTimer) {
+    clearTimeout(_brainSSERetryTimer);
+    _brainSSERetryTimer = null;
+  }
+  _brainSSERetryAttempt = 0;
+  _brainSSEFirstFailMs = 0;
+  _hideBrainConnectionLostBanner();
+}
+
 function _startBrainSSE() {
+  // Never open the live stream while a historical window is active — the
+  // frozen view must not be clobbered by incoming events.
+  if (_brainRange) return;
   if (_brainSSE) { try { _brainSSE.close(); } catch(e){} }
   _brainSSE = null;
   _brainSSEConnected = false;
@@ -3374,12 +6331,30 @@ function _startBrainSSE() {
 
     es.addEventListener('connected', function() {
       _updateBrainLiveIndicator(true);
+      // Issue #1596 — successful reconnect clears banner + retry state.
+      _resetBrainSSEReconnectState();
+      // Issue #1606 — on reconnect (not first connect), the server may have
+      // restarted with a changed event shape. Flush the stale cache and
+      // reload so chip filters don't compute against a mixed old+new array.
+      if (_brainSSEEverConnected && !_brainRange) {
+        _brainAllEvents = [];
+        _brainFilter = 'all';
+        _brainTypeFilter = 'all';
+        loadBrainPage(true);
+      }
+      _brainSSEEverConnected = true;
     });
 
     es.onmessage = function(e) {
       try {
+        // Historical window active (race: range applied while a message
+        // was in flight): drop live events, the view is frozen.
+        if (_brainRange) return;
         var ev = JSON.parse(e.data);
         if (!ev || !ev.time) return;
+        // QW5: stamp the last live-feed event so the red "feed stopped" banner
+        // can suppress itself while live activity is clearly flowing.
+        window._cmLastLiveEventMs = Date.now();
         // Prepend to events array
         _brainAllEvents.unshift(ev);
         // Cap at 500 events
@@ -3387,7 +6362,7 @@ function _startBrainSSE() {
         // Re-render with current filters
         renderBrainStream(_brainAllEvents);
         renderBrainChart(_brainAllEvents);
-        if (typeof syncBrainGraph === 'function') syncBrainGraph(_brainAllEvents);
+        if (typeof syncBrainGraph === 'function') syncBrainGraph(_brainApplyFilters(_brainAllEvents));
         // Update source chips if new source
         var known = document.querySelector('[data-source="' + ev.source + '"]');
         if (!known && ev.source !== 'all') {
@@ -3409,20 +6384,30 @@ function _startBrainSSE() {
       _updateBrainLiveIndicator(false);
       try { es.close(); } catch(e){}
       _brainSSE = null;
-      // Fall back to polling
-      if (document.getElementById('page-brain') && document.getElementById('page-brain').classList.contains('active')) {
+      // Issue #1596 — replace one-shot poll fallback with exponential
+      // backoff reconnect loop. Mark the first-fail timestamp so the
+      // banner-threshold check can surface UI after 30s of failures.
+      // Single retry chain (no parallel storms) — _scheduleBrainSSEReconnect
+      // clears any pending timer before scheduling the next attempt.
+      if (!_brainSSEFirstFailMs) _brainSSEFirstFailMs = Date.now();
+      // Belt-and-braces poll fallback so the feed at least gets one
+      // hydration even if SSE stays broken — but on TOP of the SSE
+      // retry chain, not instead of it.
+      if (!_brainRange && document.getElementById('page-brain') && document.getElementById('page-brain').classList.contains('active')) {
+        if (_brainRefreshTimer) clearTimeout(_brainRefreshTimer);
         _brainRefreshTimer = setTimeout(function() { loadBrainPage(true); }, 5000);
       }
+      _scheduleBrainSSEReconnect();
     };
 
     es.addEventListener('done', function() {
       _updateBrainLiveIndicator(false);
       try { es.close(); } catch(e){}
       _brainSSE = null;
-      // Reconnect after a short delay
-      if (document.getElementById('page-brain') && document.getElementById('page-brain').classList.contains('active')) {
-        setTimeout(_startBrainSSE, 2000);
-      }
+      // Issue #1596 — route 'done' through the same backoff chain so a
+      // server-side close behaves identically to a network error. The
+      // 'connected' handler resets backoff on the next successful open.
+      _scheduleBrainSSEReconnect();
     });
   } catch(e) {
     _updateBrainLiveIndicator(false);
@@ -3433,6 +6418,16 @@ function _stopBrainSSE() {
   if (_brainSSE) { try { _brainSSE.close(); } catch(e){} }
   _brainSSE = null;
   _updateBrainLiveIndicator(false);
+  // Issue #1596 — leaving the brain page must also tear down the retry
+  // chain + dismiss the banner; otherwise a stale timer can fire after
+  // navigation and reopen an SSE the user no longer wants.
+  if (_brainSSERetryTimer) {
+    clearTimeout(_brainSSERetryTimer);
+    _brainSSERetryTimer = null;
+  }
+  _brainSSERetryAttempt = 0;
+  _brainSSEFirstFailMs = 0;
+  _hideBrainConnectionLostBanner();
 }
 
 function _buildSourcesList(events) {
@@ -3454,14 +6449,30 @@ async function loadContextInspector() {
     var ov = await fetchJsonWithTimeout('/api/overview', 5000).catch(function(){return {};});
     // Fetch brain history for compaction events + turn count
     var brain = await fetchJsonWithTimeout('/api/brain-history?limit=300', 8000).catch(function(){return {events:[]};});
-    // Fetch skills for header token count. /api/skills is cloud-disabled
-    // (410 Gone) — skip the network call in cloud mode and use empty totals.
-    var skills = window.CLOUD_MODE
-      ? {skills:[],summary:{}}
-      : await fetch('/api/skills').then(function(r){return r.json();}).catch(function(){return {skills:[],summary:{}};});
+    // Skills header token count. Prefer the OSS↔cloud-shared
+    // `skillHeaderTokens` now exposed by /api/overview + the snapshot
+    // (2026-05-23 OSS↔cloud parity fix) so both sides render the same
+    // value. We only need to hit /api/skills when the daemon is too
+    // old to publish that field AND we're not in cloud (where the
+    // endpoint is 410 Gone). Cloud mode without the field falls back
+    // to an empty stub — the bar then uses the contextWindow*0.008
+    // approximation instead of returning a misleading 1.6K.
+    var skills;
+    if (typeof ov.skillHeaderTokens === 'number') {
+      skills = {skills:[], summary:{total_header_tokens: ov.skillHeaderTokens}};
+    } else if (window.CLOUD_MODE) {
+      skills = {skills:[], summary:{}};
+    } else {
+      skills = await fetch('/api/skills').then(function(r){return r.json();}).catch(function(){return {skills:[],summary:{}};});
+    }
 
     var contextWindow = ov.contextWindow || 200000;
-    var mainTokens = ov.mainTokens || 0;
+    // Prefer `currentContextTokens` (the latest assistant turn's actual
+    // input_tokens, capped naturally at the model's context window) over
+    // `mainTokens` (cumulative session total, which can exceed the
+    // window and gave the gauge a misleading "204K/200K (100%)" reading).
+    // Falls back to mainTokens for daemons older than the field.
+    var mainTokens = ov.currentContextTokens || ov.mainTokens || 0;
     var model = ov.model || 'unknown';
     // brain may be either {events:[...]} (legacy/local_store) or
     // {_source:"cache", events_blob:"..."} (cache hit on cloud). Use the
@@ -3478,7 +6489,7 @@ async function loadContextInspector() {
     var windowMax = document.getElementById('ctx-window-max');
     if (windowMax) windowMax.textContent = _fmtTokens(contextWindow);
     var threshold = document.getElementById('ctx-compact-threshold');
-    if (threshold) threshold.textContent = 'Compaction at ~' + _fmtTokens(Math.round(contextWindow * 0.8));
+    if (threshold) threshold.textContent = t("app.compaction_at", null, "Compaction at ~") + _fmtTokens(Math.round(contextWindow * 0.8));
 
     // Stats cards
     var turns = events.filter(function(e){return e.type === 'USER';}).length;
@@ -3487,6 +6498,57 @@ async function loadContextInspector() {
     el = document.getElementById('ctx-total-turns'); if (el) el.textContent = turns;
     el = document.getElementById('ctx-compactions'); if (el) el.textContent = compactions;
     el = document.getElementById('ctx-model-name'); if (el) { el.textContent = model.split('/').pop(); el.style.fontSize = model.length > 20 ? '14px' : '20px'; }
+
+    // Active model + model mix, scoped to the selected runtime. The overview
+    // model (ov.model) is the node-wide active model — for a non-OpenClaw
+    // runtime that's wrong (e.g. it showed claude-opus-4-7 for Codex, which
+    // actually ran gpt-5.4). Pull the per-runtime attribution: the MOST-USED
+    // model becomes the "active" one, the rest are listed with % of turns
+    // (founder spec 2026-06-04). /api/model-attribution honours ?runtime=.
+    (function _ctxModelMix() {
+      var mixEl = document.getElementById('ctx-model-mix');
+      var nameEl = document.getElementById('ctx-model-name');
+      var _rt = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+      var _q = (_rt && _rt !== 'all') ? ('?runtime=' + encodeURIComponent(_rt)) : '';
+      fetch('/api/model-attribution' + _q).then(function (r) { return r.json(); }).then(function (ma) {
+        var models = (ma && ma.models) || [];
+        var total = (ma && ma.total_turns) || models.reduce(function (s, m) { return s + (m.turns || 0); }, 0);
+        if (!models.length || !total) {
+          if (mixEl) mixEl.style.display = 'none';
+          // A specific runtime with no model data must NOT leak the node-wide
+          // model (Codex showed claude-opus-4-7 for this reason). Show a dash.
+          if (_rt && _rt !== 'all' && nameEl) {
+            nameEl.textContent = '—';
+            nameEl.style.fontSize = '20px';
+            nameEl.title = 'No model usage recorded for ' + _rt + ' yet';
+          }
+          return;
+        }
+        // most-used first
+        models = models.slice().sort(function (a, b) { return (b.turns || 0) - (a.turns || 0); });
+        var top = (ma.primary_model && ma.primary_model !== '--') ? ma.primary_model : models[0].model;
+        if (nameEl) {
+          var shortTop = String(top).replace('anthropic/', '').replace('openai/', '').split('/').pop();
+          nameEl.textContent = shortTop;
+          nameEl.style.fontSize = shortTop.length > 20 ? '14px' : '20px';
+          nameEl.title = top + ' — most-used model for ' + (_rt === 'all' ? 'all runtimes' : _rt);
+        }
+        if (!mixEl) return;
+        // List the OTHER models with % of turns (skip the primary already shown above).
+        var others = models.filter(function (m) { return m.model !== top; });
+        if (!others.length) { mixEl.style.display = 'none'; return; }
+        var html = '';
+        others.slice(0, 4).forEach(function (m) {
+          var pct = total > 0 ? (m.turns / total * 100) : 0;
+          var nm = String(m.model || '').replace('anthropic/', '').replace('openai/', '').split('/').pop();
+          html += '<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;font-size:10px;color:var(--text-muted);margin:2px 0;">'
+            + '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + escHtml(m.model || '') + '">' + escHtml(nm) + '</span>'
+            + '<span style="flex-shrink:0;font-weight:600;color:var(--text-secondary);">' + pct.toFixed(0) + '%</span></div>';
+        });
+        mixEl.innerHTML = html;
+        mixEl.style.display = 'block';
+      }).catch(function () { if (mixEl) mixEl.style.display = 'none'; });
+    })();
 
     // Context composition breakdown
     var skillHeaderTokens = (skills.summary || {}).total_header_tokens || 0;
@@ -3570,7 +6632,7 @@ async function loadContextInspector() {
     }
   } catch(e) {
     var barsEl = document.getElementById('ctx-composition-bars');
-    if (barsEl) barsEl.innerHTML = '<div style="color:var(--text-error);font-size:12px;">Error loading context data: ' + escHtml(String(e)) + '</div>';
+    if (barsEl) barsEl.innerHTML = '<div style="color:var(--text-error);font-size:12px;">' + t("app.error_loading_context_data", null, "Error loading context data") + ': ' + escHtml(String(e)) + '</div>';
   }
 }
 
@@ -3625,7 +6687,7 @@ window.advisorAsk = async function () {
   if (!q || !wrap || !out) return;
   wrap.style.display = '';
   if (qEl) qEl.textContent = '› ' + q;
-  out.innerHTML = '<span style="color:#a855f7;">Thinking…</span>';
+  out.innerHTML = '<span style="color:#a855f7;">' + t("app.thinking", null, "Thinking…") + '</span>';
   if (metaEl) metaEl.textContent = '';
   try {
     var resp = await fetch('/api/advisor/ask', {
@@ -3648,7 +6710,7 @@ window.advisorAsk = async function () {
       metaEl.textContent = parts.length ? parts.join(' · ') : '';
     }
   } catch (e) {
-    out.textContent = 'Network error: ' + e.message;
+    out.textContent = t("app.network_error", null, "Network error: ") + e.message;
   }
 };
 
@@ -3677,7 +6739,8 @@ function selfevolveRenderFindings(payload) {
     container.innerHTML = '<div style="padding:10px 12px;color:var(--text-muted);font-size:12px;">' +
       'No findings yet. Click Analyze to review recent activity.</div>';
   } else {
-    findings.forEach(function (f) {
+    window._seFindings = findings;
+    findings.forEach(function (f, _fidx) {
       var col = selfevolveSeverityColor(f.severity);
       var card = document.createElement('div');
       card.style.cssText =
@@ -3696,8 +6759,16 @@ function selfevolveRenderFindings(payload) {
         (f.evidence ? '<div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;line-height:1.5;">' +
           '<strong style="color:var(--text-secondary);">Evidence:</strong> ' + escapeHtml(f.evidence) + '</div>' : '') +
         (f.suggestion ? '<div style="font-size:12px;color:var(--text-primary);line-height:1.5;">' +
-          '<strong style="color:#60a5fa;">Try:</strong> ' + escapeHtml(f.suggestion) + '</div>' : '');
+          '<strong style="color:#60a5fa;">Try:</strong> ' + escapeHtml(f.suggestion) + '</div>' : '') +
+        (f.suggestion ?
+          '<div style="margin-top:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">' +
+            '<button class="se-fix-btn" data-fidx="' + _fidx + '" style="display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;cursor:pointer;background:#2563eb;color:#fff;border:none;border-radius:6px;padding:6px 12px;">✨ Fix with AI</button>' +
+            '<span class="se-fix-status" style="font-size:12px;color:var(--text-muted);"></span>' +
+          '</div>' : '');
       container.appendChild(card);
+    });
+    container.querySelectorAll('.se-fix-btn').forEach(function (btn) {
+      btn.addEventListener('click', function () { selfevolveFixClick(parseInt(btn.dataset.fidx, 10), btn); });
     });
   }
   if (status) {
@@ -3707,6 +6778,78 @@ function selfevolveRenderFindings(payload) {
     if (payload.model) meta.push(payload.model);
     status.textContent = meta.join(' · ');
   }
+}
+
+// ── "Fix with AI": dispatch a finding's suggestion to the local agent ──────────
+// Confirms first (the agent makes a real change), POSTs to /api/selfevolve/fix,
+// then polls /api/selfevolve/fix/status until done/error. Local-only for now;
+// the cloud relay routes the same intent through a node command.
+function selfevolveFixClick(idx, btn) {
+  var f = (window._seFindings || [])[idx];
+  if (!f) return;
+  _seFixConfirm(f, function () { _seFixRun(f, btn); });
+}
+function _seFixConfirm(f, onYes) {
+  var ov = document.createElement('div');
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:10000;display:flex;align-items:center;justify-content:center;padding:20px;';
+  var box = document.createElement('div');
+  box.style.cssText = 'max-width:460px;width:100%;background:var(--bg-secondary,#161b22);border:1px solid var(--border-primary,#30363d);border-radius:10px;padding:20px;';
+  box.innerHTML =
+    '<div style="font-size:15px;font-weight:700;color:var(--text-primary,#e6edf3);margin-bottom:8px;">✨ Send this fix to your agent?</div>' +
+    '<div style="font-size:12px;color:var(--text-muted,#8b949e);margin-bottom:6px;">Your OpenClaw agent will apply this change on your machine:</div>' +
+    '<div style="font-size:13px;color:var(--text-primary,#e6edf3);background:var(--bg-primary,#0d1117);border:1px solid var(--border-primary,#30363d);border-radius:6px;padding:10px 12px;margin-bottom:16px;line-height:1.5;">' + escapeHtml(f.suggestion || '') + '</div>' +
+    '<div style="display:flex;justify-content:flex-end;gap:8px;">' +
+      '<button id="se-fix-cancel" style="font-size:13px;padding:7px 14px;border-radius:6px;border:1px solid var(--border-primary,#30363d);background:transparent;color:var(--text-secondary,#9ca3af);cursor:pointer;">Cancel</button>' +
+      '<button id="se-fix-go" style="font-size:13px;font-weight:600;padding:7px 16px;border-radius:6px;border:none;background:#2563eb;color:#fff;cursor:pointer;">Send to agent</button>' +
+    '</div>';
+  ov.appendChild(box);
+  document.body.appendChild(ov);
+  function close() { ov.remove(); }
+  ov.addEventListener('click', function (e) { if (e.target === ov) close(); });
+  box.querySelector('#se-fix-cancel').addEventListener('click', close);
+  box.querySelector('#se-fix-go').addEventListener('click', function () { close(); onYes(); });
+}
+function _seFixRun(f, btn) {
+  var statusEl = btn.parentElement.querySelector('.se-fix-status');
+  btn.disabled = true; btn.style.opacity = '0.6';
+  if (statusEl) { statusEl.textContent = t("app.queued", null, "⏳ Queued…"); statusEl.style.color = 'var(--text-muted)'; }
+  fetch('/api/selfevolve/fix', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: f.title, suggestion: f.suggestion, category: f.category, evidence: f.evidence }) })
+    .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+    .then(function (res) {
+      if (!res.ok || !res.j.job_id) {
+        if (statusEl) { statusEl.textContent = '⚠️ ' + (res.j.message || 'Could not start'); statusEl.style.color = '#f59e0b'; }
+        btn.disabled = false; btn.style.opacity = '1'; return;
+      }
+      _seFixPoll(res.j.job_id, statusEl, btn);
+    })
+    .catch(function () {
+      if (statusEl) { statusEl.textContent = t("app.network_error_2", null, "⚠️ Network error"); statusEl.style.color = '#ef4444'; }
+      btn.disabled = false; btn.style.opacity = '1';
+    });
+}
+function _seFixPoll(jobId, statusEl, btn) {
+  var tries = 0;
+  var iv = setInterval(function () {
+    tries++;
+    fetch('/api/selfevolve/fix/status?job_id=' + encodeURIComponent(jobId))
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (j.status === 'running') {
+          if (statusEl) { statusEl.textContent = t("app.agent_working", null, "⚙️ Agent working…"); statusEl.style.color = '#60a5fa'; }
+        } else if (j.status === 'done') {
+          clearInterval(iv);
+          if (statusEl) { statusEl.textContent = '✅ ' + (j.summary || 'Done'); statusEl.style.color = '#22c55e'; }
+          if (btn) { btn.textContent = t("app.fixed", null, "✅ Fixed"); }
+        } else if (j.status === 'error') {
+          clearInterval(iv);
+          if (statusEl) { statusEl.textContent = '⚠️ ' + (j.error || 'Failed'); statusEl.style.color = '#ef4444'; }
+          if (btn) { btn.disabled = false; btn.style.opacity = '1'; }
+        }
+      })
+      .catch(function () {});
+    if (tries > 200) { clearInterval(iv); }  // ~10 min cap
+  }, 3000);
 }
 // Self-Evolve is intentionally NOT in the top nav (option C: discoverable via
 // a contextual link on the Brain tab + deep-link). The probe's job here is
@@ -3721,19 +6864,54 @@ async function selfevolveProbe() {
     var empty = document.getElementById('selfevolve-empty');
     var runBtn = document.getElementById('selfevolve-run-btn');
     if (!s || !s.available) {
+      // Issue #1721: zero-config principle — render the same OpenClaw-
+      // setup CTA other panels use instead of a "paste your key" prompt.
+      // /status now ships a setup_hint payload listing the paths the
+      // backend probed so the operator can see exactly where to drop a
+      // credential; the Analyze button is disabled to prevent the 412
+      // round-trip (the inline CTA is the actionable surface here).
       if (hint) hint.style.display = 'none';
-      if (noauth) noauth.style.display = '';
-      if (runBtn) runBtn.disabled = true;
+      if (noauth) {
+        noauth.style.display = '';
+        var sh = s && s.setup_hint;
+        if (sh) {
+          var hl = document.getElementById('selfevolve-noauth-headline');
+          if (hl && sh.headline) hl.textContent = sh.headline;
+          var sub = document.getElementById('selfevolve-noauth-subhead');
+          if (sub && sh.subhead) sub.textContent = sh.subhead;
+          var probed = document.getElementById('selfevolve-noauth-probed');
+          if (probed && Array.isArray(sh.probed)) {
+            probed.innerHTML = sh.probed.map(function (p) {
+              return '<li>' + String(p).replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</li>';
+            }).join('');
+          }
+        }
+      }
+      if (empty) empty.style.display = 'none';
+      if (runBtn) {
+        runBtn.disabled = true;
+        runBtn.style.opacity = '0.5';
+        runBtn.style.cursor = 'not-allowed';
+        runBtn.title = 'Sign in with claude or export ANTHROPIC_API_KEY first';
+      }
       return;
     }
     if (hint) hint.style.display = '';
     if (noauth) noauth.style.display = 'none';
+    // Re-enable the Analyze button in case a prior probe disabled it
+    // (e.g. credentials added between page loads without a full refresh).
+    if (runBtn) {
+      runBtn.disabled = false;
+      runBtn.style.opacity = '';
+      runBtn.style.cursor = '';
+      runBtn.title = '';
+    }
     if (s.has_cached) {
       try {
         var cached = await fetchJsonWithTimeout('/api/selfevolve/latest', 3000);
         if (cached && (cached.findings || []).length) {
           selfevolveRenderFindings(cached);
-          if (runBtn) runBtn.textContent = 'Re-analyze';
+          if (runBtn) runBtn.textContent = t("app.re_analyze", null, "Re-analyze");
           return;
         }
       } catch (e) { /* fall through to empty state */ }
@@ -3748,8 +6926,8 @@ window.selfevolveRun = async function () {
   var btn = document.getElementById('selfevolve-run-btn');
   var status = document.getElementById('selfevolve-status');
   var origText = btn ? btn.textContent : '';
-  if (btn) { btn.disabled = true; btn.textContent = 'Analyzing…'; btn.style.opacity = '0.6'; }
-  if (status) status.textContent = 'Reviewing recent activity — this takes ~15 seconds…';
+  if (btn) { btn.disabled = true; btn.textContent = t("app.analyzing", null, "Analyzing…"); btn.style.opacity = '0.6'; }
+  if (status) status.textContent = t("app.reviewing_recent_activity_this_takes_15_seconds", null, "Reviewing recent activity — this takes ~15 seconds…");
   try {
     var resp = await fetch('/api/selfevolve/analyze', { method: 'POST' });
     var d = await resp.json();
@@ -3759,9 +6937,9 @@ window.selfevolveRun = async function () {
     }
     selfevolveRenderFindings(d);
   } catch (e) {
-    if (status) status.textContent = 'Network error: ' + e.message;
+    if (status) status.textContent = t("app.network_error", null, "Network error: ") + e.message;
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = '🔄 Re-analyze'; btn.style.opacity = ''; }
+    if (btn) { btn.disabled = false; btn.textContent = t("app.re_analyze_2", null, "🔄 Re-analyze"); btn.style.opacity = ''; }
   }
 };
 
@@ -3772,20 +6950,70 @@ async function loadBrainPage(silent) {
   // (P0 follow-up to #1235). Replace the spinner with an explicit
   // empty-state so cloud users understand the surface is local-only and
   // the spinner stops misrepresenting the load state.
-  if (window.CLOUD_MODE) {
+  // Date-time range investigations DO run on the hosted dashboard: the
+  // cloud intercepts the ranged /api/brain-history fetch and answers it
+  // via the node relay (encrypted end-to-end, decrypted in this browser).
+  // Only the LIVE stream stays local-only.
+  if (window.CLOUD_MODE && !_brainRange) {
     var cloudEl = document.getElementById('brain-stream');
     if (cloudEl && /Loading/i.test(cloudEl.innerText || '')) {
       cloudEl.innerHTML = '<div style="color:var(--text-muted);padding:20px;font-size:13px;">' +
   '<div style="font-size:15px;font-weight:600;margin-bottom:6px;">🔒 Brain activity stays local — by design.</div>' +
   '<div style="margin-bottom:8px;">Your prompts, tool calls, and reasoning never leave your machine. We only see aggregated counts.</div>' +
-  '<a href="#local-first" style="color:var(--text-link, #60a5fa);text-decoration:none;">Why local-first →</a>' + 
+  '<a href="#local-first" style="color:var(--text-link, #60a5fa);text-decoration:none;">Why local-first →</a>' +
   '</div>';
     }
     return;
   }
-  if (!silent) { advisorProbe(); selfevolveProbe(); }
+  // Snapshot the active range so an async response for a STALE range (the
+  // user clicked Back-to-live or picked a new window mid-flight) is dropped
+  // instead of clobbering the current view.
+  var _bhRange = _brainRange;
+  if (!silent && !_bhRange) { advisorProbe(); selfevolveProbe(); }
   try {
-    var data = await fetchJsonWithTimeout('/api/brain-history?limit=300', 20000);
+    // Issue #1804: use raw fetch so response.status is preserved; a 503
+    // ingest-outage shows a banner instead of falling to the error handler.
+    var _bhCtrl = new AbortController();
+    // A ranged query on the hosted dashboard rides the node relay (one
+    // heartbeat round-trip), so give it more headroom than the local 20s.
+    var _bhTimeoutMs = _bhRange ? 45000 : 20000;
+    var _bhTimer = setTimeout(function(){_bhCtrl.abort('timeout');}, _bhTimeoutMs);
+    var _bhUrl = '/api/brain-history?limit=' + (_bhRange ? 500 : 300);
+    if (_bhRange) {
+      _bhUrl += '&since=' + encodeURIComponent(_bhRange.since) +
+                '&until=' + encodeURIComponent(_bhRange.until);
+    }
+    var _bhRaw;
+    try { _bhRaw = await fetch(_bhUrl, {signal: _bhCtrl.signal}); }
+    finally { clearTimeout(_bhTimer); }
+    var data = await _bhRaw.json();
+    if (_bhRange !== _brainRange) return; // stale response for an old range
+    // Hosted relay warm-up: the cloud answered "asked your node, poll me
+    // again" — show an honest status and retry a few times (the node
+    // answers within one heartbeat when it is online).
+    if (_bhRange && data && data._source === 'relay_pending') {
+      var stEl = document.getElementById('brain-history-banner-status');
+      if (stEl) stEl.textContent = t('brain.window_fetching', null, 'Fetching this window from your node…');
+      if (_brainRangeRetries++ < 12) {
+        setTimeout(function() {
+          if (_bhRange === _brainRange) loadBrainPage(true);
+        }, Math.max(2000, (data.eta_sec || 3) * 1000));
+      } else {
+        var sEl2 = document.getElementById('brain-stream');
+        if (sEl2) sEl2.innerHTML = '<div style="color:var(--text-muted);padding:20px;font-size:13px;">' + t('brain.window_node_offline', null, 'Could not reach your node for this window. Check that the machine is online, then retry.') + '</div>';
+        if (stEl) stEl.textContent = '';
+      }
+      return;
+    }
+    _brainRangeRetries = 0;
+    var _bhStatusEl = document.getElementById('brain-history-banner-status');
+    if (_bhStatusEl) _bhStatusEl.textContent = '';
+    if (_bhRaw.status === 503 && data && data.error === 'local_store ingest is offline') {
+      var _bhEl = document.getElementById('brain-stream');
+      if (_bhEl) _bhEl.innerHTML = '<div style="background:#fff7ed;border:1px solid #f59e0b;color:#92400e;padding:12px 16px;border-radius:6px;margin:12px;"><strong>' + t("app.ingest_temporarily_offline", null, "Ingest temporarily offline.") + '</strong> Brain history unavailable; the local_store writer is not responding. New events will appear once the daemon recovers.</div>';
+      _renderBrainHistoryCap(false);
+      return;
+    }
     var events = (data.events || []).slice().sort(function(a,b){
       var ta = a.time ? new Date(a.time).getTime() : 0;
       var tb = b.time ? new Date(b.time).getTime() : 0;
@@ -3802,10 +7030,31 @@ async function loadBrainPage(silent) {
     }
     renderBrainChannelChips(window._brainChannelCounts);
     renderBrainChart(events);
-    if (typeof syncBrainGraph === 'function') syncBrainGraph(events);
+    if (typeof syncBrainGraph === 'function') syncBrainGraph(_brainApplyFilters(events));
     var streamEl = document.getElementById('brain-stream');
     var wasAtTop = !streamEl || streamEl.scrollTop < 40;
     renderBrainStream(events);
+    // Issue #1448 surface 3 — OSS / Cloud-Free users are capped to the
+    // last 24h. Render a one-line upgrade CTA above the brain stream so
+    // they know full history exists on Cloud-Pro.
+    _renderBrainHistoryCap(!!(data && data.capped_at_24h));
+    // NeMo daily-cap banner (issue #1170) — only visible when a free-tier
+    // user has tripped the 1000-events/day NeMo ingest ceiling.
+    _refreshNemoCapBanner('brain-stream');
+    // Issue #1195 — One-time "Live event details restored" toast for users
+    // who lived through the 0.12.182 empty-detail regression. Fires only if
+    // (a) at least one event has a non-empty detail, (b) the user hasn't
+    // already seen the toast (localStorage flag), and (c) the install
+    // pre-dates the regression cutoff (epoch derived from config.json
+    // ctime). Fresh installs and repeat visits skip silently.
+    try {
+      var hasDetail = false;
+      for (var _i = 0; _i < events.length; _i++) {
+        var _d = events[_i] && (events[_i].detail || events[_i].text || events[_i].content);
+        if (_d && String(_d).trim() !== '') { hasDetail = true; break; }
+      }
+      if (hasDetail) maybeShowBrainRestorationToast();
+    } catch (_toastErr) { /* never block render */ }
   } catch(e) {
     // Always replace the spinner on error -- previously this only fired
     // when `silent=false`, so a silent retry that errored left the prior
@@ -3818,6 +7067,9 @@ async function loadBrainPage(silent) {
       }
     }
   }
+  // Historical window active: the view is frozen — no SSE, no fallback
+  // poll. "Back to live" re-enters the streaming path below.
+  if (_brainRange) return;
   // After initial load, start SSE for live updates instead of polling.
   // Phase 3 (#1252): defer the handshake until the user dwells on the
   // Brain tab for ≥2 s — switching away cancels the pending open.
@@ -3831,6 +7083,167 @@ async function loadBrainPage(silent) {
   }
   // Loop-signals badge (#1364) — fire-and-forget; never blocks the Brain tab.
   loadLoopSignals();
+  // At-risk impact summary (issue #2008) — fire-and-forget; never blocks.
+  loadBrainAtRisk();
+  // Forward-progress badge (issue #1707) — fire-and-forget; never blocks.
+  loadBrainProgress();
+}
+
+
+// Fetch /api/outcomes/impact?window=1h and render the "Sessions at risk"
+// card on the Brain tab (issue #2008). Called fire-and-forget from
+// loadBrainPage(). Hides the card when all impact counts are zero.
+async function loadBrainAtRisk() {
+  var card = document.getElementById('brain-at-risk-card');
+  var chips = document.getElementById('brain-at-risk-chips');
+  if (!card || !chips) return;
+  try {
+    var r = await fetch('/api/outcomes/impact?window=1h');
+    if (!r.ok) return;
+    var d = await r.json();
+    var counts = (d && d.impacts) || {};
+    var _IMPACT_META = {
+      'crash-loop':    {icon: '🔁', label: 'Crash loop'},
+      'message-loss':  {icon: '📨', label: 'Message loss'},
+      'session-state': {icon: '💾', label: 'Session state'},
+      'auth-provider': {icon: '🔑', label: 'Auth error'},
+      'security':      {icon: '🛡️', label: 'Security'},
+    };
+    var anyNonZero = Object.keys(counts).some(function(k) { return counts[k] > 0; });
+    card.style.display = anyNonZero ? '' : 'none';
+    if (!anyNonZero) return;
+    var win = document.getElementById('brain-at-risk-window');
+    if (win) win.textContent = '· last ' + (d.window || '1h');
+    chips.innerHTML = '';
+    Object.keys(_IMPACT_META).forEach(function(k) {
+      if (!counts[k]) return;
+      var m = _IMPACT_META[k];
+      var chip = document.createElement('span');
+      chip.style.cssText = 'display:inline-flex;align-items:center;gap:4px;padding:3px 10px;' +
+        'border-radius:12px;background:rgba(245,158,11,0.12);' +
+        'border:1px solid rgba(245,158,11,0.3);font-size:11px;color:#f59e0b;cursor:default;';
+      chip.title = escHtml(m.label) + ': ' + counts[k] + ' session' + (counts[k] !== 1 ? 's' : '');
+      chip.innerHTML = m.icon + ' ' + escHtml(m.label) + ' <strong>' + counts[k] + '</strong>';
+      chips.appendChild(chip);
+    });
+  } catch(e) { /* never block brain load */ }
+}
+
+
+// Forward-progress badge (issue #1707) — per-session token-to-delta ratio
+// pills on the Brain tab. Called fire-and-forget from loadBrainPage().
+// Shows only yellow/red sessions; hides the card when all are green.
+async function loadBrainProgress() {
+  var card  = document.getElementById('brain-progress-card');
+  var chips = document.getElementById('brain-progress-chips');
+  if (!card || !chips) return;
+  try {
+    var since1h = new Date(Date.now() - 3600000).toISOString().slice(0, 19) + 'Z';
+    var r = await fetch('/api/forward-progress?since=' + encodeURIComponent(since1h));
+    if (!r.ok) return;
+    var d = await r.json();
+    var rows = (d && d.rows) || [];
+    var concerning = rows.filter(function(row) {
+      return row.badge === 'yellow' || row.badge === 'red';
+    });
+    card.style.display = concerning.length ? '' : 'none';
+    if (!concerning.length) return;
+    var win = document.getElementById('brain-progress-window');
+    if (win) win.textContent = '· last 1h';
+    chips.innerHTML = '';
+    concerning.forEach(function(row) {
+      var isRed = row.badge === 'red';
+      var color = isRed ? '#ef4444' : '#f59e0b';
+      var bg    = isRed ? 'rgba(239,68,68,0.12)'  : 'rgba(245,158,11,0.12)';
+      var bdr   = isRed ? 'rgba(239,68,68,0.3)'   : 'rgba(245,158,11,0.3)';
+      var icon  = isRed ? '🔴' : '🟡';
+      var sid   = (row.session_id || '').slice(0, 8);
+      var ratio = Math.round(row.ratio || 0).toLocaleString();
+      var chip  = document.createElement('span');
+      chip.style.cssText = 'display:inline-flex;align-items:center;gap:4px;padding:3px 10px;' +
+        'border-radius:12px;background:' + bg + ';border:1px solid ' + bdr + ';' +
+        'font-size:11px;color:' + color + ';cursor:default;';
+      chip.title = 'Session ' + escHtml(row.session_id || '') + ' — ' + ratio + ' tok/Δ';
+      chip.innerHTML = icon + ' ' + escHtml(sid) + '… <strong>' + ratio + '</strong> tok/Δ';
+      chips.appendChild(chip);
+    });
+  } catch(e) { /* never block brain load */ }
+}
+
+
+// Render a one-line OSS retention CTA above the Brain stream when the
+// /api/brain-history response carries capped_at_24h (issue #1448 surface
+// 3). Lives in its own container above #brain-stream so the stream itself
+// stays a pure event feed.
+function _renderBrainHistoryCap(capped) {
+  var host = document.getElementById('brain-history-cap-cta');
+  if (!host) {
+    var streamEl = document.getElementById('brain-stream');
+    if (!streamEl || !streamEl.parentElement) return;
+    host = document.createElement('div');
+    host.id = 'brain-history-cap-cta';
+    host.style.cssText = 'padding:10px 14px;margin-bottom:8px;font-size:12px;color:var(--text-muted);border:1px solid var(--border-secondary,#2a2a4a);border-radius:6px;background:var(--bg-secondary,rgba(124,92,255,0.06));display:none;';
+    streamEl.parentElement.insertBefore(host, streamEl);
+  }
+  if (capped) {
+    host.style.display = '';
+    host.innerHTML = 'Brain history older than 24 hours is on Cloud-Pro. <a href="https://app.clawmetry.com/upgrade" target="_blank" rel="noopener" style="color:var(--accent,#7c5cff);font-weight:600;">Upgrade for full conversation context.</a>';
+  } else {
+    host.style.display = 'none';
+    host.innerHTML = '';
+  }
+}
+
+
+// ── Brain restoration toast (issue #1195) ─────────────────────────────────
+// One-time "Live event details restored" toast for installs that lived
+// through the 0.12.182 empty-detail regression (shipped 2026-05-12, fixed
+// in #1190 / 0.12.183+). Gating logic:
+//   1. localStorage flag stops re-fire across navigations & daemon restarts.
+//   2. /api/install-age tells us when the config file was first created;
+//      installs that were created AFTER the regression cutoff are fresh
+//      installs that never saw broken Brain, so they get no toast.
+//   3. Fires once per first non-empty Brain load that satisfies (1)+(2).
+var _brainRestorationToastInflight = false;
+// Unix epoch for 2026-05-12 00:00 UTC (regression ship date for 0.12.182).
+var _BRAIN_REGRESSION_CUTOFF_EPOCH = 1778544000;
+var _BRAIN_TOAST_FLAG = 'clawmetry_brain_restoration_toast_shown_v1';
+
+function maybeShowBrainRestorationToast() {
+  try {
+    if (_brainRestorationToastInflight) return;
+    if (window.CLOUD_MODE) return;
+    if (typeof localStorage === 'undefined') return;
+    if (localStorage.getItem(_BRAIN_TOAST_FLAG) === '1') return;
+    _brainRestorationToastInflight = true;
+    fetchJsonWithTimeout('/api/install-age', 4000).then(function(d) {
+      try {
+        // Fresh install OR config newer than regression cutoff: don't toast.
+        // Pre-existing install (ctime older than 2026-05-12): show toast once.
+        if (!d || !d.exists || !d.ctime) return;
+        if (d.ctime >= _BRAIN_REGRESSION_CUTOFF_EPOCH) return;
+        try { localStorage.setItem(_BRAIN_TOAST_FLAG, '1'); } catch (_e) {}
+        _showBrainToast('Live event details restored. Brain stream is back to normal.');
+      } catch (_inner) {}
+    }).catch(function() {
+      // /api/install-age failed (offline daemon, 404 on older builds, etc.).
+      // Fail closed: do nothing so we never spam the toast on errors.
+    });
+  } catch (_outer) {}
+}
+
+function _showBrainToast(msg) {
+  try {
+    var t = document.createElement('div');
+    t.className = 'cron-toast';
+    t.setAttribute('role', 'status');
+    t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(function() {
+      t.style.opacity = '0';
+      setTimeout(function() { try { t.remove(); } catch (_e) {} }, 300);
+    }, 5000);
+  } catch (_e) {}
 }
 
 
@@ -3839,6 +7252,45 @@ async function loadBrainPage(silent) {
 // clawmetry/proxy.py's LoopDetector. Hidden when the count is 0; clicking
 // expands a flat table (Time | Session | Pattern | Repeat).
 var _loopSignalsExpanded = false;
+// Issue #1377: fire a browser notification on the FIRST detection per
+// dashboard session — the highest-intent moment a user has for noticing the
+// alerts feature. Tracks the most recent signature we've already alerted on
+// so we don't re-notify on every poll. Reset on page reload (intentional —
+// we re-alert if the user comes back fresh and a loop is still active).
+var _loopSignalsNotifiedSig = null;
+var _loopSignalsPermissionAsked = false;
+
+function _loopSignalsMaybeNotify(rows) {
+  if (!rows || !rows.length) return;
+  if (typeof window === 'undefined' || !('Notification' in window)) return;
+  // Pick the newest signature (rows arrive newest-first from the API).
+  var top = rows[0] || {};
+  var sig = String(top.signature || '');
+  if (!sig || sig === _loopSignalsNotifiedSig) return;
+  _loopSignalsNotifiedSig = sig;
+  // TODO #1377: Cloud-Free upsell modal here when CLOUD_MODE && tier === 'free'.
+  // Plain copy, no em-dashes — keeps the message readable to non-tech users
+  // (memory: feedback_no_em_dashes_in_user_facing_copy.md).
+  var title = 'Loop detected in your agent';
+  var body  = 'Loop detected, agent is repeating itself and burning tokens. Open the Brain tab to see why.';
+  function _fire() {
+    try {
+      var n = new Notification(title, { body: body, tag: 'clawmetry-loop' });
+      // Focus the dashboard tab if the user clicks the notification.
+      n.onclick = function() { try { window.focus(); n.close(); } catch (e) {} };
+    } catch (e) { /* notification creation failed — silently ignore */ }
+  }
+  try {
+    if (Notification.permission === 'granted') {
+      _fire();
+    } else if (Notification.permission !== 'denied' && !_loopSignalsPermissionAsked) {
+      _loopSignalsPermissionAsked = true;
+      Notification.requestPermission().then(function(perm) {
+        if (perm === 'granted') _fire();
+      }).catch(function() { /* ignore — older browsers reject promise */ });
+    }
+  } catch (e) { /* Notification API unavailable — silently ignore */ }
+}
 
 async function loadLoopSignals() {
   if (window.CLOUD_MODE) return;
@@ -3849,13 +7301,22 @@ async function loadLoopSignals() {
   try {
     var data = await fetchJsonWithTimeout('/api/loop-signals?limit=20', 5000);
     var rows = (data && data.signals) || [];
-    if (!rows.length) {
+    // Pro gate (#1376): show the badge count from the unfiltered total so
+    // OSS users still see e.g. "5 loops" even when the table is 1 teaser row.
+    var totalCount = (data && typeof data.total_count === 'number') ? data.total_count : rows.length;
+    var cappedProGated = !!(data && data.capped_pro_gated);
+    if (!totalCount) {
       badge.style.display = 'none';
       tableEl.innerHTML = '';
       return;
     }
     badge.style.display = '';
-    countEl.textContent = String(rows.length);
+    countEl.textContent = String(totalCount);
+    // Issue #1377: first-detection-per-session browser notification.
+    // Fired here so any tab (Brain or otherwise) that has triggered the
+    // loop-signal poll sees the notification — the highest-intent moment
+    // for an alerts upsell.
+    _loopSignalsMaybeNotify(rows);
     // Render table — keep it dead simple: Time | Session | Pattern | Repeat.
     var head = '<div style="display:grid;grid-template-columns:130px 160px 1fr 70px;gap:10px;padding:4px 0;border-bottom:1px solid var(--border-secondary);font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:1px;">'
       + '<div>Last seen</div><div>Session</div><div>Pattern</div><div style="text-align:right;">Repeats</div></div>';
@@ -3873,7 +7334,22 @@ async function loadLoopSignals() {
         + '<div style="text-align:right;color:#ef4444;font-weight:700;">' + escHtml(String(rc)) + '</div>'
         + '</div>';
     }).join('');
-    tableEl.innerHTML = head + body;
+    // CTA appears on any non-Pro node once a loop has fired. The backend
+    // sends ``capped_pro_gated=true`` whenever the OSS row-cap dropped rows;
+    // we also surface the CTA on a single-row OSS response (teaser is the
+    // entire history they get locally). Plain copy, no em-dashes.
+    var cta = '';
+    if (cappedProGated) {
+      var extra = (totalCount > rows.length)
+        ? ('Showing 1 of ' + totalCount + ' recent loops. ')
+        : '';
+      cta = '<div style="margin-top:10px;padding:8px 10px;border:1px dashed rgba(239,68,68,0.4);border-radius:6px;background:rgba(239,68,68,0.05);font-size:11px;color:var(--text-secondary);line-height:1.5;">'
+        + extra
+        + 'Get full loop history plus Slack and PagerDuty alerts when your agent burns money in a loop. '
+        + '<a href="https://app.clawmetry.com/upgrade?ref=loops" target="_blank" rel="noopener" style="color:var(--accent,#7c5cff);font-weight:600;text-decoration:none;">Unlock loop history and alerts in Cloud-Pro</a>'
+        + '</div>';
+    }
+    tableEl.innerHTML = head + body + cta;
   } catch (e) {
     // Fail closed: hide the badge so we don't show a stale or wrong count.
     badge.style.display = 'none';
@@ -3933,18 +7409,20 @@ async function loadSpansPanel() {
   var wrap = document.getElementById('spans-table-wrap');
   var countEl = document.getElementById('spans-count');
   if (!wrap) return;
-  wrap.innerHTML = '<div style="color:var(--text-muted);padding:20px;font-size:12px;">Loading spans...</div>';
+  wrap.innerHTML = '<div style="color:var(--text-muted);padding:20px;font-size:12px;">' + t("app.loading_spans", null, "Loading spans...") + '</div>';
   try {
     var resp = await fetch('/api/spans?limit=100');
     var data = await resp.json();
     _spansPanelLoaded = true;
     var spans = (data && data.spans) || [];
+    var cappedAt24h = !!(data && data.capped_at_24h);
     if (countEl) countEl.textContent = String(spans.length);
     if (!spans.length) {
       var hint = (data && data._source === 'unavailable')
-        ? 'Local store unavailable — start the sync daemon or restart with CLAWMETRY_LOCAL_STORE_READ=1.'
+        ? 'Local store unavailable. Start the sync daemon or restart with CLAWMETRY_LOCAL_STORE_READ=1.'
         : 'No OTel spans yet. Wire an OTLP exporter to <code>/v1/traces</code> on this dashboard\'s port to start capturing.';
       wrap.innerHTML = '<div style="color:var(--text-muted);padding:20px;font-size:12px;text-align:center;line-height:1.6;">' + hint + '</div>';
+      _renderSpansCap(cappedAt24h);
       return;
     }
     var rowsHtml = spans.map(function(s) {
@@ -3966,8 +7444,32 @@ async function loadSpansPanel() {
       +   '<th style="padding:4px 8px;font-weight:600;">Session</th>'
       +   '<th style="padding:4px 8px;font-weight:600;">Kind</th>'
       + '</tr></thead><tbody>' + rowsHtml + '</tbody></table>';
+    _renderSpansCap(cappedAt24h);
   } catch (e) {
-    wrap.innerHTML = '<div style="color:var(--text-error);padding:20px;font-size:12px;">Failed to load spans: ' + _spansEsc(String(e)) + '</div>';
+    wrap.innerHTML = '<div style="color:var(--text-error);padding:20px;font-size:12px;">' + t("app.failed_to_load_spans", null, "Failed to load spans") + ': ' + _spansEsc(String(e)) + '</div>';
+  }
+}
+
+// Render a small CTA row below the Spans table when the OSS retention cap
+// kicked in (issue #1374). Mirrors _renderFlowRunsCap; lives in its own
+// footer container appended inside #spans-panel so the table itself stays
+// purely tabular.
+function _renderSpansCap(capped) {
+  var foot = document.getElementById('spans-cap-cta');
+  if (!foot) {
+    var panel = document.getElementById('spans-panel');
+    if (!panel) return;
+    foot = document.createElement('div');
+    foot.id = 'spans-cap-cta';
+    foot.style.cssText = 'padding:10px 0 2px 0;font-size:12px;color:var(--text-muted);border-top:1px solid var(--border);margin-top:8px;display:none;';
+    panel.appendChild(foot);
+  }
+  if (capped) {
+    foot.style.display = '';
+    foot.innerHTML = 'Showing the last 24 hours. <a href="https://app.clawmetry.com/upgrade" target="_blank" rel="noopener" style="color:var(--accent,#7c5cff);font-weight:600;">Upgrade to Cloud-Pro for unlimited history</a>';
+  } else {
+    foot.style.display = 'none';
+    foot.innerHTML = '';
   }
 }
 
@@ -4036,7 +7538,7 @@ async function loadSecCatalog() {
   try {
     var data = await fetchJsonWithTimeout('/api/security/signatures', 5000);
     var sigs = data.signatures || [];
-    if (sigs.length === 0) { el.innerHTML = '<div style="color:var(--text-muted);font-size:11px;">No signatures loaded</div>'; return; }
+    if (sigs.length === 0) { el.innerHTML = '<div style="color:var(--text-muted);font-size:11px;">' + t("app.no_signatures_loaded", null, "No signatures loaded") + '</div>'; return; }
     var html = '<table style="width:100%;font-size:11px;border-collapse:collapse;">';
     html += '<tr style="color:var(--text-muted);border-bottom:1px solid var(--border);"><th style="text-align:left;padding:4px;">ID</th><th style="text-align:left;padding:4px;">Severity</th><th style="text-align:left;padding:4px;">Description</th><th style="text-align:left;padding:4px;">Pattern</th></tr>';
     sigs.forEach(function(s){
@@ -4051,7 +7553,7 @@ async function loadSecCatalog() {
     html += '</table>';
     el.innerHTML = html;
   } catch(e) {
-    el.innerHTML = '<div style="color:var(--text-error);font-size:11px;">Failed to load: ' + escHtml(String(e)) + '</div>';
+    el.innerHTML = '<div style="color:var(--text-error);font-size:11px;">' + t("app.failed_to_load", null, "Failed to load") + ': ' + escHtml(String(e)) + '</div>';
   }
 }
 
@@ -4068,7 +7570,7 @@ async function loadNemoClaw() {
       // Issue #1127: previously said "pip install nemoclaw" but the package
       // is not yet publicly released (only a 0.0.0a1 placeholder exists on
       // PyPI). Replace with an honest "Coming soon" empty state.
-      page.innerHTML = '<div style="padding:40px 20px;text-align:center;color:var(--text-muted);font-size:14px;">NemoClaw governance is not yet available on this host.<br><span style="font-size:12px;">Coming soon &mdash; NVIDIA NeMo Guardrails integration is in private preview.</span></div>';
+      page.innerHTML = '<div style="padding:40px 20px;text-align:center;color:var(--text-muted);font-size:14px;">NemoClaw governance is not yet available on this host.<br><span style="font-size:12px;">' + t("app.coming_soon_mdash_nvidia_nemo_guardrails_integrati", null, "Coming soon &mdash; NVIDIA NeMo Guardrails integration is in private preview.") + '</span></div>';
       return;
     }
 
@@ -4102,7 +7604,7 @@ async function loadNemoClaw() {
     var sbStatus = document.getElementById('nc-sandbox-status');
     if (sbStatus) {
       if (sandboxes.length === 0) {
-        sbStatus.textContent = 'no sandboxes';
+        sbStatus.textContent = t("app.no_sandboxes", null, "no sandboxes");
         sbStatus.style.color = 'var(--text-muted)';
       } else {
         var running = sandboxes.filter(function(s) { return s.status === 'running' || s.status === 'active'; }).length;
@@ -4134,11 +7636,11 @@ async function loadNemoClaw() {
     var driftBadge = document.getElementById('nc-drift-badge');
     if (data.drift) {
       if (driftAlert) driftAlert.style.display = '';
-      if (driftDetail) driftDetail.textContent = 'Previous: ' + (data.drift.previous_hash || data.drift.old_hash || '?') + ' → Current: ' + (data.drift.current_hash || data.drift.new_hash || '?') + (data.drift.detected_at ? '  (detected ' + data.drift.detected_at.substring(0,19).replace('T',' ') + ' UTC)' : '');
-      if (driftBadge) { driftBadge.textContent = '⚠ Policy drift detected'; driftBadge.style.cssText = 'font-size:11px;font-weight:700;color:#ef4444;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:4px;padding:2px 8px;'; }
+      if (driftDetail) driftDetail.textContent = t("app.previous", null, "Previous: ") + (data.drift.previous_hash || data.drift.old_hash || '?') + ' → Current: ' + (data.drift.current_hash || data.drift.new_hash || '?') + (data.drift.detected_at ? '  (detected ' + data.drift.detected_at.substring(0,19).replace('T',' ') + ' UTC)' : '');
+      if (driftBadge) { driftBadge.textContent = t("app.policy_drift_detected", null, "⚠ Policy drift detected"); driftBadge.style.cssText = 'font-size:11px;font-weight:700;color:#ef4444;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:4px;padding:2px 8px;'; }
     } else {
       if (driftAlert) driftAlert.style.display = 'none';
-      if (driftBadge) { driftBadge.textContent = '✓ No drift'; driftBadge.style.cssText = 'font-size:11px;font-weight:600;color:#76b900;'; }
+      if (driftBadge) { driftBadge.textContent = t("app.no_drift", null, "✓ No drift"); driftBadge.style.cssText = 'font-size:11px;font-weight:600;color:#76b900;'; }
     }
 
     // Network policies table
@@ -4146,7 +7648,7 @@ async function loadNemoClaw() {
     var tbl = document.getElementById('nc-policy-table');
     if (tbl) {
       if (netPol.length === 0 && !policy.hash) {
-        tbl.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">No policy file found at ~/.nemoclaw/source/nemoclaw-blueprint/policies/openclaw-sandbox.yaml</div>';
+        tbl.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">' + t("app.no_policy_file_found_at_nemoclaw_source_nemoclaw_b", null, "No policy file found at ~/.nemoclaw/source/nemoclaw-blueprint/policies/openclaw-sandbox.yaml") + '</div>';
       } else if (netPol.length === 0) {
         tbl.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">Policy loaded (' + (policy.lines || '?') + ' lines) — no network_policies section found.</div>';
       } else {
@@ -4165,7 +7667,7 @@ async function loadNemoClaw() {
     if (presetsEl) {
       var presets = data.presets || [];
       if (presets.length === 0) {
-        presetsEl.innerHTML = '<span style="color:var(--text-muted);font-size:12px;">None detected</span>';
+        presetsEl.innerHTML = '<span style="color:var(--text-muted);font-size:12px;">' + t("app.none_detected", null, "None detected") + '</span>';
       } else {
         presetsEl.innerHTML = presets.map(function(p) {
           return '<span style="background:rgba(118,185,0,0.1);border:1px solid rgba(118,185,0,0.25);color:#76b900;border-radius:12px;padding:3px 10px;font-size:12px;font-weight:600;">' + escHtml(p) + '</span>';
@@ -4178,8 +7680,10 @@ async function loadNemoClaw() {
     if (tab) tab.style.display = 'none';
     console.warn('NemoClaw governance load failed:', e);
   }
-  // Also load approvals
+  // Also load approvals, events and metrics
   loadNemoClawApprovals();
+  loadNemoClawEvents();
+  loadNemoClawMetrics();
 }
 
 // Auto-refresh approvals every 15 seconds when NemoClaw tab is active
@@ -4200,7 +7704,7 @@ async function loadNemoClawApprovals() {
   try {
     var data = await fetchJsonWithTimeout('/api/nemoclaw/pending-approvals', 8000);
     if (!data.installed) {
-      listEl.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:6px 0;">openshell not available on this host</div>';
+      listEl.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:6px 0;">' + t("app.openshell_not_available_on_this_host", null, "openshell not available on this host") + '</div>';
       if (countEl) countEl.style.display = 'none';
       return;
     }
@@ -4214,10 +7718,24 @@ async function loadNemoClawApprovals() {
       }
     }
     if (approvals.length === 0) {
-      listEl.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:8px 0;text-align:center;">✓ No pending requests</div>';
+      listEl.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:8px 0;text-align:center;">' + t("app.no_pending_requests", null, "✓ No pending requests") + '</div>';
       return;
     }
+    // Cloud-Pro upsell CTA (issue #1328): backend stamps ``pro_gated_upsell``
+    // when the queue has >=1 pending row AND the caller is not on Cloud-Pro.
+    // Pro users never see this — OSS / Cloud-Free do. Surface the pending
+    // count in the copy because a specific number ("get pinged on your 3
+    // pending approvals") converts harder than a generic ask.
     var html = '';
+    if (data.pro_gated_upsell) {
+      var count = (typeof data.pending_count === 'number') ? data.pending_count : approvals.length;
+      var label = count + ' pending ' + (count === 1 ? 'approval' : 'approvals');
+      html += '<div style="margin-bottom:10px;padding:10px 12px;border:1px dashed rgba(124,92,255,0.5);border-radius:6px;background:rgba(124,92,255,0.06);font-size:12px;color:var(--text-secondary);line-height:1.5;">'
+        + 'Get pinged on your ' + escHtml(label) + ' the moment they land. '
+        + 'Send instant Slack, PagerDuty, or email alerts so you never miss a request. '
+        + '<a href="https://app.clawmetry.com/upgrade?source=approvals" target="_blank" rel="noopener" style="color:var(--accent,#7c5cff);font-weight:600;text-decoration:none;">Start your 7-day free trial</a>'
+        + '</div>';
+    }
     approvals.forEach(function(a) {
       var ruleDisplay = '';
       if (a.host) {
@@ -4257,12 +7775,72 @@ async function loadNemoClawApprovals() {
     });
     listEl.innerHTML = html;
   } catch(e) {
-    listEl.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">Failed to load approvals</div>';
+    listEl.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">' + t("app.failed_to_load_approvals", null, "Failed to load approvals") + '</div>';
+  }
+}
+
+// Issue #876 — Guardrail events list
+async function loadNemoClawEvents() {
+  var listEl = document.getElementById('nc-events-list');
+  var countEl = document.getElementById('nc-events-count');
+  if (!listEl) return;
+  try {
+    var data = await fetchJsonWithTimeout('/api/nemoclaw/events', 8000);
+    var events = data.events || [];
+    if (countEl) {
+      if (events.length > 0) {
+        countEl.textContent = events.length;
+        countEl.style.display = '';
+      } else {
+        countEl.style.display = 'none';
+      }
+    }
+    if (events.length === 0) {
+      listEl.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:8px 0;text-align:center;">' + t("app.no_guardrail_events_recorded_yet", null, "No guardrail events recorded yet") + '</div>';
+      return;
+    }
+    var verdictColor = function(v) { return v === 'triggered' ? '#ef4444' : '#76b900'; };
+    var html = '<div style="display:grid;grid-template-columns:140px 1fr 90px 80px;gap:4px 8px;font-size:11px;">';
+    html += '<div style="color:var(--text-muted);padding-bottom:4px;border-bottom:1px solid var(--border);">TIME</div>';
+    html += '<div style="color:var(--text-muted);padding-bottom:4px;border-bottom:1px solid var(--border);">RULE</div>';
+    html += '<div style="color:var(--text-muted);padding-bottom:4px;border-bottom:1px solid var(--border);">VERDICT</div>';
+    html += '<div style="color:var(--text-muted);padding-bottom:4px;border-bottom:1px solid var(--border);">LATENCY</div>';
+    events.slice(0, 50).forEach(function(ev) {
+      var ts = (ev.ts || '').substring(0, 19).replace('T', ' ');
+      var latency = ev.latency_ms != null ? ev.latency_ms.toFixed(0) + ' ms' : '—';
+      var vc = verdictColor(ev.verdict);
+      html += '<div style="color:var(--text-muted);padding:3px 0;border-bottom:1px solid var(--border);">' + escHtml(ts) + '</div>';
+      html += '<div style="padding:3px 0;border-bottom:1px solid var(--border);word-break:break-all;">' + escHtml(ev.rule_name || '—') + '</div>';
+      html += '<div style="padding:3px 0;border-bottom:1px solid var(--border);"><span style="color:' + vc + ';font-weight:600;">' + escHtml(ev.verdict || '—') + '</span></div>';
+      html += '<div style="color:var(--text-muted);padding:3px 0;border-bottom:1px solid var(--border);">' + escHtml(latency) + '</div>';
+    });
+    html += '</div>';
+    listEl.innerHTML = html;
+  } catch(e) {
+    listEl.innerHTML = '<div style="color:var(--text-muted);font-size:12px;">' + t("app.failed_to_load_guardrail_events", null, "Failed to load guardrail events") + '</div>';
+  }
+}
+
+// Issue #876 — NemoClaw aggregate metrics
+async function loadNemoClawMetrics() {
+  try {
+    var data = await fetchJsonWithTimeout('/api/nemoclaw/metrics', 8000);
+    var m = data.metrics || {};
+    var trigEl = document.getElementById('nc-metric-triggers');
+    var rateEl = document.getElementById('nc-metric-approval-rate');
+    var latEl  = document.getElementById('nc-metric-latency');
+    var totEl  = document.getElementById('nc-metric-total');
+    if (trigEl) trigEl.textContent = m.triggers_24h != null ? m.triggers_24h : '—';
+    if (rateEl) rateEl.textContent = m.approval_rate_pct != null ? m.approval_rate_pct + '%' : '—';
+    if (latEl)  latEl.textContent  = m.avg_latency_secs  != null ? m.avg_latency_secs + 's'  : '—';
+    if (totEl)  totEl.textContent  = m.total_approvals   != null ? m.total_approvals           : '—';
+  } catch(e) {
+    console.warn('NemoClaw metrics load failed:', e);
   }
 }
 
 async function ncApprove(sandbox, chunkId, btn) {
-  if (btn) { btn.disabled = true; btn.textContent = 'Approving...'; }
+  if (btn) { btn.disabled = true; btn.textContent = t("app.approving", null, "Approving..."); }
   try {
     var resp = await fetch('/api/nemoclaw/approve', {
       method: 'POST',
@@ -4273,11 +7851,11 @@ async function ncApprove(sandbox, chunkId, btn) {
     if (data.ok) {
       setTimeout(loadNemoClawApprovals, 500);
     } else {
-      if (btn) { btn.disabled = false; btn.textContent = '✓ Approve'; }
+      if (btn) { btn.disabled = false; btn.textContent = t("app.approve", null, "✓ Approve"); }
       alert('Approve failed: ' + (data.output || 'unknown error'));
     }
   } catch(e) {
-    if (btn) { btn.disabled = false; btn.textContent = '✓ Approve'; }
+    if (btn) { btn.disabled = false; btn.textContent = t("app.approve", null, "✓ Approve"); }
     console.error('ncApprove error:', e);
   }
 }
@@ -4285,7 +7863,7 @@ async function ncApprove(sandbox, chunkId, btn) {
 async function ncReject(sandbox, chunkId, btn) {
   var reason = window.prompt('Reject reason (optional):') || '';
   if (reason === null) return; // cancelled
-  if (btn) { btn.disabled = true; btn.textContent = 'Rejecting...'; }
+  if (btn) { btn.disabled = true; btn.textContent = t("app.rejecting", null, "Rejecting..."); }
   try {
     var resp = await fetch('/api/nemoclaw/reject', {
       method: 'POST',
@@ -4296,70 +7874,106 @@ async function ncReject(sandbox, chunkId, btn) {
     if (data.ok) {
       setTimeout(loadNemoClawApprovals, 500);
     } else {
-      if (btn) { btn.disabled = false; btn.textContent = '✗ Reject'; }
+      if (btn) { btn.disabled = false; btn.textContent = t("app.reject", null, "✗ Reject"); }
       alert('Reject failed: ' + (data.output || 'unknown error'));
     }
   } catch(e) {
-    if (btn) { btn.disabled = false; btn.textContent = '✗ Reject'; }
+    if (btn) { btn.disabled = false; btn.textContent = t("app.reject", null, "✗ Reject"); }
     console.error('ncReject error:', e);
   }
 }
 
+// Security posture renderer — elevates the WARN/FAIL items that need
+// attention, collapses the passing items behind a one-line "show all"
+// disclosure, and condenses the hero card so the action items aren't
+// buried under a wall of green PASS cards.
 async function loadSecurityPosture() {
-  // Cloud mode no longer short-circuits this — the daemon now collects
-  // posture locally and pushes on its heartbeat, cloud stores it per node,
-  // and `/api/security/posture` returns the synced snapshot. The cloud-
-  // mode fetch shim auto-injects ?node_id=<current> + &token=<cm_> so the
-  // call works against either OSS-local OR cloud-served handler.
+  if (window.CLOUD_MODE) {
+    // Trial-bug fix #23: posture scans the local OpenClaw config (no DuckDB in
+    // cloud) so it errored on the hosted dashboard. Show an honest state.
+    var _pb = document.getElementById('posture-score-badge');
+    if (_pb) _pb.textContent = '--';
+    var _pl = document.getElementById('posture-score-label');
+    if (_pl) _pl.textContent = t('app.local_dashboard_only', null, 'Local dashboard only');
+    return;
+  }
   try {
     var data = await fetchJsonWithTimeout('/api/security/posture', 25000);
     var badge = document.getElementById('posture-score-badge');
+    if (!badge) return;
     var label = document.getElementById('posture-score-label');
     var bar = document.getElementById('posture-score-bar');
     var passedEl = document.getElementById('posture-passed');
     var warnEl = document.getElementById('posture-warnings');
     var failedEl = document.getElementById('posture-failed');
     var listEl = document.getElementById('posture-checks-list');
-    if (!badge) return;
     badge.textContent = data.score || '?';
     badge.style.background = data.score_color || '#64748b';
-    label.textContent = (data.score_label || 'Unknown') + ' (' + (data.score_pct || 0) + '%)' + (data.config_path ? ' — ' + data.config_path : '');
+    var labelTxt = (data.score_label || 'Unknown') + ' · ' + (data.score_pct || 0) + '%';
+    label.innerHTML = escHtml(labelTxt) + (data.config_path ? '<span style="color:var(--text-muted);margin-left:8px;font-size:10px;font-family:ui-monospace,Menlo,monospace;">' + escHtml(data.config_path) + '</span>' : '');
     bar.style.width = (data.score_pct || 0) + '%';
     bar.style.background = data.score_color || '#64748b';
     passedEl.textContent = data.passed || 0;
     warnEl.textContent = data.warnings || 0;
     failedEl.textContent = data.failed || 0;
-    var checks = data.checks || [];
-    var html = '';
-    var statusIcons = {'pass': '&#9989;', 'warn': '&#9888;&#65039;', 'fail': '&#10060;'};
-    var statusColors = {'pass': '#22c55e', 'warn': '#f59e0b', 'fail': '#ef4444'};
-    // Show failed first, then warnings, then passed
-    checks.sort(function(a,b) {
-      var order = {'fail': 0, 'warn': 1, 'pass': 2};
-      return (order[a.status] || 2) - (order[b.status] || 2);
-    });
-    checks.forEach(function(c) {
-      var icon = statusIcons[c.status] || '&#10067;';
-      var color = statusColors[c.status] || '#64748b';
-      html += '<div style="display:flex;align-items:flex-start;gap:8px;padding:8px 10px;background:var(--bg-primary);border:1px solid var(--border);border-radius:6px;border-left:3px solid ' + color + ';">';
-      html += '<span style="font-size:14px;flex-shrink:0;">' + icon + '</span>';
-      html += '<div style="flex:1;min-width:0;">';
-      html += '<div style="font-size:12px;font-weight:600;color:var(--text-primary);">' + escHtml(c.label) + ' <span style="font-size:10px;color:' + color + ';font-weight:700;text-transform:uppercase;">' + escHtml(c.status) + '</span></div>';
-      html += '<div style="font-size:11px;color:var(--text-secondary);margin-top:2px;">' + escHtml(c.detail) + '</div>';
+    var checks = (data.checks || []).slice();
+    var fails = checks.filter(function(c){ return c.status === 'fail'; });
+    var warns = checks.filter(function(c){ return c.status === 'warn'; });
+    var passes = checks.filter(function(c){ return c.status === 'pass'; });
+    function row(c, color, accent) {
+      var h = '<div style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;background:' + (accent || 'var(--bg-primary)') + ';border:1px solid var(--border);border-left:3px solid ' + color + ';border-radius:6px;">';
+      h += '<div style="flex:1;min-width:0;">';
+      h += '<div style="font-size:13px;font-weight:600;color:var(--text-primary);">' + escHtml(c.label) + '</div>';
+      h += '<div style="font-size:11px;color:var(--text-secondary);margin-top:2px;">' + escHtml(c.detail || '') + '</div>';
       if (c.remediation) {
-        html += '<div style="font-size:10px;color:#3b82f6;margin-top:3px;font-family:monospace;background:rgba(59,130,246,0.08);padding:3px 6px;border-radius:3px;">&#128736; ' + escHtml(c.remediation) + '</div>';
+        h += '<div style="font-size:10px;color:#a5b4fc;margin-top:6px;font-family:ui-monospace,Menlo,monospace;background:rgba(99,102,241,0.10);padding:5px 8px;border-radius:4px;line-height:1.45;">→ ' + escHtml(c.remediation) + '</div>';
       }
+      h += '</div></div>';
+      return h;
+    }
+    function passPill(c) {
+      return '<span title="' + escHtml(c.detail || '') + '" style="display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:14px;background:rgba(34,197,94,0.10);border:1px solid rgba(34,197,94,0.3);color:#86efac;font-size:11px;font-weight:500;">✓ ' + escHtml(c.label) + '</span>';
+    }
+    var html = '';
+    if (fails.length || warns.length) {
+      html += '<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:var(--text-muted);margin:4px 0 8px;">Needs review · ' + (fails.length + warns.length) + '</div>';
+      html += '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;">';
+      fails.forEach(function(c){ html += row(c, '#ef4444', 'rgba(239,68,68,0.06)'); });
+      warns.forEach(function(c){ html += row(c, '#f59e0b', 'rgba(245,158,11,0.05)'); });
+      html += '</div>';
+    } else if (passes.length) {
+      html += '<div style="padding:12px 14px;background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.25);border-radius:6px;color:#86efac;font-size:13px;font-weight:600;margin-bottom:14px;">✓ All ' + passes.length + ' security checks passing — nothing to review.</div>';
+    }
+    if (passes.length) {
+      var openByDefault = !(fails.length || warns.length);
+      html += '<div>';
+      html += '<button type="button" onclick="(function(b){var t=document.getElementById(\'posture-passing-list\');var open=t.style.display!==\'none\';t.style.display=open?\'none\':\'\';b.querySelector(\'.chev\').textContent=open?\'▸\':\'▾\';})(this)" style="display:inline-flex;align-items:center;gap:8px;background:none;border:none;color:var(--text-muted);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;cursor:pointer;padding:4px 0;">';
+      html += '<span class="chev">' + (openByDefault ? '▾' : '▸') + '</span> Passing · ' + passes.length + '</button>';
+      html += '<div id="posture-passing-list" style="display:' + (openByDefault ? 'flex' : 'none') + ';flex-wrap:wrap;gap:6px;margin-top:6px;">';
+      passes.forEach(function(c){ html += passPill(c); });
       html += '</div></div>';
-    });
+    }
     listEl.innerHTML = html;
   } catch(e) {
     var panel = document.getElementById('security-posture-panel');
-    if (panel) panel.innerHTML = '<div style="color:var(--text-error);padding:10px;font-size:12px;">Posture scan failed: ' + escHtml(String(e)) + '</div>';
+    if (panel) panel.innerHTML = '<div style="color:var(--text-error);padding:10px;font-size:12px;">' + t("app.posture_scan_failed", null, "Posture scan failed") + ': ' + escHtml(String(e)) + '</div>';
   }
 }
 
 async function loadSecurityPage(silent) {
-  if (window.CLOUD_MODE) return;
+  if (window.CLOUD_MODE) {
+    // Trial-bug fix #24: threat scanning runs on the local node (no DuckDB in
+    // cloud); the early-return left "Scanning..." spinning forever. Render an
+    // honest state instead.
+    var _tl = document.getElementById('security-threat-list');
+    if (_tl) _tl.innerHTML = '<div style="color:var(--text-muted);padding:20px;font-size:13px;">' + t('app.security_threats_local_only', null, 'Threat detection runs on your local node. Open the local dashboard to scan for misconfigurations.') + '</div>';
+    // Integrity + audit DO ship in the snapshot; a cm-cloud interceptor will
+    // serve them. Until then these render an honest "local node" state rather
+    // than a silent blank (and become live once the interceptor lands).
+    loadSecurityIntegrity();
+    loadSecurityAudit();
+    return;
+  }
   try {
     var data = await fetchJsonWithTimeout('/api/security/threats', 10000);
     var threats = data.threats || [];
@@ -4370,17 +7984,225 @@ async function loadSecurityPage(silent) {
     document.getElementById('sec-medium-count').textContent = counts.medium || 0;
     document.getElementById('sec-clean-count').textContent = counts.clean_sessions || 0;
     var scanTime = document.getElementById('security-scan-time');
-    if (scanTime) scanTime.textContent = 'Scanned ' + new Date().toLocaleTimeString();
+    if (scanTime) scanTime.textContent = t("app.scanned", null, "Scanned ") + new Date().toLocaleTimeString();
+    // Compact "all-clear" mode: when there's nothing to triage, hide the four
+    // zero-tiles + severity filter + perpetual "Scanning..." placeholder; show
+    // one calm green line instead. Restored the moment anything > 0.
+    var nThreats = (counts.critical || 0) + (counts.high || 0) + (counts.medium || 0) + (threats.length || 0);
+    var summaryEl = document.getElementById('security-summary');
+    var filterEl = document.getElementById('security-filter-pills');
+    var listWrap = document.getElementById('security-threat-list');
+    var allclear = document.getElementById('security-allclear');
+    if (allclear) {
+      if (nThreats === 0) {
+        if (summaryEl) summaryEl.style.display = 'none';
+        if (filterEl) filterEl.style.display = 'none';
+        if (listWrap) listWrap.style.display = 'none';
+        allclear.style.display = 'block';
+      } else {
+        if (summaryEl) summaryEl.style.display = '';
+        if (filterEl) filterEl.style.display = '';
+        if (listWrap) listWrap.style.display = '';
+        allclear.style.display = 'none';
+      }
+    }
     renderSecurityThreats(threats);
   } catch(e) {
     if (!silent) {
       var el = document.getElementById('security-threat-list');
-      if (el) el.innerHTML = '<div style="color:var(--text-error);padding:20px">Scan failed: ' + escHtml(String(e)) + '</div>';
+      if (el) el.innerHTML = '<div style="color:var(--text-error);padding:20px">' + t("app.scan_failed", null, "Scan failed") + ': ' + escHtml(String(e)) + '</div>';
     }
+  }
+  // Policy events (PII / injection / credential leak)
+  try {
+    var pd = await fetchJsonWithTimeout('/api/security/policy-events', 10000);
+    var pc = pd.counts || {};
+    var piiEl = document.getElementById('pol-pii-count');
+    var injEl = document.getElementById('pol-inject-count');
+    var lkEl  = document.getElementById('pol-leak-count');
+    if (piiEl) piiEl.textContent = pc.PII || 0;
+    if (injEl) injEl.textContent = pc.INJECT || 0;
+    if (lkEl)  lkEl.textContent  = pc.LEAK || 0;
+    var stEl = document.getElementById('policy-events-scan-time');
+    if (stEl) stEl.textContent = new Date().toLocaleTimeString();
+    var listEl = document.getElementById('policy-events-list');
+    if (listEl) {
+      var hits = pd.hits || [];
+      if (!hits.length) {
+        listEl.innerHTML = '<div style="color:var(--text-muted);padding:12px;" data-i18n="security.no_policy_events">No policy events detected in recent activity.</div>';
+      } else {
+        var _polSevColor = {critical:'#dc2626', high:'#ef4444', medium:'#f59e0b', low:'#64748b'};
+        var _polTypeIcon = {PII:'&#128100;', INJECT:'&#128680;', LEAK:'&#128273;'};
+        var html = '';
+        hits.slice(0, 30).forEach(function(h) {
+          var col = _polSevColor[h.severity] || '#64748b';
+          var icon = _polTypeIcon[h.type] || '&#9888;';
+          html += '<div style="display:flex;align-items:flex-start;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);">';
+          html += '<span style="font-size:13px;flex-shrink:0;">' + icon + '</span>';
+          html += '<div style="flex:1;min-width:0;">';
+          html += '<span style="font-size:11px;font-weight:600;color:' + col + ';">' + escHtml(h.type) + ' · ' + escHtml(h.severity) + '</span>';
+          html += ' <span style="font-size:11px;color:var(--text-muted);">' + escHtml(h.description) + '</span>';
+          if (h.matched) html += ' <code style="font-size:10px;background:var(--bg-primary);padding:1px 4px;border-radius:3px;color:#a78bfa;">' + escHtml(h.matched) + '</code>';
+          if (h.time) html += '<div style="font-size:10px;color:var(--text-muted);margin-top:2px;">' + escHtml(String(h.time).slice(0, 19)) + (h.session ? ' · ' + escHtml(String(h.session).slice(0, 20)) : '') + '</div>';
+          html += '</div></div>';
+        });
+        listEl.innerHTML = html;
+      }
+    }
+  } catch(e) {
+    var pel = document.getElementById('policy-events-list');
+    if (pel && !silent) pel.innerHTML = '<div style="color:var(--text-muted);padding:12px;font-size:11px;">Policy scan unavailable.</div>';
+  }
+  // Tamper-evident integrity + Enterprise audit feed (both node-wide).
+  loadSecurityIntegrity();
+  loadSecurityAudit();
+  try {
+    var cd = await fetchJsonWithTimeout('/api/security/credential-scan', 10000);
+    var badgeEl = document.getElementById('credential-scan-badge');
+    var scanListEl = document.getElementById('credential-scan-list');
+    var leaks = cd.leaks || [];
+    var leakCount = cd.count || 0;
+    if (badgeEl) {
+      if (leakCount > 0) {
+        badgeEl.textContent = leakCount + ' leak' + (leakCount === 1 ? '' : 's');
+        badgeEl.style.background = '#dc2626';
+        badgeEl.style.color = '#fff';
+      } else {
+        badgeEl.textContent = 'Clean';
+        badgeEl.style.background = 'rgba(34,197,94,0.15)';
+        badgeEl.style.color = '#86efac';
+      }
+    }
+    if (scanListEl) {
+      if (!leaks.length) {
+        scanListEl.innerHTML = '<div style="color:#86efac;padding:10px;font-size:11px;">&#10003; No API key leaks detected in recent session events.</div>';
+      } else {
+        var _patternLabel = {openai:'OpenAI',anthropic:'Anthropic',aws:'AWS',github:'GitHub',generic:'Generic'};
+        var chtml = '';
+        leaks.slice(0, 30).forEach(function(lk) {
+          var pLabel = _patternLabel[lk.pattern] || lk.pattern;
+          chtml += '<div style="display:flex;align-items:flex-start;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);">';
+          chtml += '<span style="font-size:13px;flex-shrink:0;">&#128273;</span>';
+          chtml += '<div style="flex:1;min-width:0;">';
+          chtml += '<span style="font-size:11px;font-weight:600;color:#dc2626;">api_key_leak</span>';
+          chtml += ' <span style="font-size:10px;padding:1px 6px;border-radius:10px;background:rgba(220,38,38,0.12);color:#fca5a5;">' + escHtml(pLabel) + '</span>';
+          if (lk.redacted) chtml += ' <code style="font-size:10px;background:var(--bg-primary);padding:1px 4px;border-radius:3px;color:#a78bfa;">' + escHtml(lk.redacted) + '</code>';
+          chtml += '<div style="font-size:10px;color:var(--text-muted);margin-top:2px;">event #' + lk.line + (lk.file ? ' · session ' + escHtml(String(lk.file).slice(0, 24)) : '') + '</div>';
+          chtml += '</div></div>';
+        });
+        scanListEl.innerHTML = chtml;
+      }
+    }
+  } catch(e) {
+    var csl = document.getElementById('credential-scan-list');
+    if (csl && !silent) csl.innerHTML = '<div style="color:var(--text-muted);padding:12px;font-size:11px;">Credential scan unavailable.</div>';
   }
   if (_securityRefreshTimer) clearTimeout(_securityRefreshTimer);
   if (document.getElementById('page-security') && document.getElementById('page-security').classList.contains('active')) {
     _securityRefreshTimer = setTimeout(function() { loadSecurityPage(true); }, 30000);
+  }
+}
+
+// Tamper-evident hash-chain status. Plain-language labels per the FLYWHEEL
+// vision ("Tamper-evident log: 1,240 events, intact"), never "hash chain
+// verified". Node-wide concept — the runtime switcher does not apply.
+async function loadSecurityIntegrity() {
+  var label = document.getElementById('integrity-label');
+  var badge = document.getElementById('integrity-badge');
+  var icon = document.getElementById('integrity-icon');
+  if (!label || !badge) return;
+  function paint(txt, badgeTxt, badgeColor, iconChar) {
+    label.textContent = txt;
+    badge.textContent = badgeTxt;
+    if (badgeColor) { badge.style.color = badgeColor; badge.style.background = 'transparent'; badge.style.border = '1px solid ' + badgeColor; }
+    if (icon && iconChar) icon.innerHTML = iconChar;
+  }
+  try {
+    var d = await fetchJsonWithTimeout('/api/security/integrity', 10000);
+    var n = (d && d.chain_length) || 0;
+    var nStr = n.toLocaleString();
+    if (d && d.ok === true) {
+      paint(t('app.integrity_intact', null, 'Tamper-evident log: ' + nStr + ' events, intact. Every recorded event is chained, so silent edits would show up here.'),
+            t('app.integrity_intact_badge', null, 'Intact'), '#22c55e', '&#128274;');
+    } else if (d && d.ok === false) {
+      paint(t('app.integrity_broken', null, 'Tamper-evident log: a break was detected at event ' + (d.first_break != null ? d.first_break : '?') + '. The activity log may have been altered.'),
+            t('app.integrity_broken_badge', null, 'Tampered'), '#ef4444', '&#9888;');
+    } else if (window.CLOUD_MODE) {
+      // Honest cloud state until the cm-cloud-security interceptor serves the
+      // securityIntegrity snapshot slice (no silent blank).
+      paint(t('app.integrity_local_only', null, 'The tamper-evident log lives on your local node. Open the local dashboard to verify it.'),
+            t('app.integrity_na_badge', null, 'Local node'), '#64748b', '&#128274;');
+    } else {
+      paint(t('app.integrity_empty', null, 'No tamper-evident events recorded yet. Chaining begins as your agents run.'),
+            t('app.integrity_empty_badge', null, 'No data'), '#64748b', '&#128274;');
+    }
+  } catch (e) {
+    paint(t('app.integrity_unavailable', null, 'Could not check the tamper-evident log right now.'),
+          '', '#64748b', '&#128274;');
+  }
+}
+
+// Recent Enterprise audit-log activity (approvals, budgets, pauses). Node-wide.
+async function loadSecurityAudit() {
+  var listEl = document.getElementById('security-audit-list');
+  var countEl = document.getElementById('security-audit-count');
+  if (!listEl) return;
+  try {
+    var d = await fetchJsonWithTimeout('/api/security/audit?limit=25', 10000);
+    var rows = (d && d.entries) || [];
+    if (countEl) countEl.textContent = rows.length ? (rows.length + (rows.length === 1 ? ' event' : ' events')) : '';
+    if (!rows.length) {
+      if (window.CLOUD_MODE) {
+        listEl.innerHTML = '<div style="color:var(--text-muted);padding:12px;">' + t('app.audit_local_only', null, 'Governance activity is recorded on your local node. Open the local dashboard to review it.') + '</div>';
+      } else {
+        listEl.innerHTML = '<div style="color:var(--text-muted);padding:12px;" data-i18n="security.audit_empty">' + t('security.audit_empty', null, 'No recorded activity yet. Approval decisions, budget changes, and pauses appear here.') + '</div>';
+      }
+      return;
+    }
+    // Plain-language label per action prefix; result drives the accent color.
+    var _actLabel = {
+      'approval.decision': 'Approval decision',
+      'hitl.pause': 'Agent paused',
+      'hitl.resume': 'Agent resumed',
+      'hitl.decide': 'Review decision',
+      'budget.config': 'Budget settings changed',
+      'budget.auto_pause': 'Auto-pause threshold changed',
+      'budget.agent_set': 'Per-agent budget set',
+      'budget.agent_delete': 'Per-agent budget removed',
+      'gateway.pause': 'Gateway paused',
+      'gateway.resume': 'Gateway resumed',
+      'alert_rule.create': 'Alert rule created',
+      'alert_rule.update': 'Alert rule updated',
+      'alert_rule.delete': 'Alert rule deleted'
+    };
+    function resultColor(r) {
+      r = String(r || '').toLowerCase();
+      if (r === 'denied' || r === 'deny' || r === 'rejected' || r === 'paused' || r === 'deleted') return '#f59e0b';
+      if (r === 'approved' || r === 'approve' || r === 'resumed') return '#22c55e';
+      return '#64748b';
+    }
+    var html = '';
+    rows.forEach(function(r) {
+      var act = r.event_type || '';
+      var lbl = _actLabel[act] || act;
+      var det = r.details || {};
+      var res = det.result || '';
+      var col = resultColor(res);
+      var when = r.ts ? new Date(r.ts * 1000).toLocaleString() : '';
+      html += '<div style="display:flex;align-items:flex-start;gap:8px;padding:7px 0;border-bottom:1px solid var(--border);">';
+      html += '<span style="width:7px;height:7px;border-radius:50%;background:' + col + ';flex-shrink:0;margin-top:5px;"></span>';
+      html += '<div style="flex:1;min-width:0;">';
+      html += '<span style="font-size:12px;font-weight:600;color:var(--text-primary);">' + escHtml(lbl) + '</span>';
+      if (res) html += ' <span style="font-size:11px;color:' + col + ';">' + escHtml(res) + '</span>';
+      if (r.target) html += ' <code style="font-size:10px;background:var(--bg-primary);padding:1px 4px;border-radius:3px;color:#a78bfa;">' + escHtml(String(r.target).slice(0, 48)) + '</code>';
+      html += '<div style="font-size:10px;color:var(--text-muted);margin-top:2px;">';
+      if (r.actor) html += escHtml('by ' + r.actor) + ' · ';
+      html += escHtml(when) + '</div>';
+      html += '</div></div>';
+    });
+    listEl.innerHTML = html;
+  } catch (e) {
+    listEl.innerHTML = '<div style="color:var(--text-muted);padding:12px;font-size:11px;">' + t('app.audit_unavailable', null, 'Activity feed unavailable.') + '</div>';
   }
 }
 
@@ -4399,7 +8221,7 @@ function openDetailView(type) {
   } else if (type === 'sessions') {
     showSessionsModal();
   } else if (type === 'tools') {
-    switchTab('logs');
+    switchTab('brain');
   } else {
     // For thinking feed and models, stay on overview but could expand in future
     alert('Detail view for ' + type + ' coming soon!');
@@ -4517,14 +8339,14 @@ async function viewFile(path) {
   var title = document.getElementById('file-viewer-title');
   var content = document.getElementById('file-viewer-content');
   title.textContent = path;
-  content.textContent = 'Loading...';
+  content.textContent = t("app.loading", null, "Loading...");
   viewer.style.display = 'block';
   try {
     var data = await fetch('/api/file?path=' + encodeURIComponent(path)).then(r => r.json());
-    if (data.error) { content.textContent = 'Error: ' + data.error; return; }
+    if (data.error) { content.textContent = t("app.error", null, "Error: ") + data.error; return; }
     content.textContent = data.content;
   } catch(e) {
-    content.textContent = 'Failed to load: ' + e.message;
+    content.textContent = t("app.failed_to_load_2", null, "Failed to load: ") + e.message;
   }
   viewer.scrollIntoView({behavior:'smooth'});
 }
@@ -4533,18 +8355,1074 @@ function closeFileViewer() {
   document.getElementById('file-viewer').style.display = 'none';
 }
 
+// ── Runtime switcher (OpenClaw / PicoClaw / NanoClaw) ──────────────────────
+// OpenClaw-family runtimes share one dashboard; this lets you scope a session
+// list to a single runtime for a cleaner deep-dive ("All" = merged, the
+// default). The runtime is derived from the namespaced session id
+// (picoclaw:/nanoclaw:) with an explicit `runtime` field as a fallback, so it
+// works the same locally and in the cloud (the cloud session ids carry the
+// same prefix). The switcher only appears when >1 runtime is present.
+// Known non-OpenClaw runtimes (keys match each adapter's `name` + the
+// `<name>:<id>` session-id prefix the daemon stamps). Order here drives the
+// switcher chip order (OpenClaw always first). To add a runtime, add a label.
+var _CM_RT_LABEL = {
+  openclaw: 'OpenClaw', nemoclaw: 'NemoClaw',
+  picoclaw: 'PicoClaw', nanoclaw: 'NanoClaw',
+  hermes: 'Hermes', claude_code: 'Claude Code', codex: 'Codex', cursor: 'Cursor',
+  aider: 'Aider', goose: 'Goose', opencode: 'opencode', qwen_code: 'Qwen Code',
+  pi: 'Pi', deepagents: 'Deep Agents'
+};
+// The CLOSED session-prefix runtimes (the only keys that can ride a session_id
+// prefix). Foreign OTLP / OpenLLMetry apps are NOT in here — they have no
+// prefix and are filtered by agent_type server-side, so _cmRuntimeOf must never
+// derive them from a prefix (it can't) and never mis-bucket them into openclaw.
+var _CM_RT_PREFIXES = {
+  openclaw: 1, picoclaw: 1, nanoclaw: 1, hermes: 1, claude_code: 1, codex: 1,
+  cursor: 1, aider: 1, goose: 1, opencode: 1, qwen_code: 1, pi: 1, deepagents: 1
+};
+// Dynamic registry of foreign OTLP/OpenLLMetry apps surfaced by the daemon
+// (runtimeSummary/agentInventory carry `otlp:true` + a `displayName`). These are
+// keyed by agent_type (e.g. 'my_app' from service.name) and scoped SERVER-SIDE
+// via ?runtime=<agent_type>; there is no session-id prefix to match client-side.
+// agentKey -> {label}. Populated by _cmRegisterOtlpRuntime as data arrives.
+var _CM_OTLP_RT = {};
+function _cmRegisterOtlpRuntime(key, label) {
+  if (!key) return;
+  key = String(key);
+  if (_CM_RT_PREFIXES.hasOwnProperty(key.toLowerCase())) return; // never shadow a native runtime
+  _CM_OTLP_RT[key] = { label: label || key };
+  // Surface the label so _cmRuntimeLabel / chips read 'My App (OTel)'.
+  if (!_CM_RT_LABEL.hasOwnProperty(key)) _CM_RT_LABEL[key] = label || key;
+}
+// True iff `rt` is a foreign OTLP app (agent_type filter, not session prefix).
+function _cmIsOtlpRuntime(rt) { return !!(rt && _CM_OTLP_RT.hasOwnProperty(rt)); }
+function _cmRuntimeOf(o) {
+  var id = (o && (o.id || o.sessionId || o.session_id || o.key)) || '';
+  var i = id.indexOf(':');
+  if (i > 0) {
+    var p = id.slice(0, i).toLowerCase();
+    if (_CM_RT_PREFIXES.hasOwnProperty(p) && p !== 'openclaw') return p;
+  }
+  // Explicit agent_type / runtime field (OTLP apps + server-tagged rows). An
+  // OTLP app's spans carry agent_type=<its key>; honor it directly so a
+  // selected OTLP runtime matches its own data and nothing else.
+  var r = o && (o.runtime || o.agent_type || o.agentType);
+  if (r) {
+    r = String(r).toLowerCase();
+    if (_CM_RT_PREFIXES.hasOwnProperty(r) || _CM_OTLP_RT.hasOwnProperty(r)) return r;
+  }
+  return 'openclaw';
+}
+// The active runtime filter. A `?runtime=<id>` URL param takes precedence over
+// the localStorage value and is TAB-LOCAL: localStorage is shared across all
+// tabs of an origin, so without this a Fleet "open <runtime> in a new tab" would
+// have every tab fight over one shared key. Pinning via the URL lets you open
+// Claude Code in one tab and Codex in another, each independent.
+function _cmRuntimeFilterUrlPin() {
+  try {
+    var p = new URLSearchParams(window.location.search);
+    if (p.has('runtime')) { var v = p.get('runtime'); if (v) return v; }
+  } catch (e) {}
+  return null;
+}
+function _cmRuntimeFilter() {
+  var pin = _cmRuntimeFilterUrlPin();
+  if (pin) return pin;
+  try { return localStorage.getItem('cm-runtime-filter') || 'all'; } catch (e) { return 'all'; }
+}
+function _cmSetRuntimeFilter(v, reload) {
+  // If this tab is URL-pinned to a runtime, keep the selection tab-local by
+  // updating the URL param (not the shared localStorage key) so sibling tabs
+  // stay on their own runtime.
+  if (_cmRuntimeFilterUrlPin() !== null) {
+    try {
+      var u = new URL(window.location.href);
+      u.searchParams.set('runtime', v);
+      window.history.replaceState(null, '', u.toString());
+    } catch (e) {}
+  } else {
+    try { localStorage.setItem('cm-runtime-filter', v); } catch (e) {}
+  }
+  if (typeof reload === 'function') reload();
+}
+function _cmRuntimeLabel(rt) { return _CM_RT_LABEL[rt] || rt; }
+// Runtime to use for CLIENT-SIDE prefix filtering of a node-wide blob (Brain
+// list/chart, Tracing, model attribution, active tasks, transcripts). A foreign
+// OTLP app has no session-id prefix, so a prefix filter would empty the view —
+// which would contradict the honest "showing all runtimes" scope note we render
+// for it. Collapse OTLP selections to 'all' here so the blob shows unfiltered
+// (the note explains why); the server-side runtime= path (the no-leak contract)
+// is unaffected. Native runtimes pass through unchanged.
+function _cmClientFilterRt(rt) {
+  return _cmIsOtlpRuntime(rt) ? 'all' : rt;
+}
+// Tabs whose data is a cross-runtime AGGREGATE (merged server/snapshot-side):
+// the switcher can't scope them client-side yet, so picking a specific runtime
+// shows an honest "all runtimes" note rather than pretending the numbers are
+// runtime-specific. (Per-runtime aggregation is a follow-up.)
+// Tool catalog + Context economics now filter per-runtime (snapshot byRuntime
+// slice + cloud interceptor), so they're no longer aggregate-only tabs.
+// context (LLM Context) still pending per-runtime slicing.
+var _CM_RT_AGGREGATE = {
+  context: 1
+};
+// Tabs that are NODE-WIDE concepts, not per-runtime: crons run on the gateway,
+// memory/skills are workspace-level, security is machine posture, self-evolve is
+// node findings. The runtime selector simply does not apply to these.
+var _CM_RT_NODEWIDE = {
+  crons: 1, memory: 1, security: 1, skills: 1, selfevolve: 1, approvals: 1,
+  alerts: 1, policy: 1, nemoclaw: 1, notifications: 1, dives: 1,
+  'version-impact': 1, clusters: 1, logs: 1, actions: 1,
+  // Inventory is a ROSTER (node/all-agents view): it never hides rows when a
+  // runtime is selected. Instead it highlights the selected runtime's row and
+  // carries the honest node-wide scope note (FLYWHEEL HARD GATE 2). The DATA
+  // path still honours per-runtime via agentInventoryByRuntime.
+  inventory: 1
+};
+// Per-runtime sidebar tab visibility, DERIVED from each adapter's DECLARED
+// Capability enum — the authoritative contract, not an LLM "analysis" (founder
+// 2026-06-03: a workflow agent hallucinated NemoClaw as a "NeMo toolkit" when
+// it is sandboxed OpenClaw; deriving from declared capabilities makes the config
+// hallucination-proof and self-maintaining). Source of truth:
+//   - pro adapters: clawmetry_pro/adapters/<rt>.py `capabilities()` return.
+//   - openclaw: clawmetry/adapters/openclaw.py. nemoclaw runs the OpenClaw
+//     adapter (sandboxed: `clawmetry exec ... kubectl exec nemoclaw-sandbox`),
+//     so it shares OpenClaw's capabilities.
+// Verify/regenerate: grep `Capability.` in each adapter. Guarded by
+// tests/test_runtime_tab_capability_parity.py (OSS) against openclaw.
+var _CM_RT_CAPS = {
+  openclaw:    ['SESSIONS','EVENTS','COST','SUBAGENTS','CRONS','SKILLS','MEMORY','BRAIN','LOGS','GATEWAY_RPC','CHANNELS'],
+  nemoclaw:    ['SESSIONS','EVENTS','COST','SUBAGENTS','CRONS','SKILLS','MEMORY','BRAIN','LOGS','GATEWAY_RPC','CHANNELS'], // sandboxed OpenClaw
+  claude_code: ['SESSIONS','EVENTS','COST'],
+  codex:       ['SESSIONS','EVENTS','COST'],
+  aider:       ['SESSIONS','EVENTS','COST'],
+  goose:       ['SESSIONS','EVENTS','COST'],
+  opencode:    ['SESSIONS','EVENTS','COST'],
+  qwen_code:   ['SESSIONS','EVENTS','COST'],
+  pi:          ['SESSIONS','EVENTS','COST'],
+  deepagents:  ['SESSIONS','EVENTS','COST'],
+  hermes:      ['SESSIONS','EVENTS','COST','SUBAGENTS'],
+  cursor:      ['SESSIONS','EVENTS'],   // no COST
+  picoclaw:    ['SESSIONS','EVENTS'],   // no COST
+  nanoclaw:    ['SESSIONS','EVENTS']    // no COST
+};
+// Capability -> the sidebar tabs it enables. A tab shows iff the runtime
+// declares (at least) one capability that enables it.
+var _CM_CAP_TABS = {
+  SESSIONS:    ['overview','dives'],
+  EVENTS:      ['brain','models','context','tracing','turn-anatomy'],
+  COST:        ['cost','context-economics'],
+  SUBAGENTS:   ['subagents'],
+  CRONS:       ['crons'],
+  SKILLS:      ['skills'],
+  MEMORY:      ['memory'],
+  GATEWAY_RPC: ['approvals','policy','selfevolve'],
+  CHANNELS:    ['flow']
+};
+// Node/account-level tabs — not capability-gated, shown for every runtime.
+var _CM_NODE_TABS = ['alerts','notifications','security'];
+// Every togglable sidebar tab (so switching runtimes RE-SHOWS what a prior one
+// hid). overview is never togglable.
+var _CM_RT_ALL_TABS = ['flow','brain','models','context','tracing','turn-anatomy',
+  'context-economics','approvals','alerts','cost','dives','crons','memory',
+  'notifications','security','policy','skills','selfevolve','subagents','nemoclaw'];
+// Foreign OTLP apps only emit spans/traces (events + maybe cost). They get the
+// EVENTS + COST tabs (Brain/Tracing/Models/Context/Turn-anatomy/Cost), plus the
+// roster; OpenClaw-only concepts (Crons/Memory/Skills/Channels/Subagents) do not
+// apply and stay hidden. Honest scope notes still cover any aggregate tab.
+var _CM_OTLP_CAPS = ['EVENTS', 'COST'];
+function _cmCapsForRuntime(rt) {
+  if (_cmIsOtlpRuntime(rt)) return _CM_OTLP_CAPS;
+  return _CM_RT_CAPS[rt];
+}
+function _cmShownTabsForRuntime(rt) {
+  var show = {};
+  _CM_NODE_TABS.forEach(function (t) { show[t] = 1; });
+  (_cmCapsForRuntime(rt) || []).forEach(function (cap) {
+    (_CM_CAP_TABS[cap] || []).forEach(function (t) { show[t] = 1; });
+  });
+  if (rt === 'nemoclaw') show['nemoclaw'] = 1;
+  return show;
+}
+function _cmApplyRuntimeTabVisibility() {
+  var rt = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+  // 'all' or an unknown/unmapped runtime => show everything (never silently drop).
+  var showAll = !rt || rt === 'all' || !_cmCapsForRuntime(rt);
+  var shown = showAll ? null : _cmShownTabsForRuntime(rt);
+  _CM_RT_ALL_TABS.forEach(function (tab) {
+    var show = showAll || !!shown[tab];
+    Array.prototype.forEach.call(document.querySelectorAll('.left-nav-item[data-tab="' + tab + '"], .nav-tab[data-tab="' + tab + '"]'), function (el) {
+      el.style.display = show ? '' : 'none';
+    });
+    if (!show && _cmCurrentTab === tab && typeof switchTab === 'function') {
+      try { switchTab('overview'); } catch (e) {}
+    }
+  });
+  try { _cmRefreshHarnessNav(); } catch (e) {}
+}
+// Insert/update/remove the runtime-scope note at the top of a tab's page.
+// Called from switchTab. Only shows when a specific (non-'all') runtime is
+// selected AND the tab can't honour it — so the user is never left wondering
+// "is this for <runtime>?": the answer is stated inline. Idempotent.
+function _cmApplyRuntimeScopeNote(name) {
+  var page = document.getElementById('page-' + name);
+  if (!page) return;
+  var noteId = 'cm-rt-scope-note';
+  var existing = page.querySelector('#' + noteId);
+  var rt = _cmRuntimeFilter();
+  // Foreign OTLP / OpenLLMetry app selected. These have no session-id prefix, so
+  // the session/event tabs that filter client-side by prefix cannot scope to
+  // them honestly. Rather than silently empty (or worse, show node-wide and call
+  // it the app's data), state plainly that this app is observed via OTLP traces
+  // and its scoped views live where the data actually is (the Inventory roster
+  // row + cost/tokens). The Inventory tab keeps its own roster note below.
+  // 'inventory' has its own roster note; 'dives' (transcripts) has its own
+  // scoped empty-state ("no <app> sessions have a transcript yet"), so skip both
+  // to avoid a conflicting double-note.
+  if (_cmIsOtlpRuntime(rt) && name !== 'inventory' && name !== 'dives') {
+    var _otl = _cmRuntimeLabel(rt);
+    var _otmsg = '<strong>' + escHtml(_otl) + '</strong> is observed via OpenLLMetry / OTLP traces. '
+      + 'This view shows <strong>all runtimes</strong>; its scoped tokens, cost and sessions are on the '
+      + '<strong>Agent Inventory</strong> roster.';
+    var _othtml = '<div id="' + noteId + '" style="display:flex;align-items:center;gap:8px;margin:0 0 14px;padding:9px 13px;border-radius:8px;background:rgba(245,158,11,0.10);border:1px solid rgba(245,158,11,0.35);font-size:12px;color:var(--text-secondary);line-height:1.4;"><span style="color:#d97706;font-size:13px;flex-shrink:0;">&#9888;</span><span>' + _otmsg + '</span></div>';
+    if (existing) existing.outerHTML = _othtml;
+    else page.insertAdjacentHTML('afterbegin', _othtml);
+    return;
+  }
+  // Overview is a MIX: some cards re-scope with the runtime switcher (today's
+  // tasks/outcome, the activity strip, the hero token/cost stats) and some stay
+  // node-wide (autonomy score, reliability, activity heatmap). A single
+  // nodewide/aggregate note would be wrong, so spell out exactly what is scoped
+  // so the same number never looks runtime-specific when it isn't. (Founder:
+  // "don't confuse users" after the outcome/activity cards read identically
+  // across runtimes.)
+  if (name === 'overview') {
+    if (rt === 'all') { if (existing) existing.parentNode.removeChild(existing); return; }
+    var _ovl = _cmRuntimeLabel(rt);
+    var _ovmsg = 'Showing <strong>' + escHtml(_ovl) + '</strong>: today\'s tasks, activity, tokens and cost below are scoped to it. The autonomy score, reliability and activity heatmap stay <strong>node-wide</strong> (all runtimes).';
+    var _ovhtml = '<div id="' + noteId + '" style="display:flex;align-items:center;gap:8px;margin:0 0 14px;padding:9px 13px;border-radius:8px;background:rgba(59,130,246,0.10);border:1px solid rgba(59,130,246,0.35);font-size:12px;color:var(--text-secondary);line-height:1.4;"><span style="color:#3b82f6;font-size:13px;flex-shrink:0;">&#127760;</span><span>' + _ovmsg + '</span></div>';
+    if (existing) existing.outerHTML = _ovhtml;
+    else page.insertAdjacentHTML('afterbegin', _ovhtml);
+    return;
+  }
+  var scope = _CM_RT_NODEWIDE[name] ? 'nodewide' : (_CM_RT_AGGREGATE[name] ? 'aggregate' : null);
+  if (rt === 'all' || !scope) { if (existing) existing.parentNode.removeChild(existing); return; }
+  // For AGGREGATE tabs: if only one runtime actually has data, the cross-runtime
+  // aggregate IS that runtime — the "not yet filtered" warning is misleading
+  // noise (user-reported: a single-OpenClaw node showed "Showing all runtimes,
+  // not filtered to OpenClaw" on LLM Context / Tool catalog). Suppress it then;
+  // multi-runtime nodes still get the honest note until real per-runtime
+  // server-side slicing lands.
+  if (scope === 'aggregate') {
+    var observedRuntimes = 0;
+    try {
+      observedRuntimes = Object.keys(_cmGlobalRtCounts || {})
+        .filter(function (k) { return (_cmGlobalRtCounts[k] || 0) > 0; }).length;
+    } catch (e) {}
+    if (observedRuntimes <= 1) {
+      if (existing) existing.parentNode.removeChild(existing);
+      return;
+    }
+  }
+  var label = _cmRuntimeLabel(rt);
+  var msg = scope === 'nodewide'
+    ? '<strong>' + escHtml(label) + '</strong> is selected, but this view is <strong>node-wide</strong> - it is not specific to any runtime.'
+    : 'Showing <strong>all runtimes</strong>. This summary is not yet filtered to <strong>' + escHtml(label) + '</strong>.';
+  var ic = scope === 'nodewide' ? '&#127760;' : '&#9888;';
+  var bg = scope === 'nodewide' ? 'rgba(59,130,246,0.10)' : 'rgba(245,158,11,0.10)';
+  var bd = scope === 'nodewide' ? 'rgba(59,130,246,0.35)' : 'rgba(245,158,11,0.35)';
+  var fg = scope === 'nodewide' ? '#3b82f6' : '#d97706';
+  var html = '<div id="' + noteId + '" style="display:flex;align-items:center;gap:8px;margin:0 0 14px;padding:9px 13px;border-radius:8px;background:' + bg + ';border:1px solid ' + bd + ';font-size:12px;color:var(--text-secondary);line-height:1.4;">'
+    + '<span style="color:' + fg + ';font-size:13px;flex-shrink:0;">' + ic + '</span><span>' + msg + '</span></div>';
+  if (existing) existing.outerHTML = html;
+  else page.insertAdjacentHTML('afterbegin', html);
+}
+// Render a runtime chip-switcher immediately before `anchor`. `counts` maps
+// runtime -> N. `reload` is invoked on chip click. Returns nothing; idempotent.
+function _cmRenderRuntimeSwitcher(counts, anchor, reload) {
+  if (!anchor || !anchor.parentNode) return;
+  var id = 'cm-runtime-switcher';
+  var existing = document.getElementById(id);
+  var order = Object.keys(_CM_RT_LABEL).filter(function(k) { return counts[k]; });
+  if (order.length < 2) { if (existing) existing.remove(); return; }
+  var active = _cmRuntimeFilter();
+  if (active !== 'all' && !counts[active]) active = 'all';
+  var total = order.reduce(function(a, k) { return a + counts[k]; }, 0);
+  function chip(val, label, n, on) {
+    var bg = on ? 'var(--bg-accent,#E5443A)' : 'var(--bg-secondary,#161b22)';
+    var fg = on ? '#fff' : 'var(--text-secondary,#9ca3af)';
+    var bd = on ? 'var(--bg-accent,#E5443A)' : 'var(--border-primary,#30363d)';
+    // Runtime pixel-logo (chip variant) before the label, keyed off the runtime
+    // id. The "All" chip (val==='all') carries no mascot.
+    var ic = (val !== 'all' && typeof window.cmRuntimeIcon === 'function')
+      ? window.cmRuntimeIcon(val, 15, { chip: true, cls: 'cm-rt-btn-ic' }) + ' ' : '';
+    return '<button class="cm-rt-btn" data-rt="' + val + '" style="cursor:pointer;padding:4px 12px;border-radius:14px;' +
+      'font-size:12px;font-weight:600;display:inline-flex;align-items:center;gap:4px;background:' + bg + ';color:' + fg + ';border:1px solid ' + bd + ';">' +
+      ic + escHtml(label) + (n != null ? (' <span style="opacity:.65;">' + n + '</span>') : '') + '</button>';
+  }
+  var html = '<span style="font-size:11px;color:var(--text-muted);font-weight:600;margin-right:2px;">Runtime</span>';
+  html += chip('all', 'All', total, active === 'all');
+  order.forEach(function(k) { html += chip(k, _CM_RT_LABEL[k] || k, counts[k], active === k); });
+  if (!existing) {
+    existing = document.createElement('div');
+    existing.id = id;
+    existing.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:12px;';
+    anchor.parentNode.insertBefore(existing, anchor);
+  } else if (existing.nextSibling !== anchor) {
+    // anchor was re-created (tab re-render) — move the switcher back above it.
+    anchor.parentNode.insertBefore(existing, anchor);
+  }
+  existing.innerHTML = html;
+  var btns = existing.querySelectorAll('.cm-rt-btn');
+  for (var b = 0; b < btns.length; b++) {
+    btns[b].addEventListener('click', function() { _cmSetRuntimeFilter(this.getAttribute('data-rt'), reload); });
+  }
+}
+
+// ── Global runtime switcher (header) ────────────────────────────────────────
+// Promotes the per-runtime filter — previously rendered only on the Transcripts
+// tab — to an always-visible header control, so the active runtime scope is
+// discoverable and persists across tabs. Reuses _cmRuntimeFilter() /
+// _cmSetRuntimeFilter() / _CM_RT_LABEL and the same session-id-prefix runtime
+// derivation. Hidden until >1 runtime is present (single-runtime installs are
+// unchanged). Changing it reloads the current tab so any runtime-aware view
+// re-filters against the new scope.
+var _cmGlobalRtCounts = {};
+// Catalog of locked runtimes from /api/runtimes (Phase 5 open-core).
+// Stays empty in grace mode (the default), so the switcher renders unchanged
+// from before this endpoint existed. Populated only once enforcement is on
+// AND the install lacks the paid entitlement — then locked runtimes appear in
+// the dropdown with a 🔒 affordance regardless of session count.
+var _cmLockedRuntimes = {};
+// Free-tier runtimes from /api/runtimes (openclaw, nemoclaw): id -> 1. These
+// are ALWAYS listed in the switcher, even with 0 recent sessions — otherwise a
+// node whose only OpenClaw session went idle past the 24h retention cap shows
+// nothing but the locked Pro catalog, which reads as "your free runtime is
+// gone" (issue observed live 2026-07-11).
+var _cmFreeRuntimes = {};
+// Runtimes actually DETECTED on this machine (from the daemon's
+// `detectedRuntimes` snapshot slice / overview): id -> {running:bool}. Lets the
+// switcher flag a locked runtime the user is genuinely running ("detected here
+// — upgrade to observe") vs a generic locked catalog row. Empty by default.
+var _cmRunningRuntimes = {};
+async function _cmLoadDetectedRuntimes() {
+  try {
+    var det = null;
+    if (window.CLOUD_MODE && typeof window.__cmSnap === 'function') {
+      var sp = await window.__cmSnap();
+      det = sp && sp.detectedRuntimes;            // daemon-detected, server-blind
+    } else {
+      var ov = await fetch('/api/overview', { credentials: 'same-origin' })
+        .then(function(r) { return r.json(); }).catch(function() { return null; });
+      det = ov && (ov.detectedRuntimes || ov.detected_runtimes);
+    }
+    var run = {};
+    (det || []).forEach(function(d) {
+      if (d && d.name) run[d.name] = { running: !!d.running };
+    });
+    _cmRunningRuntimes = run;
+  } catch (e) { /* non-fatal — switcher just omits the "detected here" hint */ }
+}
+
+function _cmPopulateGlobalRuntime(counts) {
+  // Merge-MAX into the running set, never replace. Per-tab loaders pass their
+  // own subset (e.g. the Transcripts tab only sees transcript-bearing
+  // sessions); replacing would drop runtimes that exist but have no rows on
+  // that tab (qwen with sessions but no transcripts), shrinking the header
+  // dropdown and silently reverting the selection to "all". Union keeps every
+  // runtime the node has ever reported.
+  if (counts && Object.keys(counts).length) {
+    Object.keys(counts).forEach(function(k) {
+      _cmGlobalRtCounts[k] = Math.max(_cmGlobalRtCounts[k] || 0, counts[k] || 0);
+    });
+  }
+  counts = _cmGlobalRtCounts || {};
+  var wrap = document.getElementById('cm-global-runtime-wrap');
+  var sel = document.getElementById('cm-global-runtime');
+  if (!wrap || !sel) return;
+  // Observed runtimes (have local sessions) ∪ always-visible free runtimes ∪
+  // locked-but-visible runtimes. Free runtimes render even at 0 sessions so
+  // the 24h retention cap can't make OpenClaw vanish from its own switcher.
+  var observedAll = Object.keys(_CM_RT_LABEL).filter(function(k) {
+    return counts[k] || _cmFreeRuntimes[k];
+  });
+  // Split native session-prefix runtimes from foreign OTLP apps: the OTLP apps
+  // get their own optgroup and their count is traces, not sessions, so they
+  // must not inflate the "All runtimes · N sessions" total.
+  var observed = observedAll.filter(function(k) { return !_cmIsOtlpRuntime(k); });
+  var otlpApps = observedAll.filter(function(k) { return _cmIsOtlpRuntime(k); });
+  var seen = {};
+  observedAll.forEach(function(k) { seen[k] = 1; });
+  var locked = Object.keys(_cmLockedRuntimes).filter(function(k) { return !seen[k]; });
+  var order = observed.concat(otlpApps).concat(locked);
+  // Visibility gate: zero-count free runtimes render when the switcher is
+  // shown but must not summon it by themselves — a plain single-runtime
+  // install (openclaw only, nothing locked) keeps its switcher-free header.
+  var gate = observed.filter(function(k) { return counts[k]; }).length +
+    otlpApps.length + locked.length;
+  if (gate < 2) { wrap.style.display = 'none'; return; }
+  var active = _cmRuntimeFilter();
+  if (active !== 'all' && !counts[active] && !_cmLockedRuntimes[active] && !_cmFreeRuntimes[active]) active = 'all';
+  var total = observed.reduce(function(a, k) { return a + (counts[k] || 0); }, 0);
+  // The count is the number of SESSIONS for that runtime — spell it out so the
+  // chip doesn't read as "22 Claude Code runtimes" (there's one runtime, many
+  // sessions). Singular/plural for the "1 session" case.
+  function _sessLabel(n) { return n + (n === 1 ? ' session' : ' sessions'); }
+  function _opt(k) {
+    var lbl = _CM_RT_LABEL[k] || k;
+    if (_cmIsOtlpRuntime(k)) {
+      // Foreign OTLP/OpenLLMetry app: count is sessions or traces; keep the
+      // wording neutral ("activity") since a pure-trace app has no sessions.
+      var on = counts[k] || 0;
+      var act = on ? (' · ' + on + (on === 1 ? ' trace' : ' traces')) : '';
+      return '<option value="' + k + '">' + escHtml(lbl) + act + '</option>';
+    }
+    if (_cmLockedRuntimes[k]) {
+      // A locked (Pro) runtime that is ACTUALLY DETECTED on this machine is the
+      // strongest upgrade signal — "you're using it here, upgrade to observe
+      // it" — so call it out, distinct from a generic catalog row the user
+      // doesn't run. Both stay selectable so the tab can render its empty-state
+      // + upgrade CTA.
+      var det = _cmRunningRuntimes[k];
+      if (det) {
+        var tag = det.running ? '▶ running here' : 'detected here';
+        return '<option value="' + k + '">🔒 ' + escHtml(lbl) + ' · ' + tag + ' · Upgrade</option>';
+      }
+      return '<option value="' + k + '">🔒 ' + escHtml(lbl) + ' · Upgrade</option>';
+    }
+    return '<option value="' + k + '">' + escHtml(lbl) + ' · ' + _sessLabel(counts[k] || 0) + '</option>';
+  }
+  var lockedRunning = locked.filter(function(k) { return _cmRunningRuntimes[k]; });
+  var lockedOther = locked.filter(function(k) { return !_cmRunningRuntimes[k]; });
+  var html = '<option value="all">All runtimes · ' + _sessLabel(total) + '</option>';
+  observed.forEach(function(k) { html += _opt(k); });
+  // Foreign OpenLLMetry / OTLP apps (bring your own agent): grouped on their own
+  // so a LangChain / CrewAI / OpenAI-Agents app reads as distinct from a native
+  // runtime. Selecting one scopes server-side by agent_type.
+  if (otlpApps.length) {
+    html += '<optgroup label="OpenLLMetry / OTLP apps">';
+    otlpApps.forEach(function(k) { html += _opt(k); });
+    html += '</optgroup>';
+  }
+  // Group the detected-but-locked runtimes under their own header so the
+  // "running here, needs Pro" distinction is unmistakable in the dropdown.
+  if (lockedRunning.length) {
+    html += '<optgroup label="▶ Detected on this machine — upgrade to observe">';
+    lockedRunning.forEach(function(k) { html += _opt(k); });
+    html += '</optgroup>';
+  }
+  if (lockedOther.length) {
+    html += '<optgroup label="Available with Pro">';
+    lockedOther.forEach(function(k) { html += _opt(k); });
+    html += '</optgroup>';
+  }
+  sel.innerHTML = html;
+  sel.value = active;
+  wrap.style.display = 'flex';
+  // Apply OpenClaw-only tab visibility on load (the node view opens with a
+  // pinned ?runtime=, so irrelevant tabs are hidden from first paint).
+  try { _cmApplyRuntimeTabVisibility(); } catch (e) {}
+}
+
+function _cmOnGlobalRuntimeChange(sel) {
+  if (!sel) return;
+  var val = sel.value;
+  // If the chosen runtime is locked (paid, enforcement on) revert the
+  // selection and show the upgrade modal instead of switching.
+  if (val !== 'all' && _cmLockedRuntimes[val]) {
+    sel.value = _cmRuntimeFilter() || 'all';
+    _cmShowRuntimePaywall(val, _CM_RT_LABEL[val] || val);
+    return;
+  }
+  _cmSetRuntimeFilter(val);
+  // Hide OpenClaw-only tabs (Memory/Skills/Self-Evolve/Crons/Tool-Policy/NeMo)
+  // for non-OpenClaw runtimes — they'd only show OpenClaw's data.
+  try { _cmApplyRuntimeTabVisibility(); } catch (e) {}
+  // Swap the Flow + Overview diagram to the selected runtime's topology.
+  try { if (typeof _applyRuntimeFlowDiagram === 'function') _applyRuntimeFlowDiagram(val); } catch (e) {}
+  // Reload the current tab so any runtime-aware view re-filters in place.
+  if (typeof switchTab === 'function' && _cmCurrentTab) switchTab(_cmCurrentTab);
+  try { _cmRefreshHarnessNav(); } catch (e) {}
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Agent Inventory tab — single-pane control-tower roster.
+// Reads the shared snapshot blob's `agentInventory` (cloud) or GET
+// /api/inventory (local). NODE-WIDE roster: a selected runtime highlights its
+// row + shows the honest scope note (via _CM_RT_NODEWIDE + switchTab), never
+// hides rows. The DATA path honours per-runtime via agentInventoryByRuntime.
+// ─────────────────────────────────────────────────────────────────────────
+function _invFmtUsd(n) {
+  var v = Number(n || 0);
+  if (!v) return '$0.00';
+  if (v < 0.01) return '<$0.01';
+  return '$' + v.toFixed(2);
+}
+function _invFmtAgo(iso) {
+  if (!iso) return '';
+  try {
+    var t = Date.parse(iso);
+    if (isNaN(t)) return '';
+    var secs = Math.max(0, (Date.now() - t) / 1000);
+    if (secs < 60) return 'just now';
+    if (secs < 3600) return Math.round(secs / 60) + 'm ago';
+    if (secs < 86400) return (secs / 3600).toFixed(1) + 'h ago';
+    return Math.round(secs / 86400) + 'd ago';
+  } catch (e) { return ''; }
+}
+// Does this runtime declare COST? Cursor / PicoClaw / NanoClaw don't — show an
+// honest "--" with a tooltip, never a misleading $0.
+function _invHasCost(rt) {
+  // Foreign OTLP apps report cost from their spans (when the instrumentation
+  // emits it); treat them as cost-capable so the roster shows their $ instead
+  // of "--".
+  if (_cmIsOtlpRuntime(rt)) return true;
+  var caps = _CM_RT_CAPS[rt] || [];
+  return caps.indexOf('COST') !== -1;
+}
+function _invOwnerLabel(a) {
+  var o = (a && a.owner != null) ? String(a.owner).trim() : '';
+  return o || (typeof t === 'function' ? t('inventory.owner_default', 'me') : 'me');
+}
+function _invDoingNow(a) {
+  if (a && a.running) return { txt: 'Working', cls: 'inv-doing-on' };
+  if (a && a.detected) return { txt: 'Idle', cls: 'inv-doing-idle' };
+  return { txt: 'Quiet', cls: 'inv-doing-quiet' };
+}
+function _invAliveDot(a) {
+  // green = running, amber = detected-not-running, grey = neither.
+  if (a && a.running) return { color: '#22c55e', label: 'Checked in' };
+  if (a && a.detected) return { color: '#f59e0b', label: 'Resting' };
+  return { color: '#6b7280', label: 'Not seen' };
+}
+
+async function _invFetchData() {
+  // Cloud: read the shared snapshot blob (the cm-cloud-inventory interceptor
+  // also serves /api/inventory from it, but reading __cmSnap directly avoids a
+  // duplicate fetch). Local: GET /api/inventory.
+  var rt = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+  try {
+    if (window.CLOUD_MODE && typeof window.__cmSnap === 'function') {
+      var sp = await window.__cmSnap();
+      if (sp && sp.agentInventory) return sp.agentInventory;
+    }
+  } catch (e) {}
+  // Local (or cloud cold fall-through): always fetch the node-wide roster so
+  // the roster keeps every row; the runtime filter only HIGHLIGHTS a row here.
+  try {
+    var r = await fetch('/api/inventory', { credentials: 'same-origin' });
+    var j = await r.json();
+    return j || { agents: [], total: 0 };
+  } catch (e) {
+    return { agents: [], total: 0 };
+  }
+}
+
+// An agent is "active/recent" (shown by default) when it's running, did work in
+// the last 24h (cost or tokens), or is the currently-selected runtime. Everything
+// else folds under a "Show N inactive" expander so the roster reads like the
+// device's calm view instead of every runtime ever used here (#web-accuracy).
+function _invIsRecentlyActive(a, rtFilter) {
+  return !!(a.running
+    || (Number(a.cost24hUsd || 0) > 0)
+    || (Number(a.tokens24h || 0) > 0)
+    || (rtFilter !== 'all' && a.agentKey === rtFilter));
+}
+
+function _invRosterRow(a, rtFilter) {
+  var rt = a.agentKey;
+  var label = a.displayName || rt;
+  var doing = _invDoingNow(a);
+  var dot = _invAliveDot(a);
+  var owner = _invOwnerLabel(a);
+  var hasCost = _invHasCost(rt);
+  // LAST 24h (rolling, event-windowed) vs LIFETIME (all the runtime's sessions).
+  // The column used to be labeled "Cost today" but rendered the lifetime total.
+  var naTip = '<span class="inv-na" data-i18n-title="inventory.cost_na_tip" title="This runtime does not report cost yet.">--</span>';
+  var dayCell = hasCost ? _invFmtUsd(a.cost24hUsd) : naTip;
+  var lifeCell = hasCost ? _invFmtUsd(a.costUsd) : naTip;
+  var work = (a.sessions || 0) + ((a.sessions === 1) ? ' conversation' : ' conversations');
+  var model = a.primaryModel || '--';
+  var highlight = (rtFilter !== 'all' && rt === rtFilter) ? ' inv-row-active' : '';
+  // When the row is only visible BECAUSE it is the selected runtime (it had no
+  // activity in 24h and would otherwise sit in the inactive fold), say so.
+  // Without this chip the roster looks like it shows different data on every
+  // switcher change (founder report 2026-07-02).
+  var selectedChip = '';
+  if (rtFilter !== 'all' && rt === rtFilter && !_invIsRecentlyActive(a, 'all')) {
+    selectedChip = ' <span class="inv-selected-chip" '
+      + 'title="' + t('inventory.selected_chip_tip', null, 'Shown because this runtime is selected in the switcher. No activity in the last 24h.') + '" '
+      + 'style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;padding:2px 7px;border-radius:9px;background:rgba(99,102,241,0.15);border:1px solid rgba(99,102,241,0.4);color:#818cf8;vertical-align:middle;">'
+      + t('inventory.selected_chip', null, 'selected') + '</span>';
+  }
+  var pencil = window.CLOUD_MODE
+    ? ''
+    : '<span class="inv-owner-pencil" title="Rename owner" onclick="event.stopPropagation();_invStartOwnerEdit(this,\'' + escHtml(rt) + '\')">&#9998;</span>';
+  return ''
+    + '<tr class="inv-row' + highlight + '" data-rt="' + escHtml(rt) + '" onclick="_invToggleRow(this,\'' + escHtml(rt) + '\')">'
+    +   '<td class="inv-c-agent"><span class="inv-dot" style="background:' + dot.color + '"></span>' + escHtml(label) + selectedChip + '</td>'
+    +   '<td class="inv-c-owner"><span class="inv-owner-chip" data-rt="' + escHtml(rt) + '"><span class="inv-owner-name">' + escHtml(owner) + '</span>' + pencil + '</span></td>'
+    +   '<td class="inv-c-doing"><span class="inv-doing ' + doing.cls + '">' + doing.txt + '</span></td>'
+    +   '<td class="inv-c-alive"><span class="inv-dot" style="background:' + dot.color + '"></span>'
+    +     '<span class="inv-alive-lbl" title="For OpenClaw and NemoClaw this is a real heartbeat; for other runtimes it means a process is running.">' + dot.label + '</span></td>'
+    +   '<td class="inv-c-cost" title="Cost from the last 24 hours of activity (API-equivalent)">' + dayCell + '</td>'
+    +   '<td class="inv-c-cost inv-c-cost-life" title="All-time cost across this agent\'s tracked sessions (API-equivalent)">' + lifeCell + '</td>'
+    +   '<td class="inv-c-work">' + escHtml(work) + '</td>'
+    +   '<td class="inv-c-model">' + escHtml(model) + '</td>'
+    + '</tr>'
+    + '<tr class="inv-expand-row" id="inv-exp-' + escHtml(rt) + '" style="display:none;"><td colspan="8">'
+    +   _invExpandHtml(a)
+    + '</td></tr>';
+}
+
+function _invRenderRoster(inv) {
+  var agents = (inv && inv.agents) || [];
+  var rtFilter = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+  var active = [], inactive = [];
+  agents.forEach(function (a) {
+    (_invIsRecentlyActive(a, rtFilter) ? active : inactive).push(a);
+  });
+  // Never end up with an empty roster: if nothing is "active" right now, show
+  // everything rather than an empty table.
+  if (!active.length && inactive.length) { active = inactive; inactive = []; }
+  // Consistent ordering: the selected runtime is always the FIRST row. Without
+  // this the promoted row lands wherever the roster order puts it (OpenClaw
+  // above Claude Code, Hermes below), which reads as the list changing
+  // arbitrarily on every switcher change.
+  if (rtFilter !== 'all') {
+    active.sort(function (a, b) {
+      return (b.agentKey === rtFilter ? 1 : 0) - (a.agentKey === rtFilter ? 1 : 0);
+    });
+  }
+  var rows = active.map(function (a) { return _invRosterRow(a, rtFilter); }).join('');
+  var foldRows = '';
+  if (inactive.length) {
+    foldRows = ''
+      + '<tr class="inv-fold-toggle" onclick="_invToggleInactive(this)">'
+      +   '<td colspan="8"><span class="inv-fold-caret">&#9656;</span> '
+      +     'Show ' + inactive.length + ' inactive agent' + (inactive.length === 1 ? '' : 's')
+      +     ' <span class="inv-fold-hint">(no activity in 24h)</span></td>'
+      + '</tr>'
+      + '<tbody class="inv-fold-body" style="display:none;">'
+      +   inactive.map(function (a) { return _invRosterRow(a, rtFilter); }).join('')
+      + '</tbody>';
+  }
+
+  return ''
+    + '<table class="inv-table">'
+    +   '<thead><tr>'
+    +     '<th data-i18n="inventory.col_agent">Agent</th>'
+    +     '<th data-i18n="inventory.col_owner">Owner</th>'
+    +     '<th data-i18n="inventory.col_doing">Doing now</th>'
+    +     '<th data-i18n="inventory.col_alive">Alive</th>'
+    +     '<th data-i18n="inventory.col_cost_24h">Cost (24h)</th>'
+    +     '<th data-i18n="inventory.col_cost_life">Cost (lifetime)</th>'
+    +     '<th data-i18n="inventory.col_work">Work done</th>'
+    +     '<th data-i18n="inventory.col_model">Main model</th>'
+    +   '</tr></thead>'
+    +   '<tbody>' + rows + '</tbody>'
+    +   foldRows
+    + '</table>';
+}
+
+function _invToggleInactive(el) {
+  try {
+    var body = el.parentNode.querySelector('.inv-fold-body')
+      || (el.nextElementSibling && el.nextElementSibling.classList.contains('inv-fold-body') ? el.nextElementSibling : null);
+    if (!body) return;
+    var open = body.style.display !== 'none';
+    body.style.display = open ? 'none' : '';
+    var caret = el.querySelector('.inv-fold-caret');
+    if (caret) caret.innerHTML = open ? '&#9656;' : '&#9662;';
+  } catch (e) {}
+}
+
+function _invExpandHtml(a) {
+  var rt = a.agentKey;
+  var facts = ''
+    + '<span class="inv-fact">' + (a.turns || 0) + ' turns</span>'
+    + '<span class="inv-fact">' + ((a.tokens || 0).toLocaleString()) + ' tokens</span>'
+    + '<span class="inv-fact">' + (a.switchCount || 0) + ' model switches</span>';
+  var deep = ''
+    + '<button class="inv-deep-btn" onclick="event.stopPropagation();_invDeepLink(\'' + escHtml(rt) + '\',\'brain\')" data-i18n="inventory.expand_brain">See what it is thinking</button>'
+    + '<button class="inv-deep-btn" onclick="event.stopPropagation();_invDeepLink(\'' + escHtml(rt) + '\',\'usage\')" data-i18n="inventory.expand_cost">See what it cost</button>'
+    + '<button class="inv-deep-btn" onclick="event.stopPropagation();_invDeepLink(\'' + escHtml(rt) + '\',\'flow\')" data-i18n="inventory.expand_flow">Watch it live</button>';
+  return '<div class="inv-expand"><div class="inv-facts">' + facts + '</div><div class="inv-deep">' + deep + '</div></div>';
+}
+
+function _invToggleRow(tr, rt) {
+  var exp = document.getElementById('inv-exp-' + rt);
+  if (!exp) return;
+  var open = exp.style.display !== 'none';
+  // Set the runtime switcher to this agent (highlights the row + scope note),
+  // following the same path as picking it in the header dropdown.
+  if (!open && typeof _cmSetRuntimeFilter === 'function') {
+    _cmSetRuntimeFilter(rt);
+    var sel = document.getElementById('cm-global-runtime');
+    if (sel) { sel.value = rt; }
+    try { _cmApplyRuntimeTabVisibility(); } catch (e) {}
+  }
+  exp.style.display = open ? 'none' : '';
+  // Re-render highlight without re-fetching.
+  try { renderInventory(); } catch (e) {}
+}
+
+function _invDeepLink(rt, tab) {
+  // Pre-filter the target tab to this runtime, then switch to it. The newcomer
+  // never types a session id.
+  if (typeof _cmSetRuntimeFilter === 'function') {
+    _cmSetRuntimeFilter(rt);
+    var sel = document.getElementById('cm-global-runtime');
+    if (sel) sel.value = rt;
+    try { _cmApplyRuntimeTabVisibility(); } catch (e) {}
+  }
+  if (typeof switchTab === 'function') switchTab(tab);
+}
+
+function _invStartOwnerEdit(pencilEl, rt) {
+  var chip = pencilEl.closest('.inv-owner-chip');
+  if (!chip) return;
+  var nameEl = chip.querySelector('.inv-owner-name');
+  var current = nameEl ? nameEl.textContent : '';
+  var input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'inv-owner-input';
+  input.value = current;
+  input.maxLength = 60;
+  chip.innerHTML = '';
+  chip.appendChild(input);
+  input.focus();
+  input.select();
+  var done = false;
+  function save() {
+    if (done) return; done = true;
+    var val = input.value.trim();
+    _invSaveOwner(rt, val);
+  }
+  function cancel() {
+    if (done) return; done = true;
+    try { renderInventory(); } catch (e) {}
+  }
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); save(); }
+    else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+  });
+  input.addEventListener('blur', save);
+}
+
+async function _invSaveOwner(rt, owner) {
+  try {
+    await fetch('/api/inventory/' + encodeURIComponent(rt) + '/owner', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ owner: owner })
+    });
+  } catch (e) { /* non-fatal — re-render reflects the stored value */ }
+  try { renderInventory(); } catch (e) {}
+}
+
+async function renderInventory() {
+  var inv = await _invFetchData();
+  var agents = (inv && inv.agents) || [];
+
+  // Register any foreign OTLP/OpenLLMetry app in the roster so _cmIsOtlpRuntime /
+  // _invHasCost / the header dropdown recognise it (the roster is the canonical
+  // source for the app set; the dropdown is fed from the same data on init).
+  agents.forEach(function (a) {
+    if (a && a.otlp && a.agentKey) _cmRegisterOtlpRuntime(a.agentKey, a.displayName || a.agentKey);
+  });
+
+  var statsEl = document.getElementById('inv-stats');
+  var rosterEl = document.getElementById('inv-roster');
+  var emptyEl = document.getElementById('inv-empty');
+  var stripEl = document.getElementById('inv-nodewide-strip');
+  if (!rosterEl) return;
+
+  if (!agents.length) {
+    if (statsEl) statsEl.style.display = 'none';
+    if (stripEl) stripEl.style.display = 'none';
+    rosterEl.innerHTML = '';
+    if (emptyEl) emptyEl.style.display = '';
+    return;
+  }
+  if (emptyEl) emptyEl.style.display = 'none';
+
+  // 4-tile strip.
+  var aliveCount = agents.filter(function (a) { return a.running; }).length;
+  var totalCost = agents.reduce(function (s, a) {
+    return s + (_invHasCost(a.agentKey) ? Number(a.costUsd || 0) : 0);
+  }, 0);
+  var allGood = agents.every(function (a) { return !a.detected || a.running || true; });
+  var setTxt = function (id, v) { var el = document.getElementById(id); if (el) el.textContent = v; };
+  setTxt('inv-tile-alive', aliveCount + ' of ' + agents.length);
+  setTxt('inv-tile-agents', String(agents.length));
+  setTxt('inv-tile-today', _invFmtUsd(totalCost));
+  setTxt('inv-tile-health', allGood ? 'All good' : 'Check');
+  if (statsEl) statsEl.style.display = '';
+
+  // Node-wide strip (tools / eval), labeled honestly.
+  var tg = inv.nodeWideToolGroups || {};
+  var toolTotal = (tg.builtin || 0) + (tg.mcp || 0) + (tg.plugin || 0);
+  var evalSummary = inv.nodeWideEval || {};
+  var evalScore = (evalSummary && (evalSummary.avg_score != null ? evalSummary.avg_score
+                  : (evalSummary.average != null ? evalSummary.average : null)));
+  var toolsEl = document.getElementById('inv-node-tools');
+  var evalEl = document.getElementById('inv-node-eval');
+  if (toolsEl) toolsEl.textContent = 'node tools: ' + toolTotal;
+  if (evalEl) evalEl.textContent = 'node eval: ' + (evalScore != null ? (Math.round(evalScore * 100) / 100) : 'paused');
+  if (stripEl) stripEl.style.display = (toolTotal || evalScore != null) ? '' : 'none';
+
+  rosterEl.innerHTML = _invRenderRoster(inv);
+
+  // Re-apply i18n to the freshly-injected markup + the scope note.
+  try { if (window.i18n && typeof window.i18n.apply === 'function') window.i18n.apply(rosterEl); } catch (e) {}
+  try { _cmApplyRuntimeScopeNote('inventory'); } catch (e) {}
+}
+
+function _cmShowRuntimePaywall(harness, label) {
+  // Emit paywall_view telemetry (fire-and-forget).
+  try {
+    fetch('/api/paywall/event', {method:'POST', headers:{'Content-Type':'application/json'},
+      credentials:'same-origin',
+      body: JSON.stringify({event:'paywall_view', feature: harness + '_observability',
+        harness: harness, source:'runtime-switcher'})});
+  } catch(e) {}
+
+  var existing = document.getElementById('_cmRtPaywallOverlay');
+  if (existing) existing.remove();
+
+  var overlay = document.createElement('div');
+  overlay.id = '_cmRtPaywallOverlay';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
+  overlay.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(26,24,22,.45);'
+    + 'display:flex;align-items:center;justify-content:center;padding:24px;';
+
+  var upgradeUrl = 'https://app.clawmetry.com/upgrade?source=runtime-switcher&harness='
+    + encodeURIComponent(harness);
+
+  // The plan ladder, mirroring the LIVE clawmetry.com/pricing page
+  // (verified 2026-06-09: Free $0 / Starter $9 / Pro $29 / self-hosted via
+  // license key / Enterprise; annual includes the desk device). Prices live
+  // in this ONE object so a reprice is a one-line change here plus the
+  // pricing page. Plain words for someone who has never compared plans.
+  var _cmPlanPrices = { starter: '$9', starterYr: '$90', pro: '$29', proYr: '$290' };
+  function _tierRow(accent, name, price, desc) {
+    return '<div style="margin-bottom:10px;padding:11px 14px;border:1px solid ' + accent + ';'
+      + 'border-radius:8px;font-size:13px;color:var(--text-secondary,#cbd5e1);line-height:1.5;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px;">'
+      + '<strong style="color:var(--text-primary,#e2e8f0);">' + name + '</strong>'
+      + '<span style="color:var(--text-primary,#e2e8f0);font-weight:600;">' + price + '</span></div>'
+      + desc + '</div>';
+  }
+  overlay.innerHTML = '<div style="max-width:460px;width:100%;padding:24px;'
+    + 'background:var(--bg-primary,#1a1a2e);border:1px solid var(--border-color,rgba(255,255,255,.15));'
+    + 'border-radius:12px;">'
+    + '<div style="font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:#a78bfa;'
+    + 'margin-bottom:8px;font-weight:600;">Plans</div>'
+    + '<h2 style="margin:0 0 12px;font-size:20px;font-weight:500;color:var(--text-primary,#e2e8f0);">'
+    + 'See ' + escHtml(label) + ' working, in one place</h2>'
+    + _tierRow('rgba(118,185,0,.28)', 'Free', '$0 forever',
+        'OpenClaw and NemoClaw on 1 machine, fully observable. You keep this no matter what.')
+    + _tierRow('rgba(124,92,255,.45)', 'Starter', _cmPlanPrices.starter + '/node/mo',
+        escHtml(label) + ' plus every runtime ClawMetry supports (Claude Code, Codex, Cursor and 7 more) '
+        + 'on one dashboard. Starts with a 7-day free trial, no credit card.')
+    + _tierRow('rgba(255,255,255,.14)', 'Pro', _cmPlanPrices.pro + '/node/mo',
+        'Everything in Starter, plus alerts, budgets, loop detection and fleet views for production teams.')
+    + '<div style="font-size:11.5px;color:var(--text-muted,#94a3b8);line-height:1.55;margin:2px 2px 16px;">'
+    + 'Annual plans (' + _cmPlanPrices.starterYr + ' / ' + _cmPlanPrices.proYr + ' per node) include the '
+    + '$149 desk device, free. Prefer your own infra? Self-hosted uses the same plans with a license key: '
+    + '<a href="https://clawmetry.com/pricing" target="_blank" rel="noopener noreferrer" '
+    + 'style="color:#a78bfa;">see all plans</a>.</div>'
+    + '<div style="display:flex;gap:8px;justify-content:flex-end;">'
+    + '<button type="button" id="_cmRtPaywallCancel" style="padding:8px 16px;'
+    + 'border:1px solid var(--border-color,rgba(255,255,255,.2));border-radius:6px;'
+    + 'background:transparent;color:var(--text-secondary,#cbd5e1);cursor:pointer;font-size:13px;">Not now</button>'
+    + '<a href="' + upgradeUrl + '" target="_blank" rel="noopener noreferrer" id="_cmRtPaywallCTA"'
+    + ' style="padding:8px 16px;background:#7c3aed;color:#fff;border-radius:6px;'
+    + 'text-decoration:none;font-size:13px;font-weight:500;">Start 7-day free trial</a>'
+    + '</div></div>';
+
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', function(e) { if (e.target === overlay) _cmDismissRtPaywall(); });
+  document.getElementById('_cmRtPaywallCancel').addEventListener('click', _cmDismissRtPaywall);
+  var ctaEl = document.getElementById('_cmRtPaywallCTA');
+  if (ctaEl) {
+    ctaEl.addEventListener('click', function() {
+      try {
+        fetch('/api/paywall/event', {method:'POST', headers:{'Content-Type':'application/json'},
+          credentials:'same-origin',
+          body: JSON.stringify({event:'paywall_cta_click', harness: harness,
+            source:'runtime-switcher', plan_chosen:'pro'})});
+      } catch(e) {}
+    });
+  }
+  overlay._cmEscHandler = function(e) { if (e.key === 'Escape') _cmDismissRtPaywall(); };
+  document.addEventListener('keydown', overlay._cmEscHandler);
+}
+
+function _cmDismissRtPaywall() {
+  var overlay = document.getElementById('_cmRtPaywallOverlay');
+  if (!overlay) return;
+  if (overlay._cmEscHandler) document.removeEventListener('keydown', overlay._cmEscHandler);
+  overlay.remove();
+}
+
+async function _cmLoadRuntimeCatalog() {
+  // Read the entitlement-aware runtime catalog (Phase 5 open-core).
+  // Two ways a runtime earns the lock affordance in the dropdown:
+  //   1. enforced && locked: the original paywall semantics.
+  //   2. !entitled (grace teaser, cloud#1532): the plan does not include the
+  //      runtime, so even though grace "allows" it, its data is never
+  //      ingested (the pro adapter only provisions for entitled accounts).
+  //      Showing it locked is both the honest state AND the conversion
+  //      surface; picking it opens the non-blocking two-path card.
+  // Cloud guard: the hosted server resolves entitlement as OSS-free, so in
+  // CLOUD_MODE trust the account plan/trial instead. A paying or trialing
+  // hosted user must never see the teaser. Re-checked once after 4s because
+  // window._account loads async.
+  try {
+    var cat = await fetch('/api/runtimes', { credentials: 'same-origin' }).then(function(r) { return r.json(); });
+    if (!cat || !Array.isArray(cat.runtimes)) return;
+    var teaserOk = true;
+    try {
+      if (window.CLOUD_MODE) {
+        var plan = String(window.CLOUD_PLAN || '').toLowerCase();
+        var acct = window._account || {};
+        teaserOk = !(/pro|starter|paid/.test(plan) || acct.trial_active);
+      }
+    } catch (e) { teaserOk = false; }
+    var locked = {};
+    var free = {};
+    cat.runtimes.forEach(function(r) {
+      if (!r || !r.id) return;
+      if ((cat.enforced && r.locked) ||
+          (teaserOk && r.free === false && r.entitled === false)) locked[r.id] = 1;
+      // Free runtimes stay in the switcher even at 0 recent sessions (the
+      // 24h session cap must never make OpenClaw itself disappear).
+      if (r.free === true && r.entitled !== false && !locked[r.id]) free[r.id] = 1;
+    });
+    _cmLockedRuntimes = locked;
+    _cmFreeRuntimes = free;
+    if (window.CLOUD_MODE && !window._cmRtCatalogRecheck) {
+      window._cmRtCatalogRecheck = 1;
+      setTimeout(_cmLoadRuntimeCatalog, 4000);
+    }
+  } catch (e) { /* non-fatal: keeps the previous behaviour */ }
+}
+
+async function _cmInitGlobalRuntimeSwitcher() {
+  // Derive the runtimes present from the session list (the session-id prefix is
+  // the runtime discriminator — agent_type is always "openclaw"). One cheap
+  // fetch on load; the Transcripts loader refreshes the counts as it runs.
+  // Also pull the locked-but-visible catalog so paid runtimes show up in the
+  // switcher (with a 🔒) when enforcement is on — no-op in grace mode.
+  try {
+    await _cmLoadRuntimeCatalog();
+  } catch (e) { /* non-fatal */ }
+  try {
+    await _cmLoadDetectedRuntimes();
+  } catch (e) { /* non-fatal */ }
+  try {
+    await _cmRefreshRuntimeCounts(true);
+  } catch (e) { /* non-fatal — the switcher just stays hidden */ }
+  // Surface foreign OTLP / OpenLLMetry apps (no session prefix, so absent from
+  // /api/sessions). The Agent Inventory roster carries them with otlp:true; one
+  // read registers each so the dropdown lists 'My App (OTel)'.
+  try { await _cmLoadOtlpRuntimes(); } catch (e) { /* non-fatal */ }
+  // Keep the counts live: a session that becomes active mid-visit (e.g. the
+  // only OpenClaw session waking up after the 24h retention cap hid it) must
+  // appear without a manual page reload. The refresher only re-renders when a
+  // count actually rises, so an open dropdown is never yanked shut.
+  if (!window._cmRtCountsTimer) {
+    window._cmRtCountsTimer = setInterval(function() {
+      if (document.hidden) return; // no polling for a tab nobody is looking at
+      _cmRefreshRuntimeCounts(false).catch(function() {});
+    }, 60000);
+  }
+}
+
+// Fetch /api/sessions, derive per-runtime session counts and (re)render the
+// switcher. `force` renders unconditionally (first paint); otherwise skip the
+// re-render when nothing increased — _cmGlobalRtCounts merges MAX so a count
+// can only ever rise, and re-rendering a native <select> closes it if open.
+async function _cmRefreshRuntimeCounts(force) {
+  var data = await fetch('/api/sessions', { credentials: 'same-origin' }).then(function(r) { return r.json(); });
+  var counts = {};
+  ((data && data.sessions) || []).forEach(function(s) {
+    var rt = _cmRuntimeOf(s);
+    counts[rt] = (counts[rt] || 0) + 1;
+  });
+  if (!force) {
+    var changed = Object.keys(counts).some(function(k) {
+      return counts[k] > (_cmGlobalRtCounts[k] || 0);
+    });
+    if (!changed) return;
+  }
+  _cmPopulateGlobalRuntime(counts);
+}
+
+// Pull the OTLP/custom apps the daemon folded into the inventory roster and
+// register each so the switcher dropdown + labels include it. Local: GET
+// /api/inventory; cloud: the agentInventory snapshot slice (already loaded via
+// __cmSnap by other consumers, so this is cheap / deduped). Each app contributes
+// a session count to the dropdown (or its trace count when it has no sessions).
+async function _cmLoadOtlpRuntimes() {
+  var inv = null;
+  try {
+    if (window.CLOUD_MODE && typeof window.__cmSnap === 'function') {
+      var sp = await window.__cmSnap();
+      inv = sp && sp.agentInventory;
+    } else {
+      inv = await fetch('/api/inventory', { credentials: 'same-origin' })
+        .then(function(r) { return r.json(); }).catch(function() { return null; });
+    }
+  } catch (e) { return; }
+  var agents = (inv && inv.agents) || [];
+  var counts = {};
+  agents.forEach(function(a) {
+    if (!a || !a.otlp || !a.agentKey) return;
+    _cmRegisterOtlpRuntime(a.agentKey, a.displayName || a.agentKey);
+    // Dropdown count: prefer sessions, fall back to traces/spans so a pure-trace
+    // app (sessions=0) still shows a non-zero presence and stays listed.
+    var n = a.sessions || a.traces || a.spans || 1;
+    counts[a.agentKey] = Math.max(counts[a.agentKey] || 0, n);
+  });
+  if (Object.keys(counts).length) _cmPopulateGlobalRuntime(counts);
+}
+
 async function loadSessions() {
   if (window.CLOUD_MODE) {
     // In cloud mode: /api/sessions and /api/subagents already handle CLOUD_MODE server-side
     // fetch interceptor appends node_id+token so these hit the cloud endpoints correctly
   }
-  var [sessData, saData, anomalyData, costData, chainData] = await Promise.all([
+  var [sessData, saData, anomalyData, costData, chainData, riskBrain, evalData, loopData] = await Promise.all([
     fetch('/api/sessions').then(r => r.json()).catch(function() { return {sessions:[]}; }),
     fetch('/api/subagents').then(r => r.json()).catch(function() { return {subagents:[]}; }),
     fetch('/api/usage/anomalies').then(r => r.json()).catch(function() { return {anomalies:[]}; }),
     fetch('/api/sessions/cost-breakdown').then(r => r.json()).catch(function() { return {sessions:[]}; }),
-    fetch('/api/delegation-tree').then(r => r.json()).catch(function() { return {chains:[], total_subagents:0, total_chain_cost_usd:0}; })
+    fetch('/api/delegation-tree').then(r => r.json()).catch(function() { return {chains:[], total_subagents:0, total_chain_cost_usd:0}; }),
+    // Issue #567 — pull recent brain events so we can stamp a high-risk
+    // warning on any session whose latest LLM call tripped the band.
+    // 200 events is enough to cover the active window without blowing
+    // the page-load budget; the fast path serves this in <50 ms.
+    fetch('/api/brain-history?limit=200').then(r => r.json()).catch(function() { return {events:[]}; }),
+    // Issue #1619 Phase 1 — eval scores. Joined client-side onto the
+    // sessions list so the Score column doesn't require a server-side
+    // join with the in-flight #1614 outcome columns.
+    fetch('/api/evals/recent?limit=200').then(r => r.json()).catch(function() { return {evals:[]}; }),
+    // Issue #1364 — loop-detection badge on session cards. Same data that
+    // powers the Brain tab badge, now surfaced on the Sessions list where
+    // users look first. Fails silently (empty map) when the proxy isn't
+    // running or the local store is unreachable.
+    fetch('/api/loop-signals?limit=200&since_minutes=60').then(r => r.json()).catch(function() { return {signals:[]}; })
   ]);
+  // Build a session_id → eval lookup for O(1) overlay.
+  var evalMap = {};
+  ((evalData && evalData.evals) || []).forEach(function(e) {
+    if (e && e.session_id) evalMap[e.session_id] = e;
+  });
   // Build cost lookup map by session_id suffix
   var costMap = {};
   (costData.sessions || []).forEach(function(c) {
@@ -4556,6 +9434,24 @@ async function loadSessions() {
   });
   var anomalySet = {};
   (anomalyData.anomalies || []).forEach(function(a) { if (a && a.session_id) anomalySet[a.session_id] = a; });
+  // Issue #1364 — per-session loop-detection lookup (session_id → repeat_count).
+  // Populated from /api/loop-signals (loop_signals DuckDB table). Empty for
+  // users who don't run the proxy; badge simply won't appear in that case.
+  var loopSessions = {};
+  ((loopData && loopData.signals) || []).forEach(function(sig) {
+    if (sig && sig.session_id) loopSessions[sig.session_id] = (loopSessions[sig.session_id] || 0) + (sig.repeat_count || 1);
+  });
+  // Per-session high-risk set for the session-row warning badge.
+  // Issue #567: a session is "high-risk" if ANY of its recent LLM calls
+  // scored "high". Build the lookup once so the per-row test is O(1).
+  var highRiskSessions = {};
+  ((riskBrain && riskBrain.events) || []).forEach(function(ev) {
+    if (!ev || !ev.risk) return;
+    if (String(ev.risk.risk_level || '').toLowerCase() !== 'high') return;
+    var sid = ev.sessionId || ev.src || ev.source || '';
+    if (!sid) return;
+    highRiskSessions[sid] = (highRiskSessions[sid] || 0) + 1;
+  });
   var html = '';
   // Main sessions (non-subagent)
   var mainSessions = sessData.sessions.filter(function(s) { return !(s.sessionId || '').includes('subagent'); });
@@ -4567,9 +9463,32 @@ async function loadSessions() {
     var sparkId = 'session-burn-' + Math.random().toString(36).slice(2);
     html += '<div class="session-item" style="border-left:3px solid var(--bg-accent);padding-left:16px;">';
     html += '<div class="session-name" style="display:flex;justify-content:space-between;align-items:center;gap:8px;">';
-    html += '<span>🖥️ ' + escHtml(s.displayName || s.key) + ' <span style="font-size:11px;color:var(--text-muted);font-weight:400;">Main Session</span>';
+    // Per-session runtime mascot, keyed off the session's runtime (session-id
+    // prefix / agent_type). Falls back to the desktop emoji if the helper or
+    // sprite has not loaded yet.
+    var _srt = (typeof _cmRuntimeOf === 'function') ? _cmRuntimeOf(s) : 'openclaw';
+    var _sic = (typeof window.cmRuntimeIcon === 'function')
+      ? window.cmRuntimeIcon(_srt, 18, { title: _cmRuntimeLabel(_srt), cls: 'cm-session-rt-ic' }) : '🖥️';
+    html += '<span data-cm-runtime="' + escHtml(_srt) + '">' + _sic + ' ' + escHtml(s.displayName || s.key) + ' <span style="font-size:11px;color:var(--text-muted);font-weight:400;">Main Session</span>';
     if (anomaly) {
       html += '<span class="session-anomaly" title="Cost anomaly: $' + Number(anomaly.cost_usd || 0).toFixed(4) + ' (' + Number(anomaly.ratio || 0).toFixed(2) + 'x rolling avg)">&#9888;&#65039;</span>';
+    }
+    // Issue #567 — high-risk warning. One or more LLM calls in this
+    // session scored "high" on the Hallucination Risk Indicator.
+    var _hrCount = highRiskSessions[sid] || 0;
+    if (_hrCount > 0) {
+      html += '<span class="session-risk-warn" data-session-id="' + escHtml(sid) +
+        '" title="' + _hrCount + ' high-risk call' + (_hrCount > 1 ? 's' : '') +
+        ' in this session. Open the Brain tab for per-call detail."' +
+        ' style="margin-left:6px;color:#dc2626;font-size:13px;">&#9888;</span>';
+    }
+    // Issue #1364 — loop-detection badge. Shown when the proxy's LoopDetector
+    // has recorded repeated identical requests from this session in the last
+    // hour. Data comes from the loop_signals DuckDB table via /api/loop-signals.
+    var _loopCount = loopSessions[sid] || 0;
+    if (_loopCount > 0) {
+      html += '<span class="session-loop-warn" onclick="event.stopPropagation();switchTab(\'brain\')" title="Agent may be looping: ' + _loopCount + ' repeated request' + (_loopCount > 1 ? 's' : '') + ' detected. Click to open Brain tab."' +
+        ' style="margin-left:6px;color:#d97706;font-size:11px;font-weight:700;background:rgba(217,119,6,0.12);border:1px solid rgba(217,119,6,0.35);border-radius:8px;padding:1px 6px;cursor:pointer;">&#9888; Looping</span>';
     }
     html += '</span>';
     html += '<button onclick="event.stopPropagation();stopSession(\'' + escHtml(sid).replace(/'/g, "\\\\'") + '\')" style="background:#b91c1c;color:#fff;border:none;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:700;cursor:pointer;">⏹ Emergency Stop</button>';
@@ -4580,6 +9499,48 @@ async function loadSessions() {
     if (s.channel !== 'unknown') html += '<span><span class="badge channel">' + s.channel + '</span></span>';
     if (sessCost && sessCost.cost_usd > 0) {
       html += '<span style="font-size:11px;color:var(--text-success);font-weight:600;">💰 $' + Number(sessCost.cost_usd||0).toFixed(4) + ' total</span>';
+    }
+    // Cost-intelligence chips (foundation): reasoning-tax $ + cache-hit %, shown
+    // only for runtimes whose adapter reports the field (others omit it).
+    if (sessCost && sessCost.reasoning_cost_usd != null && Number(sessCost.reasoning_cost_usd) > 0) {
+      html += '<span title="Reasoning tokens billed at the output rate — spend that produces no visible deliverable" style="font-size:11px;color:#a78bfa;font-weight:600;">🧠 $' + Number(sessCost.reasoning_cost_usd).toFixed(4) + ' reasoning</span>';
+    }
+    if (sessCost && sessCost.cache_hit_pct != null) {
+      var _chp = Number(sessCost.cache_hit_pct);
+      var _chc = _chp >= 70 ? '#22c55e' : (_chp >= 40 ? '#f59e0b' : '#ef4444');
+      html += '<span title="Share of input context served from prompt cache (far cheaper). Low = re-sending context at full price every turn." style="font-size:11px;color:' + _chc + ';font-weight:600;">⚡ ' + _chp.toFixed(0) + '% cache</span>';
+    }
+    if (sessCost && sessCost.model_mix) {
+      var _mmt = 'This session silently ran on more than one model — a fallback/downgrade you did not choose';
+      if (sessCost.primary_model) _mmt += ' (' + escHtml(sessCost.primary_model) + (sessCost.secondary_model ? ' + ' + escHtml(sessCost.secondary_model) : '') + ')';
+      html += '<span title="' + _mmt + '" style="font-size:11px;color:#f59e0b;font-weight:600;">🔀 model fallback</span>';
+    }
+    if (sessCost && sessCost.tool_error_pct != null && Number(sessCost.tool_error_pct) > 0) {
+      var _tep = Number(sessCost.tool_error_pct);
+      var _tec = _tep >= 30 ? '#ef4444' : '#f59e0b';
+      html += '<span title="Share of this session\'s tool calls that came back a real (non-benign) error — a failing tool you only ever see as the agent \'thinking\'." style="font-size:11px;color:' + _tec + ';font-weight:600;">⚠ ' + _tep.toFixed(0) + '% tools failing</span>';
+    }
+    if (sessCost && sessCost.compaction_count != null && Number(sessCost.compaction_count) > 0) {
+      var _cc = Number(sessCost.compaction_count);
+      html += '<span title="Times this session auto-compacted — each one silently re-summarises (and re-bills) the context window. Frequent compaction = context thrash / wasted tokens." style="font-size:11px;color:#f59e0b;font-weight:600;">♻ compacted ' + _cc + '×</span>';
+    }
+    if (sessCost && sessCost.downstream_cost_usd != null && Number(sessCost.downstream_cost_usd) > 0) {
+      var _dc = Number(sessCost.downstream_cost_usd), _sa = Number(sessCost.subagent_count || 0);
+      html += '<span title="The TRUE cost of this ask: it spawned ' + _sa + ' sub-agent(s) that spent this much downstream — billed under their own keys but caused by this session. (Context graph)" style="font-size:11px;color:#60a5fa;font-weight:600;">&#8627; +$' + _dc.toFixed(4) + (_sa ? ' · ' + _sa + ' agents' : '') + '</span>';
+    }
+    if (sessCost && Number(sessCost.governance_count) > 0) {
+      var _gn = Number(sessCost.governance_count), _gd = Number(sessCost.governance_denied || 0);
+      var _gc = _gd > 0 ? '#ef4444' : '#22c55e';
+      html += '<span title="Tool calls this session put through governance (NeMo guardrails + the approval queue): ' + _gn + ' gated, ' + _gd + ' denied/blocked. (Context graph)" style="font-size:11px;color:' + _gc + ';font-weight:600;">&#128737; ' + _gn + ' gated' + (_gd ? ' · ' + _gd + ' denied' : '') + '</span>';
+    }
+    // Issue #1619 Phase 1 — Score pill. Color band matches the overview
+    // tile (4+ green, 3-4 yellow, <3 red). Hover shows the judge's reason.
+    var evalRow = evalMap[sid];
+    if (evalRow && evalRow.eval_score !== null && evalRow.eval_score !== undefined) {
+      var scoreVal = Number(evalRow.eval_score);
+      var scoreColor = scoreVal >= 4 ? '#22c55e' : scoreVal >= 3 ? '#f59e0b' : '#ef4444';
+      var reason = String(evalRow.eval_reason || '').replace(/"/g, '&quot;');
+      html += '<span title="' + reason + ' (judge: ' + escHtml(evalRow.eval_judge_model || '') + ')" style="font-size:11px;font-weight:700;color:' + scoreColor + ';padding:1px 8px;border:1px solid ' + scoreColor + ';border-radius:10px;">⭐ ' + scoreVal.toFixed(1) + '</span>';
     }
     html += '<span>Updated ' + timeAgo(s.updatedAt) + '</span>';
     html += '</div>';
@@ -4689,12 +9650,36 @@ async function loadSessions() {
   }
 
   document.getElementById('sessions-list').innerHTML = html || '<div style="padding:16px;color:var(--text-muted);">No sessions found</div>';
+  _renderSessionsRetentionCta(!!(sessData && sessData.capped_at_24h));
   mainSessions.forEach(function(s, i) {
     var canvas = document.querySelectorAll('#sessions-list canvas')[i];
     if (!canvas) return;
     var pts = Array.isArray(s.burnSeries) ? s.burnSeries : [];
     drawSessionSparkline(canvas, pts);
   });
+}
+
+// Issue #1448: surface the OSS 24h retention cap as an upgrade CTA above
+// the Sessions list when /api/sessions returns capped_at_24h=true. Cloud-Pro
+// bypasses the cap server-side so this CTA stays hidden for paid users.
+function _renderSessionsRetentionCta(capped) {
+  var list = document.getElementById('sessions-list');
+  if (!list || !list.parentElement) return;
+  var cta = document.getElementById('sessions-retention-cta');
+  if (!cta) {
+    cta = document.createElement('div');
+    cta.id = 'sessions-retention-cta';
+    cta.style.cssText = 'padding:10px 14px;margin-bottom:10px;font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border:1px solid var(--border-primary);border-radius:8px;display:none;';
+    list.parentElement.insertBefore(cta, list);
+  }
+  if (capped) {
+    cta.style.display = '';
+    cta.innerHTML = 'Sessions older than 24 hours are available on Cloud-Pro. '
+      + '<a href="https://app.clawmetry.com/upgrade" target="_blank" rel="noopener" style="color:var(--accent,#7c5cff);font-weight:600;">Upgrade for full history.</a>';
+  } else {
+    cta.style.display = 'none';
+    cta.innerHTML = '';
+  }
 }
 
 async function stopSession(sessionId) {
@@ -4737,6 +9722,7 @@ var _cronJobs = [];
 var _cronExpanded = {};
 var _cronAutoRefreshTimer = null;
 var _cronActionsAvailable = false;
+var _cronWritesAvailable = false;  // single-job writes (relay-backed in cloud)
 var _cronView = 'active'; // 'active' | 'paused' | 'calendar'
 
 // Cache of recent runs per job, populated lazily when Calendar is opened.
@@ -4744,6 +9730,9 @@ var _cronView = 'active'; // 'active' | 'paused' | 'calendar'
 // activity in the Calendar's "Recently ran" section, including failures.
 var _cronRecentRunsCache = {};
 var _cronRecentRunsLoaded = false;
+// Lifetime run totals per job_id (the daemon ships `total_count` alongside the
+// capped recent-runs list). Falls back to the cached-run count when absent.
+var _cronRunTotals = {};
 
 function setCronView(view) {
   _cronView = view;
@@ -4765,21 +9754,37 @@ async function _loadAllCronRecentRuns() {
   _cronRecentRunsLoaded = true;
   try {
     var active = (_cronJobs || []).filter(function(j) { return j.enabled !== false; });
-    var sevenDaysAgo = Date.now() - 7 * 86400000;
+    // Cover the whole month grid + a margin (not just 7 days) so past fires
+    // land on the right calendar cells. The DuckDB-backed timeline endpoint
+    // (/api/crons/<id>/runs) is preferred; the legacy one is best-effort.
+    var windowStart = Date.now() - 40 * 86400000;
     var results = await Promise.all(active.map(function(j) {
-      return fetch('/api/cron/' + encodeURIComponent(j.id) + '/runs')
-        .then(function(r) { return r.ok ? r.json() : {runs:[]}; })
-        .catch(function() { return {runs:[]}; });
+      return fetch('/api/crons/' + encodeURIComponent(j.id) + '/runs?limit=200')
+        .then(function(r) { return r.ok ? r.json() : null; })
+        .catch(function() { return null; })
+        .then(function(d) {
+          if (d && (d.runs || []).length) return d;
+          // fall back to the legacy endpoint when the timeline is empty
+          return fetch('/api/cron/' + encodeURIComponent(j.id) + '/runs')
+            .then(function(r) { return r.ok ? r.json() : {runs:[]}; })
+            .catch(function() { return {runs:[]}; });
+        });
     }));
     active.forEach(function(j, i) {
-      var runs = ((results[i] || {}).runs || [])
+      var resp = results[i] || {};
+      var runs = (resp.runs || [])
         .map(function(r) {
           var ts = r.startedAt ? Date.parse(r.startedAt)
                  : r.timestamp || r.ts || 0;
           return { ts: ts, status: r.status || 'unknown' };
         })
-        .filter(function(r) { return r.ts >= sevenDaysAgo && r.ts <= Date.now(); });
+        .filter(function(r) { return r.ts >= windowStart && r.ts <= Date.now(); });
       _cronRecentRunsCache[j.id] = runs;
+      // Lifetime total if the backend reports one (daemon ships total_count);
+      // otherwise leave unset so the renderer falls back to the cached count.
+      var total = (resp.total_count != null) ? resp.total_count
+                : (resp.count != null ? resp.count : null);
+      if (total != null) _cronRunTotals[j.id] = total;
     });
   } catch (e) {
     // non-fatal: Calendar still renders predictions, just no past runs
@@ -4931,6 +9936,23 @@ function _cronComputeNextFireMs(schedule, fromMs) {
   return 0;
 }
 
+// Enumerate every fire time of a schedule within [fromMs, untilMs], capped so
+// a "* * * * *" job can't enumerate tens of thousands of entries. Reuses the
+// single-next predictor, advancing the cursor to each fire. Used by the
+// Calendar's "upcoming" count + month-grid future markers.
+function _cronEnumerateFiresMs(schedule, fromMs, untilMs, cap) {
+  cap = cap || 500;
+  var fires = [];
+  var t = fromMs;
+  for (var i = 0; i < cap; i++) {
+    var next = _cronComputeNextFireMs(schedule, t);
+    if (!next || next > untilMs || next <= t) break;
+    fires.push(next);
+    t = next;
+  }
+  return fires;
+}
+
 function toggleCronAutoRefresh() {
   var cb = document.getElementById('cron-auto-refresh');
   if (!cb) return;
@@ -4959,9 +9981,17 @@ async function loadCrons() {
     // copy says to click it. Cloud-iframe stays false so we don't dangle
     // controls that 410 when used.
     _cronActionsAvailable = !window.CLOUD_MODE;
-    // Show/hide cron action buttons based on gateway availability
+    // ALL cron writes now relay to the daemon's openclaw CLI: single-job
+    // (create/run/toggle/delete/edit via cm-cloud-cron-create + cm-cloud-cron-
+    // actions), Emergency Stop All (cm-cloud-cron-bulk -> cron_killall), and
+    // the AI "Fix" button (cm-cloud-cron-bulk -> cron_fix). So per-row +
+    // bulk + AI-fix all work in cloud. Both flags now collapse to the same
+    // thing; kept as a pair for callers that semantically check "writes".
+    _cronWritesAvailable = _cronActionsAvailable || !!window.CLOUD_MODE;
+    // .cron-action-btn (New Job + Emergency Stop All) — relay-backed, so show
+    // in cloud too.
     document.querySelectorAll('.cron-action-btn').forEach(function(btn) {
-      btn.style.display = _cronActionsAvailable ? '' : 'none';
+      btn.style.display = _cronWritesAvailable ? '' : 'none';
     });
     renderCrons();
     // Load cron health summary panel
@@ -5007,7 +10037,7 @@ async function loadCronHealth() {
 
     // Show/hide emergency stop button
     var killBtn = document.getElementById('cron-kill-all-btn');
-    if (killBtn) killBtn.style.display = (_cronActionsAvailable && hasIssues) ? 'inline-flex' : 'none';
+    if (killBtn) killBtn.style.display = (_cronWritesAvailable && hasIssues) ? 'inline-flex' : 'none';
 
     if (jobs.length === 0) { panel.innerHTML = ''; return; }
 
@@ -5043,7 +10073,7 @@ async function loadCronHealth() {
         html += anomalyBadges;
         if (j.consecutiveFailures > 1) html += '<span style="font-size:11px;background:#ef444422;color:#ef4444;border-radius:4px;padding:1px 5px;">'+j.consecutiveFailures+' fails</span>';
         html += '<span style="font-size:11px;color:var(--text-muted);white-space:nowrap;">'+projStr+'</span>';
-        if (_cronActionsAvailable) html += '<button onclick="event.stopPropagation();cronPauseJob(\''+escHtml(j.id)+'\')" title="Pause this job" style="font-size:11px;padding:2px 7px;border-radius:5px;border:1px solid var(--border-secondary);background:var(--bg-tertiary);color:var(--text-secondary);cursor:pointer;">&#x23F8; Pause</button>';
+        if (_cronWritesAvailable) html += '<button onclick="event.stopPropagation();cronPauseJob(\''+escHtml(j.id)+'\')" title="Pause this job" style="font-size:11px;padding:2px 7px;border-radius:5px;border:1px solid var(--border-secondary);background:var(--bg-tertiary);color:var(--text-secondary);cursor:pointer;">&#x23F8; Pause</button>';
         html += '</div>';
       });
       html += '</div>';
@@ -5057,7 +10087,7 @@ async function loadCronHealth() {
 }
 
 async function cronKillAll() {
-  if (!confirm('Emergency stop: disable ALL active cron jobs? This cannot be undone automatically.')) return;
+  if (!confirm(t("app.emergency_stop_disable_all_active_cron_jobs_this_c", null, "Emergency stop: disable ALL active cron jobs? This cannot be undone automatically."))) return;
   try {
     var r = await fetch('/api/cron/kill-all', {method:'POST'}).then(res => res.json());
     alert('Disabled ' + (r.disabled||0) + ' cron job(s).' + (r.errors && r.errors.length ? ' Failed: '+r.errors.join(', ') : ''));
@@ -5144,7 +10174,27 @@ function renderCrons() {
       // In cloud iframe mode the "+ New Job" button is hidden because
       // cron-create hits a cloud-disabled endpoint; pointing the user
       // at an invisible button (clawmetry-cloud#793) is a UX dead-end.
-      msg = 'No active cron jobs yet. Create one from the OSS dashboard on the host running OpenClaw.';
+      //
+      // The cloud-side /api/crons interceptor stashes a hint in
+      // window._cmCloudCronsEmpty so we can pick accurate copy instead
+      // of the generic "Create one from the OSS dashboard" line that
+      // misled the user in clawmetry-cloud#948 ("I scheduled a cron and
+      // it never showed up"). The cron WAS scheduled; the cache just
+      // hadn't synced yet. Three states:
+      //   - 'no_crons_scheduled'  : cache hit, list is empty
+      //   - 'waiting_first_sync'  : cache miss, node is online (next ~30s)
+      //   - 'node_offline'        : cache miss, node hasn't heartbeated
+      //   - ''/undefined          : pre-948 fallback (snap-based path)
+      var hint = window._cmCloudCronsEmpty;
+      if (hint === 'no_crons_scheduled') {
+        msg = "You haven't scheduled any crons yet. Create one from the OSS dashboard on the host running OpenClaw.";
+      } else if (hint === 'waiting_first_sync') {
+        msg = 'Waiting for first sync from your laptop. New crons appear within about 30 seconds.';
+      } else if (hint === 'node_offline') {
+        msg = 'Waiting for your laptop to come back online. Crons will appear once it heartbeats.';
+      } else {
+        msg = 'No active cron jobs yet. Create one from the OSS dashboard on the host running OpenClaw.';
+      }
     } else {
       msg = 'No active cron jobs yet. Click "+ New Job" to create one.';
     }
@@ -5181,7 +10231,7 @@ function renderCronList(jobs) {
       var consecutiveFails = (j.state && j.state.consecutiveFailures) ? j.state.consecutiveFailures : '';
       html += '<span class="cron-error-actions">';
       html += '<span class="cron-info-icon" title="Error details" onclick="event.stopPropagation();showCronError(this,\'' + errMsg.replace(/'/g,'\\&#39;').replace(/"/g,'&quot;') + '\',\'' + escHtml(errTime) + '\',' + (consecutiveFails||'null') + ')">&#x2139;&#xFE0F;</span>';
-      if (_cronActionsAvailable) html += '<button class="cron-fix-btn" onclick="event.stopPropagation();confirmCronFix(\'' + escHtml(j.id) + '\',\'' + escHtml(j.name||j.id).replace(/'/g,'\\&#39;') + '\')">&#x1F527; Fix</button>';
+      if (_cronWritesAvailable) html += '<button class="cron-fix-btn" onclick="event.stopPropagation();confirmCronFix(\'' + escHtml(j.id) + '\',\'' + escHtml(j.name||j.id).replace(/'/g,'\\&#39;') + '\')">&#x1F527; Fix</button>';
       html += '</span>';
     }
     html += '</div>';
@@ -5213,8 +10263,9 @@ function renderCronList(jobs) {
     }
     if (badges) html += '<div style="display:inline;">' + badges + '</div>';
 
-    // Action buttons (hidden unless gateway supports cron invocation)
-    if (_cronActionsAvailable) {
+    // Action buttons. Relay-backed in cloud (cm-cloud-cron-actions), so show
+    // them whenever single-job writes are available (local OR cloud).
+    if (_cronWritesAvailable) {
     html += '<div class="cron-actions" onclick="event.stopPropagation()">';
     html += '<button class="cron-btn-run" onclick="cronRunNow(\'' + escHtml(j.id) + '\')">&#x25B6; Run Now</button>';
     html += '<button class="cron-btn-toggle" onclick="cronToggle(\'' + escHtml(j.id) + '\',' + !isEnabled + ')">' + (isEnabled ? '&#x23F8; Disable' : '&#x25B6; Enable') + '</button>';
@@ -5270,6 +10321,51 @@ function _cronGroupByDay(items) {
   return groups;
 }
 
+function _renderCronMonthGrid(monthStart, monthEnd, now, pastByDay, futureByDay) {
+  function _dk(ts) { var d = new Date(ts); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); }
+  var first = new Date(monthStart);
+  var monthName = first.toLocaleString(undefined, {month:'long', year:'numeric'});
+  var daysInMonth = new Date(first.getFullYear(), first.getMonth()+1, 0).getDate();
+  var leadBlanks = first.getDay(); // 0 = Sunday
+  var todayKey = _dk(now);
+  var dows = ['S','M','T','W','T','F','S'];
+  var h = '<div class="cron-cal-section">&#x1F4C5; ' + escHtml(monthName) + '</div>';
+  h += '<div style="display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--text-muted);margin:2px 0 10px;">'
+     + '<span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#22c55e;vertical-align:middle;margin-right:4px;"></span>ran</span>'
+     + '<span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#ef4444;vertical-align:middle;margin-right:4px;"></span>failed</span>'
+     + '<span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#60a5fa;vertical-align:middle;margin-right:4px;"></span>upcoming</span>'
+     + '</div>';
+  h += '<div style="display:grid;grid-template-columns:repeat(7,1fr);gap:4px;max-width:520px;margin-bottom:6px;">';
+  dows.forEach(function(d) { h += '<div style="text-align:center;font-size:10px;color:var(--text-muted);padding:2px 0;">' + d + '</div>'; });
+  for (var b = 0; b < leadBlanks; b++) h += '<div></div>';
+  for (var day = 1; day <= daysInMonth; day++) {
+    var ts = new Date(first.getFullYear(), first.getMonth(), day).getTime();
+    var k = _dk(ts);
+    var pd = pastByDay[k];
+    var fc = futureByDay[k] || 0;
+    var isToday = (k === todayKey);
+    var bg = 'var(--bg-secondary)', fg = 'var(--text-muted)', badge = '', title = k;
+    if (pd && pd.count) {
+      bg = pd.error ? 'rgba(239,68,68,0.18)' : 'rgba(34,197,94,0.18)';
+      fg = 'var(--text-primary)';
+      badge = '<div style="font-size:10px;font-weight:700;color:' + (pd.error ? '#ef4444' : '#22c55e') + ';">' + pd.count + (pd.error ? ' ✗' : '') + '</div>';
+      title = k + ': ' + pd.count + ' run' + (pd.count > 1 ? 's' : '') + (pd.error ? ' (had a failure)' : '');
+    } else if (fc) {
+      bg = 'rgba(96,165,250,0.14)';
+      fg = 'var(--text-secondary)';
+      badge = '<div style="font-size:10px;font-weight:700;color:#60a5fa;">' + fc + '</div>';
+      title = k + ': ' + fc + ' upcoming fire' + (fc > 1 ? 's' : '');
+    }
+    var border = isToday ? '2px solid #60a5fa' : '1px solid transparent';
+    h += '<div title="' + escHtml(title) + '" style="background:' + bg + ';border:' + border + ';border-radius:6px;min-height:40px;padding:3px 4px;display:flex;flex-direction:column;justify-content:space-between;">';
+    h += '<div style="font-size:10px;color:' + fg + ';' + (isToday ? 'font-weight:700;' : '') + '">' + day + '</div>';
+    h += badge;
+    h += '</div>';
+  }
+  h += '</div>';
+  return h;
+}
+
 function renderCronCalendar(jobs) {
   var listEl = document.getElementById('crons-list');
   if (!listEl) return;
@@ -5281,6 +10377,21 @@ function renderCronCalendar(jobs) {
   var upcoming = [];
   var recent = [];
   var predictedCount = 0;
+
+  // Lifetime "fired so far" + "upcoming (30d)" counts, and per-day buckets for
+  // the month grid (current month only): pastByDay[k]={count,error},
+  // futureByDay[k]=count.
+  var firedSoFar = 0;
+  var upcoming30 = 0;
+  var horizon30 = now + 30 * dayMs;
+  var dRef = new Date();
+  var monthStart = new Date(dRef.getFullYear(), dRef.getMonth(), 1).getTime();
+  var monthEnd = new Date(dRef.getFullYear(), dRef.getMonth() + 1, 1).getTime();
+  var enumUntil = Math.max(horizon30, monthEnd);
+  var pastByDay = {};
+  var futureByDay = {};
+  function _dk(ts) { var d = new Date(ts); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); }
+
   jobs.forEach(function(j) {
     var nextMs = j.state && j.state.nextRunAtMs;
     var predicted = false;
@@ -5288,7 +10399,7 @@ function renderCronCalendar(jobs) {
       // No agent-reported next run -- compute it from the schedule so the
       // Calendar populates immediately for jobs that have never landed a
       // run record yet. This is the difference between "Coming up: 0" and
-      // showing all 17 actively-scheduled jobs grouped by day.
+      // showing all actively-scheduled jobs grouped by day.
       var pred = _cronComputeNextFireMs(j.schedule, now);
       if (pred) { nextMs = pred; predicted = true; }
     }
@@ -5309,27 +10420,49 @@ function renderCronCalendar(jobs) {
         recent.push({ts: r.ts, job: j, status: r.status});
       }
     });
+
+    // Lifetime fired-so-far: prefer the daemon's total_count, else cached runs.
+    firedSoFar += (_cronRunTotals[j.id] != null) ? _cronRunTotals[j.id] : cached.length;
+
+    // Past runs -> month-grid cells (this month only).
+    cached.forEach(function(r) {
+      if (r.ts >= monthStart && r.ts < monthEnd) {
+        var k = _dk(r.ts);
+        if (!pastByDay[k]) pastByDay[k] = {count: 0, error: false};
+        pastByDay[k].count++;
+        if (r.status === 'error') pastByDay[k].error = true;
+      }
+    });
+
+    // Future predicted fires -> upcoming-30d count + month-grid future cells.
+    _cronEnumerateFiresMs(j.schedule, now, enumUntil, 800).forEach(function(ts) {
+      if (ts <= horizon30) upcoming30++;
+      if (ts >= monthStart && ts < monthEnd && ts > now) {
+        var k2 = _dk(ts);
+        futureByDay[k2] = (futureByDay[k2] || 0) + 1;
+      }
+    });
   });
   upcoming.sort(function(a,b){return a.ts - b.ts;});
   recent.sort(function(a,b){return b.ts - a.ts;});
 
   var html = '<div style="padding:12px;">';
 
-  // Summary tiles
+  // Summary tiles: lifetime + forward-looking notification counts.
   html += '<div style="display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap;">';
   [
-    {label:'Coming up (7d)', val: upcoming.length},
-    {label:'Ran (last 7d)',   val: recent.length},
-    {label:'Active jobs',     val: jobs.length},
+    {label:'Fired so far',   val: firedSoFar, tip:'Total runs recorded across all active jobs'},
+    {label:'Upcoming (30d)', val: upcoming30, tip:'Predicted fires across all active jobs over the next 30 days'},
+    {label:'Active jobs',    val: jobs.length, tip:'Enabled cron jobs'},
   ].forEach(function(t) {
-    html += '<div style="background:var(--bg-secondary);border-radius:8px;padding:10px 16px;flex:1;min-width:130px;">';
+    html += '<div title="' + escHtml(t.tip) + '" style="background:var(--bg-secondary);border-radius:8px;padding:10px 16px;flex:1;min-width:130px;">';
     html += '<div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">' + t.label + '</div>';
-    html += '<div style="font-size:22px;font-weight:700;color:var(--text-primary);margin-top:2px;">' + t.val + '</div>';
+    html += '<div style="font-size:22px;font-weight:700;color:var(--text-primary);margin-top:2px;">' + (t.val || 0).toLocaleString() + '</div>';
     html += '</div>';
   });
   html += '</div>';
 
-  if (upcoming.length === 0 && recent.length === 0) {
+  if (upcoming.length === 0 && recent.length === 0 && upcoming30 === 0 && firedSoFar === 0) {
     html += '<div style="background:var(--bg-secondary);border-radius:8px;padding:24px;text-align:center;color:var(--text-muted);font-size:13px;line-height:1.6;">';
     html += '<div style="font-size:30px;margin-bottom:8px;">&#x1F4C5;</div>';
     html += '<div><strong style="color:var(--text-primary);">No schedule data available yet.</strong></div>';
@@ -5338,6 +10471,10 @@ function renderCronCalendar(jobs) {
     listEl.innerHTML = html;
     return;
   }
+
+  // Month grid: past actual runs (green / red on failure) + future predicted
+  // fires (blue), with a per-day count.
+  html += _renderCronMonthGrid(monthStart, monthEnd, now, pastByDay, futureByDay);
 
   if (upcoming.length > 0) {
     html += '<div class="cron-cal-section">&#x1F552; Coming up</div>';
@@ -5528,9 +10665,14 @@ async function loadCronRuns(jobId) {
     var timelinePromise = fetch('/api/crons/' + encodeURIComponent(jobId) + '/runs?limit=30')
       .then(function(r) { return r.ok ? r.json() : {runs:[]}; })
       .catch(function() { return {runs:[]}; });
-    var resp = await fetch('/api/cron/' + encodeURIComponent(jobId) + '/runs');
-    if (!resp.ok) throw new Error('HTTP ' + resp.status);
-    var data = await resp.json();
+    // The legacy gateway-derived endpoint is BEST-EFFORT only -- it 502s in
+    // cloud (no gateway reachable) and may be offline locally. Never let its
+    // failure surface an error: the DuckDB-backed timeline endpoint above is
+    // the real source. Falling through to {runs:[]} yields the friendly
+    // "No run history yet" empty state instead of a scary 502.
+    var data = await fetch('/api/cron/' + encodeURIComponent(jobId) + '/runs')
+      .then(function(r) { return r.ok ? r.json() : {runs:[]}; })
+      .catch(function() { return {runs:[]}; });
     var timelineData = await timelinePromise;
     var timelineRuns = (timelineData && timelineData.runs) || [];
     var el = document.getElementById('cron-runs-' + jobId);
@@ -5615,9 +10757,9 @@ async function loadCronLog(evt, sessionId) {
       var text = ev.text || ev.content || ev.summary || ev.tool || '';
       return '[' + (ev.ts || '').substring(11,19) + '] ' + role + ': ' + String(text).substring(0,200);
     }).join('\n');
-    document.getElementById('cron-log-content').textContent = out || 'No events found';
+    document.getElementById('cron-log-content').textContent = out || t("app.no_events_found", null, "No events found");
   } catch(ex) {
-    document.getElementById('cron-log-content').textContent = 'Error: ' + ex.message;
+    document.getElementById('cron-log-content').textContent = t("app.error", null, "Error: ") + ex.message;
   }
 }
 
@@ -5666,7 +10808,7 @@ function cronEdit(jobId) {
   var job = _cronJobs.find(function(j) { return j.id === jobId; });
   if (!job) return;
   document.getElementById('cron-edit-mode').value = 'edit';
-  document.getElementById('cron-modal-title').textContent = 'Edit Cron Job';
+  document.getElementById('cron-modal-title').textContent = t("app.edit_cron_job", null, "Edit Cron Job");
   document.getElementById('cron-save-btn').textContent = 'Save';
   document.getElementById('cron-edit-id').value = job.id;
   document.getElementById('cron-edit-name').value = job.name || '';
@@ -5691,8 +10833,8 @@ function cronEdit(jobId) {
 
 function cronCreateNew() {
   document.getElementById('cron-edit-mode').value = 'create';
-  document.getElementById('cron-modal-title').textContent = 'Create New Cron Job';
-  document.getElementById('cron-save-btn').textContent = 'Create';
+  document.getElementById('cron-modal-title').textContent = t("app.create_new_cron_job", null, "Create New Cron Job");
+  document.getElementById('cron-save-btn').textContent = t("app.create", null, "Create");
   document.getElementById('cron-edit-id').value = '';
   document.getElementById('cron-edit-name').value = '';
   document.getElementById('cron-edit-schedule').value = '';
@@ -5812,21 +10954,39 @@ function showCronToast(msg) {
 }
 
 function formatSchedule(s) {
+  // Defensive: never render a raw `{}` or JSON blob. Schedules can arrive as
+  // a structured dict (the blessed shape), a bare cron-expr string (legacy
+  // store rows), or empty (data not yet synced). Handle all three.
+  if (s == null) return 'no schedule';
+  if (typeof s === 'string') {
+    if (!s.trim()) return 'no schedule';
+    var hs = cronToHuman(s);
+    return hs ? ('cron: ' + s + ' \u00b7 ' + hs) : ('cron: ' + s);
+  }
+  if (typeof s !== 'object') return String(s);
   if (s.kind === 'cron') {
-    var expr = s.expr;
+    var expr = s.expr || s.cron || '';
+    if (!expr) return 'cron (no expression)';
     var human = cronToHuman(expr);
     var label = 'cron: ' + expr;
-    if (human) label += ' \u2014 ' + human;
+    if (human) label += ' \u00b7 ' + human;
     if (s.tz) label += ' (' + s.tz + ')';
     return label;
   }
-  if (s.kind === 'every') {
-    var mins = s.everyMs / 60000;
-    if (mins >= 60) return 'every ' + (mins/60).toFixed(0) + 'h';
-    return 'every ' + mins + ' min';
+  if (s.kind === 'every' || s.kind === 'interval') {
+    var ms = (typeof s.everyMs === 'number') ? s.everyMs : null;
+    if (ms != null) {
+      var mins = ms / 60000;
+      if (mins >= 60) return 'every ' + (mins/60).toFixed(0) + 'h';
+      return 'every ' + mins + ' min';
+    }
+    if (s.interval) return 'every ' + s.interval;
   }
-  if (s.kind === 'at') return 'once at ' + formatTime(s.atMs);
-  return JSON.stringify(s);
+  if (s.kind === 'at') return 'once at ' + formatTime(s.atMs || s.at);
+  // Last-ditch: surface any expr-ish field rather than the raw object.
+  if (s.expr || s.cron) return 'cron: ' + (s.expr || s.cron);
+  if (s.interval) return 'every ' + s.interval;
+  return Object.keys(s).length ? 'custom schedule' : 'no schedule';
 }
 
 function cronToHuman(expr) {
@@ -5849,6 +11009,11 @@ function cronToHuman(expr) {
     if (min === '0') return 'every ' + evHr[1] + ' hours';
     return 'every ' + evHr[1] + ' hours at :' + min.padStart(2,'0');
   }
+  // Minute X past every hour within an hour range (e.g. "37 9-21 * * *")
+  var hrRange = hr.match(/^(\d{1,2})-(\d{1,2})$/);
+  if (hrRange && dom === '*' && mon === '*' && dow === '*' && /^\d+$/.test(min)) {
+    return 'at :' + min.padStart(2,'0') + ' hourly, ' + hrRange[1].padStart(2,'0') + ':00 to ' + hrRange[2].padStart(2,'0') + ':00';
+  }
   // Daily
   if (dom === '*' && mon === '*' && dow === '*' && /^\d+$/.test(hr) && /^\d+$/.test(min)) {
     return 'daily at ' + hr.padStart(2,'0') + ':' + min.padStart(2,'0');
@@ -5867,7 +11032,7 @@ function cronToHuman(expr) {
 async function loadLogs() {
   if (window.CLOUD_MODE) {
     var el = document.getElementById('logs-full');
-    if (el) el.innerHTML = '<div style="color:var(--text-secondary);padding:24px;text-align:center;font-size:13px;">Full logs are not available in cloud view. Use the live stream on the Flow tab.</div>';
+    if (el) el.innerHTML = '<div style="color:var(--text-secondary);padding:24px;text-align:center;font-size:13px;">' + t("app.full_logs_are_not_available_in_cloud_view_use_the_", null, "Full logs are not available in cloud view. Use the live stream on the Flow tab.") + '</div>';
     return;
   }
   var lines = document.getElementById('log-lines').value;
@@ -5958,8 +11123,10 @@ async function loadMemoryAnalytics() {
 function memorySwitchView(view) {
   var summary = document.getElementById('memory-summary-view');
   var all = document.getElementById('memory-all-view');
+  var access = document.getElementById('memory-access-view');
   if (summary) summary.style.display = view === 'summary' ? 'block' : 'none';
   if (all) all.style.display = view === 'all' ? 'block' : 'none';
+  if (access) access.style.display = view === 'access' ? 'block' : 'none';
   document.querySelectorAll('.mem-view-tab').forEach(function(t) {
     var active = t.getAttribute('data-view') === view;
     t.style.background = active ? 'var(--bg-secondary)' : 'transparent';
@@ -5968,9 +11135,956 @@ function memorySwitchView(view) {
   });
   if (view === 'summary') {
     if (typeof loadSelfConfig === 'function') loadSelfConfig();
+  } else if (view === 'access') {
+    loadMemoryAccess();
   } else {
     _loadMemoryAllFiles();
   }
+}
+
+// ── Memory access log (issue #1896) ────────────────────────────────────────
+// Shows when OpenClaw read memory (memory_search / memory_get) and lets the
+// user click through to the conversation that triggered each access.
+async function loadMemoryAccess() {
+  var el = document.getElementById('memory-access-list');
+  if (!el) return;
+  el.innerHTML = '<div style="padding:18px;color:var(--text-muted);">' + t("app.loading_memory_accesses", null, "Loading memory accesses…") + '</div>';
+  var data;
+  try {
+    data = await fetch('/api/memory-access?limit=300').then(function(r){ return r.json(); });
+  } catch (e) {
+    el.innerHTML = '<div style="padding:18px;color:var(--text-muted);">' + t("app.could_not_load_memory_accesses", null, "Could not load memory accesses.") + '</div>';
+    return;
+  }
+  if (!data || data.available === false) {
+    el.innerHTML = '<div style="padding:24px;text-align:center;color:var(--text-secondary);font-size:13px;">' + t("app.memory_access_history_reads_from_the_local_event_s", null, "Memory access history reads from the local event store, which is not available here.") + '</div>';
+    return;
+  }
+  var rows = data.accesses || [];
+  if (!rows.length) {
+    el.innerHTML = '<div style="padding:24px;text-align:center;color:var(--text-secondary);font-size:13px;">' + t("app.no_memory_accesses_recorded_yet_they_appear_here_o", null, "No memory accesses recorded yet. They appear here once your agent reads its memory.") + '</div>';
+    return;
+  }
+  var html = '<div style="display:flex;flex-direction:column;">';
+  rows.forEach(function(a) {
+    var op = a.op || 'access';
+    var opColor = op === 'search' ? '#6366f1' : op === 'get' ? '#10b981' : '#6b7280';
+    var opLabel = op === 'search' ? '🔍 search' : op === 'get' ? '📄 get' : op;
+    var when = a.ts ? new Date(a.ts).toLocaleString() : '';
+    var sid = a.session_id || '';
+    var sidShort = sid ? escHtml(sid.slice(0, 12)) : '(unknown session)';
+    var canOpen = !!sid;
+    html += '<div onclick="' + (canOpen ? "memoryOpenAccessConversation('" + escHtml(sid) + "')" : '') + '" '
+      + 'style="display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:1px solid var(--border-secondary);'
+      + (canOpen ? 'cursor:pointer;' : '') + '" '
+      + (canOpen ? 'onmouseover="this.style.background=\'var(--bg-tertiary,#1e293b)\'" onmouseout="this.style.background=\'\'"' : '') + '>'
+      + '<span style="flex-shrink:0;background:' + opColor + '22;color:' + opColor + ';border-radius:6px;padding:2px 8px;font-size:11px;font-weight:600;white-space:nowrap;">' + opLabel + '</span>'
+      + '<span style="flex:1;color:var(--text-primary);font-size:13px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + escHtml(a.target || '') + '">' + (a.target ? escHtml(a.target) : '<span style="color:var(--text-muted);">(no query)</span>') + '</span>'
+      + '<span style="flex-shrink:0;color:var(--text-muted);font-size:11px;white-space:nowrap;">' + escHtml(when) + '</span>'
+      + '<span style="flex-shrink:0;color:var(--text-secondary);font-size:11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;">' + sidShort + (canOpen ? ' ›' : '') + '</span>'
+      + '</div>';
+  });
+  html += '</div>';
+  el.style.cssText = 'padding:0;overflow:hidden;';
+  el.innerHTML = html;
+}
+
+// Deep-link from a memory access to the conversation that triggered it.
+function memoryOpenAccessConversation(sessionId) {
+  if (!sessionId) return;
+  if (typeof switchTab === 'function') switchTab('transcripts');
+  setTimeout(function(){ if (typeof viewTranscript === 'function') viewTranscript(sessionId); }, 60);
+}
+
+// ── Tracing tab (Phoenix/Arize-style) ──────────────────────────────────────
+// Trace list → span waterfall + span tree + agent graph. Events-first: a trace
+// is one session, each event is a span, linked by parentId.
+window._traceData = null;
+window._traceView = 'waterfall';
+window._traceActiveSpanId = null;
+window._traceActiveTab = 'details';
+window._traceSpanCache = {};
+window._traceSpanCopyBuf = '';
+window._traceCollapsed = {};
+
+var _TRACE_KIND_COLORS = {
+  agent: '#ec4899', prompt: '#3b82f6', llm: '#8b5cf6', tool: '#10b981',
+  retrieval: '#06b6d4', attachment: '#6b7280', event: '#94a3b8'
+};
+var _TRACE_KIND_ICONS = {
+  agent: '🤖', llm: '🧠', tool: '🔧', prompt: '💬', retrieval: '📚',
+  attachment: '📎', event: '•'
+};
+function _traceColor(s) {
+  // Sub-agent ROOT span is orange; everything else (incl. spans inside a
+  // sub-agent) is colored by its kind so chat/tool stay readable.
+  if (s.kind === 'agent' && s.is_subagent) return '#f59e0b';
+  return _TRACE_KIND_COLORS[s.kind] || '#94a3b8';
+}
+function _traceIcon(s) { return _TRACE_KIND_ICONS[s.kind] || '•'; }
+function _traceCost(s) { return (s.rolled_cost != null ? s.rolled_cost : s.cost) || 0; }
+function _traceTokens(s) { return (s.rolled_tokens != null ? s.rolled_tokens : s.tokens) || 0; }
+function _traceFmtDur(ms) {
+  ms = ms || 0;
+  if (ms < 1000) return ms + 'ms';
+  if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
+  if (ms < 3600000) return (ms / 60000).toFixed(1) + 'm';
+  if (ms < 86400000) return (ms / 3600000).toFixed(1) + 'h';
+  return (ms / 86400000).toFixed(1) + 'd';
+}
+
+window._allTraces = [];
+window._traceListFilter = 'recent';
+window._traceListSearch = '';
+
+// ── Turn anatomy (P0-3): per-turn waterfall + stalled detector ──────────────
+// Reuses the trace list (one row per session) for picking a session, then
+// /api/turn-anatomy decomposes that session into turns of ordered spans.
+var _TA_KIND_COLORS = {
+  prompt: '#a78bfa', model: '#22d3ee', tool: '#f59e0b',
+  compaction: '#f472b6', reply: '#34d399'
+};
+var _TA_KIND_ICONS = {
+  prompt: '💬', model: '🧠', tool: '🔧', compaction: '🗜️', reply: '✅'
+};
+function _taColor(kind) { return _TA_KIND_COLORS[kind] || '#94a3b8'; }
+function _taIcon(kind) { return _TA_KIND_ICONS[kind] || '•'; }
+// Top-level cost formatter for the turn-anatomy waterfall (the page-scoped
+// fmtCost helpers live inside other functions and aren't in scope here).
+function _taFmtCost(c) { c = Number(c) || 0; return c >= 0.01 ? '$' + c.toFixed(2) : c > 0 ? '<$0.01' : '$0.00'; }
+
+window._taSession = null;
+
+async function loadTurnAnatomy() {
+  // Session deep-dive handoff (Phase B): a pending session skips the list and
+  // opens the per-session detail directly.
+  if (window._pendingTurnSession) {
+    var _pts = window._pendingTurnSession;
+    window._pendingTurnSession = null;
+    viewTurnAnatomy(_pts);
+    return;
+  }
+  turnAnatomyShowList();
+  _taLoadStalled();
+  var el = document.getElementById('ta-list');
+  if (!el) return;
+  el.style.cssText = '';
+  el.innerHTML = '<div style="padding:18px;color:var(--text-muted);">' + t("app.loading_sessions_hellip", null, "Loading sessions&hellip;") + '</div>';
+  var data;
+  try {
+    data = await fetch('/api/traces?limit=200').then(function(r){ return r.json(); });
+  } catch (e) {
+    el.innerHTML = '<div style="padding:18px;color:var(--text-muted);">' + t("app.could_not_load_sessions", null, "Could not load sessions.") + '</div>';
+    return;
+  }
+  if (!data || data.available === false) {
+    el.innerHTML = '<div style="padding:24px;text-align:center;color:var(--text-secondary);font-size:13px;">' + t("app.turn_anatomy_reads_from_the_local_event_store_whic", null, "Turn anatomy reads from the local event store, which is not available here.") + '</div>';
+    return;
+  }
+  var traces = (data.traces || []).slice().sort(function(a, b){ return (b.start_ms || 0) - (a.start_ms || 0); });
+  // Runtime scoping — a trace's id IS the session id, whose prefix is the
+  // runtime (same derivation the Tracing tab uses). Don't silently merge when
+  // a specific runtime is picked; show a scoped empty state instead.
+  var _taRt = (typeof _cmRuntimeFilter === 'function') ? _cmClientFilterRt(_cmRuntimeFilter()) : 'all';
+  if (_taRt !== 'all') {
+    traces = traces.filter(function(t) { return _cmRuntimeOf({ id: t.trace_id }) === _taRt; });
+  }
+  if (!traces.length) {
+    var _taEmpty = _taRt !== 'all'
+      ? 'No <strong>' + escHtml(_cmRuntimeLabel(_taRt)) + '</strong> sessions recorded yet.'
+      : 'No sessions yet. They appear here once your agent runs.';
+    el.innerHTML = '<div style="padding:24px;text-align:center;color:var(--text-secondary);font-size:13px;">' + _taEmpty + '</div>';
+    return;
+  }
+  el.style.cssText = 'padding:0;overflow:hidden;';
+  var html = '<div style="display:flex;gap:12px;padding:8px 14px;border-bottom:1px solid var(--border-primary);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:var(--text-muted);">'
+    + '<span style="flex:1;">Session</span><span style="width:74px;text-align:right;">Duration</span><span style="width:64px;text-align:right;">Spans</span><span style="width:130px;">Model</span></div>';
+  traces.forEach(function(t) {
+    var when = t.start_ms ? new Date(t.start_ms).toLocaleString() : '';
+    var statusDot = t.status === 'error' ? '#ef4444' : '#22c55e';
+    html += '<div onclick="viewTurnAnatomy(\'' + escHtml(t.trace_id) + '\')" '
+      + 'style="display:flex;gap:12px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border-secondary);cursor:pointer;" '
+      + 'onmouseover="this.style.background=\'var(--bg-tertiary,#1e293b)\'" onmouseout="this.style.background=\'\'">'
+      + '<span style="flex:1;min-width:0;">'
+        + '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + statusDot + ';margin-right:8px;"></span>'
+        + '<span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;color:var(--text-primary);">' + escHtml((t.name || t.trace_id).slice(0, 30)) + '</span>'
+        + '<span style="margin-left:8px;color:var(--text-muted);font-size:11px;">' + escHtml(when) + '</span>'
+      + '</span>'
+      + '<span style="width:74px;text-align:right;color:var(--text-secondary);font-size:12px;">' + _traceFmtDur(t.duration_ms) + '</span>'
+      + '<span style="width:64px;text-align:right;color:var(--text-secondary);font-size:12px;">' + (t.span_count || 0) + '</span>'
+      + '<span style="width:130px;color:var(--text-muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escHtml(t.model || '') + '</span>'
+      + '</div>';
+  });
+  el.innerHTML = html;
+}
+
+function turnAnatomyShowList() {
+  var list = document.getElementById('ta-list');
+  var detail = document.getElementById('ta-detail');
+  var back = document.getElementById('ta-back-btn');
+  if (list) list.style.display = '';
+  if (detail) detail.style.display = 'none';
+  if (back) back.style.display = 'none';
+}
+
+async function _taLoadStalled() {
+  var el = document.getElementById('ta-stalled');
+  if (!el) return;
+  var data;
+  try {
+    data = await fetch('/api/turn-anatomy/stalled?min=5').then(function(r){ return r.json(); });
+  } catch (e) { el.style.display = 'none'; return; }
+  var stalled = (data && data.stalled) || [];
+  if (!stalled.length) { el.style.display = 'none'; return; }
+  el.style.display = '';
+  var rows = stalled.slice(0, 6).map(function(s) {
+    return '<div onclick="viewTurnAnatomy(\'' + escHtml(s.session_id) + '\')" style="display:flex;align-items:center;gap:10px;padding:6px 0;cursor:pointer;font-size:12px;">'
+      + '<span style="width:8px;height:8px;border-radius:50%;background:#f59e0b;flex-shrink:0;"></span>'
+      + '<span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--text-primary);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escHtml(s.session_id) + '</span>'
+      + '<span style="color:#fbbf24;">idle ' + (s.idle_min || 0) + 'm</span>'
+      + '<span style="color:var(--text-muted);">' + escHtml(s.last_kind || '') + (s.pending_tool ? ' · tool pending' : '') + '</span>'
+      + '</div>';
+  }).join('');
+  el.innerHTML = '<div style="background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.35);border-radius:8px;padding:12px 14px;">'
+    + '<div style="font-size:12px;font-weight:700;color:#f59e0b;margin-bottom:4px;">&#9888; ' + stalled.length + ' session' + (stalled.length === 1 ? '' : 's') + ' stalled / long-running</div>'
+    + '<div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;">Latest turn has had no new event for &gt; ' + (data.threshold_min || 5) + ' min and never reached a reply.</div>'
+    + rows + '</div>';
+}
+
+async function viewTurnAnatomy(sessionId) {
+  window._taSession = sessionId;
+  var list = document.getElementById('ta-list');
+  var detail = document.getElementById('ta-detail');
+  var back = document.getElementById('ta-back-btn');
+  if (list) list.style.display = 'none';
+  if (detail) detail.style.display = '';
+  if (back) back.style.display = '';
+  var meta = document.getElementById('ta-detail-meta');
+  var turnsEl = document.getElementById('ta-turns');
+  if (meta) meta.innerHTML = '<div style="color:var(--text-muted);font-size:13px;">' + t("app.loading_turns_hellip", null, "Loading turns&hellip;") + '</div>';
+  if (turnsEl) turnsEl.innerHTML = '';
+  var data;
+  try {
+    data = await fetch('/api/turn-anatomy?session_id=' + encodeURIComponent(sessionId)).then(function(r){ return r.json(); });
+  } catch (e) {
+    if (meta) meta.innerHTML = '<div style="color:var(--text-muted);font-size:13px;">' + t("app.could_not_load_turns", null, "Could not load turns.") + '</div>';
+    return;
+  }
+  if (!data || data.available === false) {
+    if (meta) meta.innerHTML = '<div style="color:var(--text-secondary);font-size:13px;">' + t("app.event_store_not_available_here", null, "Event store not available here.") + '</div>';
+    return;
+  }
+  var turns = data.turns || [];
+  if (meta) {
+    meta.innerHTML = '<div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;color:var(--text-primary);">' + escHtml(sessionId) + '</div>'
+      + '<div style="font-size:12px;color:var(--text-muted);margin-top:4px;">' + turns.length + ' turn' + (turns.length === 1 ? '' : 's') + '</div>';
+  }
+  if (!turns.length) {
+    if (turnsEl) turnsEl.innerHTML = '<div class="card" style="padding:18px;color:var(--text-muted);">' + t("app.no_turns_in_this_session", null, "No turns in this session.") + '</div>';
+    return;
+  }
+  if (turnsEl) turnsEl.innerHTML = turns.map(_taRenderTurn).join('');
+}
+
+function _taRenderTurn(t) {
+  var spans = (t.spans || []).slice().sort(function(a, b){ return (a.started_ms || 0) - (b.started_ms || 0); });
+  var t0 = spans.length ? (spans[0].started_ms || 0) : 0;
+  var t1 = 0;
+  spans.forEach(function(s){ t1 = Math.max(t1, (s.started_ms || 0) + (s.duration_ms || 0)); });
+  var total = Math.max(1, t1 - t0);
+  var isErr = t.status === 'error';
+  var head = '<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">'
+    + '<span style="font-size:13px;font-weight:700;color:var(--text-primary);">Turn ' + t.turn + '</span>'
+    + (isErr ? '<span style="background:rgba(239,68,68,0.15);color:#f87171;border-radius:6px;padding:1px 7px;font-size:10px;font-weight:600;">error</span>' : '')
+    + '<span style="font-size:11px;color:var(--text-muted);">' + _traceFmtDur(t.duration_ms) + ' &middot; ' + (t.tool_count || 0) + ' tool' + (t.tool_count === 1 ? '' : 's') + ' &middot; ' + ((t.total_tokens || 0) / 1000).toFixed(1) + 'K tok'
+       + ((t.total_cost || 0) > 0 ? ' &middot; ' + _taFmtCost(t.total_cost) : '') + '</span>'
+    + '</div>';
+  var prompt = t.prompt ? '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + escHtml(t.prompt) + '">&#128172; ' + escHtml(t.prompt) + '</div>' : '';
+  var bars = '<div style="min-width:560px;">';
+  if (!spans.length) {
+    bars += '<div style="padding:8px;color:var(--text-muted);font-size:12px;">No spans.</div>';
+  }
+  spans.forEach(function(s) {
+    var left = ((s.started_ms - t0) / total) * 100;
+    var width = Math.max(0.6, ((s.duration_ms || 0) / total) * 100);
+    if (left + width > 100) width = Math.max(0.6, 100 - left);
+    var color = _taColor(s.kind);
+    var spanErr = s.status === 'error';
+    var label = (s.label || s.kind || '');
+    var spanCostTip = ((s.cost || 0) > 0 ? ' · ' + _taFmtCost(s.cost) : '') + ((s.tokens || 0) > 0 ? ' · ' + (s.tokens >= 1000 ? (s.tokens / 1000).toFixed(1) + 'K' : s.tokens) + ' tok' : '');
+    bars += '<div style="display:flex;align-items:center;gap:8px;padding:2px 0;" title="' + escHtml(label) + ' · ' + _traceFmtDur(s.duration_ms) + spanCostTip + (spanErr ? ' · error' : '') + '">'
+      + '<span style="width:18px;flex-shrink:0;text-align:center;font-size:11px;">' + _taIcon(s.kind) + '</span>'
+      + '<span style="width:170px;flex-shrink:0;font-size:11px;color:' + (spanErr ? '#f87171' : 'var(--text-secondary)') + ';white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escHtml(label) + (spanErr ? ' &#9888;' : '') + '</span>'
+      + '<span style="flex:1;position:relative;height:14px;background:var(--bg-primary);border-radius:3px;">'
+        + '<span style="position:absolute;left:' + left.toFixed(2) + '%;width:' + width.toFixed(2) + '%;top:2px;height:10px;background:' + (spanErr ? '#ef4444' : color) + ';border-radius:3px;min-width:2px;"></span>'
+      + '</span>'
+      + '<span style="width:58px;flex-shrink:0;text-align:right;font-size:11px;color:var(--text-muted);">' + _traceFmtDur(s.duration_ms) + '</span>'
+      + '</div>';
+  });
+  bars += '</div>';
+  return '<div class="card" style="margin-bottom:10px;overflow-x:auto;' + (isErr ? 'border-color:rgba(239,68,68,0.35);' : '') + '">' + head + prompt + bars + '</div>';
+}
+
+async function loadTracing() {
+  // Session deep-dive handoff (Phase B): a pending session skips the list and
+  // opens the per-session detail directly.
+  if (window._pendingTraceSession) {
+    var _pds = window._pendingTraceSession;
+    window._pendingTraceSession = null;
+    viewTrace(_pds);
+    return;
+  }
+  tracingShowList();
+  var el = document.getElementById('trace-list');
+  if (!el) return;
+  el.innerHTML = '<div style="padding:18px;color:var(--text-muted);">' + t("app.loading_traces_hellip", null, "Loading traces&hellip;") + '</div>';
+  var data;
+  try {
+    data = await fetch('/api/traces?limit=200').then(function(r){ return r.json(); });
+  } catch (e) {
+    el.innerHTML = '<div style="padding:18px;color:var(--text-muted);">' + t("app.could_not_load_traces", null, "Could not load traces.") + '</div>';
+    return;
+  }
+  if (!data || data.available === false) {
+    el.innerHTML = '<div style="padding:24px;text-align:center;color:var(--text-secondary);font-size:13px;">' + t("app.traces_read_from_the_local_event_store_which_is_no", null, "Traces read from the local event store, which is not available here.") + '</div>';
+    return;
+  }
+  window._allTraces = data.traces || [];
+  if (!window._allTraces.length) {
+    el.innerHTML = '<div style="padding:24px;text-align:center;color:var(--text-secondary);font-size:13px;">' + t("app.no_traces_yet_they_appear_here_once_your_agent_run", null, "No traces yet. They appear here once your agent runs.") + '</div>';
+    return;
+  }
+  el.style.cssText = 'padding:0;overflow:hidden;';
+  // Filter bar (chips + search) rendered once so the search box keeps focus.
+  function chip(id, label) {
+    var on = window._traceListFilter === id;
+    return '<div class="trace-filter-chip" data-f="' + id + '" onclick="traceListFilter(\'' + id + '\')" style="padding:5px 12px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;background:' + (on ? '#6366f1' : 'transparent') + ';color:' + (on ? '#fff' : 'var(--text-muted)') + ';border:1px solid ' + (on ? '#6366f1' : 'var(--border-secondary)') + ';">' + label + '</div>';
+  }
+  el.innerHTML =
+    '<div style="display:flex;gap:6px;align-items:center;padding:10px 12px;flex-wrap:wrap;border-bottom:1px solid var(--border-primary);">'
+    + chip('recent', 'Recent') + chip('errors', 'Errors') + chip('slowest', 'Slowest') + chip('costliest', 'Costliest')
+    + '<input id="trace-search" type="text" placeholder="Search trace / model&hellip;" value="' + escHtml(window._traceListSearch || '') + '" oninput="traceListSearch(this.value)" style="margin-left:auto;flex:0 0 200px;padding:5px 10px;border-radius:6px;border:1px solid var(--border-secondary);background:var(--bg-primary);color:var(--text-primary);font-size:12px;">'
+    + '</div>'
+    + '<div id="trace-rows"></div>';
+  _renderTraceRows();
+}
+
+function traceListFilter(f) {
+  window._traceListFilter = f;
+  document.querySelectorAll('.trace-filter-chip').forEach(function(c) {
+    var on = c.getAttribute('data-f') === f;
+    c.style.background = on ? '#6366f1' : 'transparent';
+    c.style.color = on ? '#fff' : 'var(--text-muted)';
+    c.style.borderColor = on ? '#6366f1' : 'var(--border-secondary)';
+  });
+  _renderTraceRows();
+}
+
+function traceListSearch(v) {
+  window._traceListSearch = (v || '').toLowerCase();
+  _renderTraceRows();  // rows only — leaves the focused search input untouched
+}
+
+function _renderTraceRows() {
+  var box = document.getElementById('trace-rows');
+  if (!box) return;
+  var traces = (window._allTraces || []).slice();
+  // Global runtime switcher (header): scope traces to one runtime. Each
+  // event-derived trace's `trace_id` IS its session_id, whose prefix is the
+  // runtime discriminator (OTLP traces with hex ids fall through to OpenClaw).
+  var _trRt = (typeof _cmRuntimeFilter === 'function') ? _cmClientFilterRt(_cmRuntimeFilter()) : 'all';
+  if (_trRt && _trRt !== 'all') {
+    traces = traces.filter(function(t) { return _cmRuntimeOf({ id: t.trace_id }) === _trRt; });
+  }
+  var f = window._traceListFilter, q = window._traceListSearch;
+  if (q) traces = traces.filter(function(t) {
+    return (((t.trace_id || '') + ' ' + (t.model || '')).toLowerCase().indexOf(q) !== -1);
+  });
+  if (f === 'errors') traces = traces.filter(function(t) { return t.status === 'error'; });
+  if (f === 'slowest') traces.sort(function(a, b) { return (b.duration_ms || 0) - (a.duration_ms || 0); });
+  else if (f === 'costliest') traces.sort(function(a, b) { return (b.total_cost_usd || 0) - (a.total_cost_usd || 0); });
+  else traces.sort(function(a, b) { return (b.start_ms || 0) - (a.start_ms || 0); });
+
+  var html = '<div style="display:flex;gap:12px;padding:8px 14px;border-bottom:1px solid var(--border-primary);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:var(--text-muted);">'
+    + '<span style="flex:1;">Trace</span><span style="width:64px;text-align:right;">Spans</span><span style="width:74px;text-align:right;">Duration</span><span style="width:64px;text-align:right;">Tokens</span><span style="width:70px;text-align:right;">Cost</span><span style="width:130px;">Model</span></div>';
+  if (!traces.length) {
+    box.innerHTML = html + '<div style="padding:24px;text-align:center;color:var(--text-secondary);font-size:13px;">No matching traces.</div>';
+    return;
+  }
+  traces.forEach(function(t) {
+    var when = t.start_ms ? new Date(t.start_ms).toLocaleString() : '';
+    var statusDot = t.status === 'error' ? '#ef4444' : '#22c55e';
+    var cost = t.total_cost_usd || 0;
+    var costStr = cost ? '$' + (cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)) : '&mdash;';
+    html += '<div onclick="viewTrace(\'' + escHtml(t.trace_id) + '\')" '
+      + 'style="display:flex;gap:12px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border-secondary);cursor:pointer;" '
+      + 'onmouseover="this.style.background=\'var(--bg-tertiary,#1e293b)\'" onmouseout="this.style.background=\'\'">'
+      + '<span style="flex:1;min-width:0;">'
+        + '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + statusDot + ';margin-right:8px;"></span>'
+        + '<span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;color:var(--text-primary);">' + escHtml((t.name || t.trace_id).slice(0, 26)) + '</span>'
+        + (t.has_subagents ? '<span style="margin-left:8px;background:rgba(245,158,11,0.15);color:#f59e0b;border-radius:6px;padding:1px 6px;font-size:10px;font-weight:600;">sub-agents</span>' : '')
+        + '<span style="margin-left:8px;color:var(--text-muted);font-size:11px;">' + escHtml(when) + '</span>'
+      + '</span>'
+      + '<span style="width:64px;text-align:right;color:var(--text-secondary);font-size:12px;">' + (t.span_count || 0) + '</span>'
+      + '<span style="width:74px;text-align:right;color:var(--text-secondary);font-size:12px;">' + _traceFmtDur(t.duration_ms) + '</span>'
+      + '<span style="width:64px;text-align:right;color:var(--text-secondary);font-size:12px;">' + ((t.total_tokens || 0) / 1000).toFixed(1) + 'K</span>'
+      + '<span style="width:70px;text-align:right;color:var(--text-secondary);font-size:12px;">' + costStr + '</span>'
+      + '<span style="width:130px;color:var(--text-muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escHtml(t.model || '') + '</span>'
+      + '</div>';
+  });
+  box.innerHTML = html;
+}
+
+function tracingShowList() {
+  var list = document.getElementById('trace-list');
+  var detail = document.getElementById('trace-detail');
+  var back = document.getElementById('trace-back-btn');
+  if (list) list.style.display = '';
+  if (detail) detail.style.display = 'none';
+  if (back) back.style.display = 'none';
+}
+
+async function viewTrace(traceId) {
+  var list = document.getElementById('trace-list');
+  var detail = document.getElementById('trace-detail');
+  var back = document.getElementById('trace-back-btn');
+  if (list) list.style.display = 'none';
+  if (detail) detail.style.display = '';
+  if (back) back.style.display = '';
+  // Reset left-pane loading state + right-pane placeholder until spans land.
+  var tg = document.getElementById('trace-treegantt');
+  if (tg) tg.innerHTML = '<div style="padding:18px;color:var(--text-muted);">' + t("app.loading_trace_hellip", null, "Loading trace&hellip;") + '</div>';
+  var pane = document.getElementById('trace-span-pane');
+  if (pane) pane.innerHTML = '<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:32px 14px;">Select a span on the left to see its <b>' + t("app.chat", null, "Chat") + '</b>, <b>' + t("app.inputs", null, "Inputs") + '</b>, <b>' + t("app.outputs", null, "Outputs") + '</b>, <b>' + t("app.attributes", null, "Attributes") + '</b>, and <b>' + t("app.events", null, "Events") + '</b>.</div>';
+  window._traceActiveSpanId = null;
+  window._traceSpanCache = {};
+  window._traceCollapsed = {};
+  var data;
+  try {
+    data = await fetch('/api/trace/' + encodeURIComponent(traceId)).then(function(r){ return r.json(); });
+  } catch (e) {
+    if (tg) tg.innerHTML = '<div style="padding:18px;color:var(--text-muted);">' + t("app.could_not_load_trace", null, "Could not load trace.") + '</div>';
+    return;
+  }
+  window._traceData = data;
+  var s = data.summary || {};
+
+  // MLflow-style header: trace title (first user prompt) prominent on top,
+  // small id + key stats chips beneath. Falls back to the trace id when the
+  // first-prompt couldn't be derived (older daemons before #2055 follow-up).
+  var meta = document.getElementById('trace-detail-meta');
+  if (meta) {
+    var title = (s.title || '').trim();
+    var statusDot = s.status === 'error' ? '#ef4444' : '#22c55e';
+    function stat(label, val) {
+      return '<span style="display:inline-flex;align-items:baseline;gap:6px;font-size:12px;color:var(--text-secondary);">'
+        + '<span style="color:var(--text-muted);font-size:11px;">' + label + '</span>'
+        + '<b style="color:var(--text-primary);">' + val + '</b></span>';
+    }
+    var stats = [];
+    stats.push(stat('Latency', _traceFmtDur(s.duration_ms)));
+    stats.push(stat('Spans', String(s.span_count || (data.spans || []).length)));
+    if (s.total_tokens) stats.push(stat('Tokens', ((s.total_tokens / 1000).toFixed(1) + 'K')));
+    if (s.total_cost_usd) stats.push(stat('Cost', '$' + (s.total_cost_usd < 0.01 ? s.total_cost_usd.toFixed(4) : s.total_cost_usd.toFixed(3))));
+    if (s.model) stats.push(stat('Model', escHtml(s.model)));
+    if (s.has_subagents) stats.push('<span style="background:rgba(245,158,11,0.15);color:#f59e0b;border-radius:6px;padding:1px 8px;font-size:11px;font-weight:600;">sub-agents</span>');
+    meta.innerHTML =
+      '<div style="display:flex;align-items:flex-start;gap:10px;">'
+        + '<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:' + statusDot + ';margin-top:6px;flex-shrink:0;"></span>'
+        + '<div style="flex:1;min-width:0;">'
+          + '<div style="font-size:15px;font-weight:700;color:var(--text-primary);line-height:1.35;word-break:break-word;">'
+            + (title ? escHtml(title) : '<span style="font-family:ui-monospace,Menlo,monospace;font-size:13px;color:var(--text-secondary);">' + escHtml((data.trace_id || '').slice(0, 40)) + '</span>')
+          + '</div>'
+          + (title ? '<div style="font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--text-muted);margin-top:2px;">' + escHtml((data.trace_id || '').slice(0, 40)) + '</div>' : '')
+          + '<div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:8px;">' + stats.join('') + '</div>'
+        + '</div>'
+      + '</div>';
+  }
+
+  window._traceView = 'treegantt';
+  tracingSwitchView('treegantt');
+}
+
+function tracingSwitchView(view) {
+  window._traceView = view;
+  document.querySelectorAll('.trace-view-tab').forEach(function(t) {
+    var active = t.getAttribute('data-view') === view;
+    t.style.background = active ? '#6366f1' : 'transparent';
+    t.style.color = active ? '#fff' : 'var(--text-muted)';
+    t.style.borderColor = active ? '#6366f1' : 'var(--border-secondary)';
+  });
+  var tg = document.getElementById('trace-treegantt');
+  var wf = document.getElementById('trace-waterfall');
+  var graph = document.getElementById('trace-graph');
+  if (tg) tg.style.display = view === 'treegantt' ? '' : 'none';
+  if (wf) wf.style.display = view === 'waterfall' ? '' : 'none';
+  if (graph) graph.style.display = view === 'graph' ? '' : 'none';
+  var d = window._traceData;
+  if (!d) return;
+  if (view === 'treegantt') _traceRenderTreeGantt(d.spans || [], d.root_span_ids || []);
+  else if (view === 'waterfall') _traceRenderWaterfall(d.spans || []);
+  else if (view === 'graph') _traceRenderGraph(d.agent_graph || {nodes: [], edges: []});
+}
+
+// MLflow-style merged tree + inline Gantt bars (the new default trace view).
+// Combines the nesting of _traceRenderTree with the time-aligned bars from
+// _traceRenderWaterfall so you can see hierarchy + timing in one place. The
+// top of the panel has a time axis (0s / 25% / 50% / 75% / 100% of trace
+// duration) all bars align to.
+function _traceRenderTreeGantt(spans, roots) {
+  var el = document.getElementById('trace-treegantt');
+  if (!el) return;
+  if (!spans.length) { el.innerHTML = '<div style="padding:18px;color:var(--text-muted);">' + t("app.no_spans_in_this_trace", null, "No spans in this trace.") + '</div>'; return; }
+
+  // Trace timeline = earliest start → latest (start + duration).
+  var t0 = Infinity, t1 = 0;
+  spans.forEach(function(s) {
+    var st = s.start_ms || 0;
+    if (st && st < t0) t0 = st;
+    t1 = Math.max(t1, st + (s.duration_ms || 0));
+  });
+  if (!isFinite(t0)) t0 = 0;
+  var total = Math.max(1, t1 - t0);
+
+  var byId = {}; spans.forEach(function(s){ byId[s.span_id] = s; });
+  var children = {};
+  spans.forEach(function(s) {
+    var p = s.parent_span_id;
+    if (p && byId[p]) (children[p] = children[p] || []).push(s);
+  });
+  Object.keys(children).forEach(function(k) {
+    children[k].sort(function(a, b){ return (a.start_ms || 0) - (b.start_ms || 0); });
+  });
+  var rootIds = (roots && roots.length)
+    ? roots
+    : spans.filter(function(s){ return !s.parent_span_id; }).map(function(s){ return s.span_id; });
+
+  if (spans.length > 500 && Object.keys(window._traceCollapsed).length === 0) {
+    Object.keys(children).forEach(function(k){ window._traceCollapsed[k] = true; });
+  }
+
+  // Time-axis labels: 0s, q1, q2, q3, total. Aligned to the same flex column
+  // the bars live in so the visual ticks line up exactly.
+  var axisLabels = [0, 0.25, 0.5, 0.75, 1].map(function(f) {
+    return '<span style="flex:0 0 0;position:relative;">'
+      + '<span style="position:absolute;left:-1px;top:0;font-size:10px;color:var(--text-muted);transform:translateX(' + (f === 0 ? '0' : f === 1 ? '-100%' : '-50%') + ');white-space:nowrap;">'
+      + _traceFmtDur(total * f) + '</span></span>';
+  });
+  // The bar column is `flex:1`; the ticks live in a 5-column grid above it.
+  var axisHtml = '<div style="display:flex;align-items:center;gap:8px;padding:0 8px 8px 8px;border-bottom:1px solid var(--border-secondary);margin-bottom:6px;font-size:10px;color:var(--text-muted);">'
+    + '<span style="width:260px;flex-shrink:0;text-transform:uppercase;letter-spacing:0.6px;font-weight:700;">Span</span>'
+    + '<span style="flex:1;position:relative;height:14px;">'
+      + '<div style="position:absolute;inset:0;display:flex;justify-content:space-between;align-items:flex-end;">'
+        + [0,0.25,0.5,0.75,1].map(function(f) {
+            var labelTransform = f === 0 ? '0' : f === 1 ? '-100%' : '-50%';
+            return '<span style="position:relative;font-size:10px;color:var(--text-muted);transform:translateX(' + labelTransform + ');white-space:nowrap;">' + _traceFmtDur(total * f) + '</span>';
+          }).join('')
+      + '</div>'
+    + '</span>'
+    + '<span style="width:60px;flex-shrink:0;text-align:right;text-transform:uppercase;letter-spacing:0.6px;font-weight:700;">Dur</span>'
+    + '<span style="width:54px;flex-shrink:0;text-align:right;text-transform:uppercase;letter-spacing:0.6px;font-weight:700;">Tok</span>'
+    + '<span style="width:60px;flex-shrink:0;text-align:right;text-transform:uppercase;letter-spacing:0.6px;font-weight:700;">Cost</span>'
+    + '</div>';
+  // (note: axisLabels variable above is unused — the inline expression above is
+  // the working version; kept the variable assignment for future styling tweaks.)
+  axisLabels; // silence linter (the value above is the live axis)
+
+  function row(s, depth) {
+    var color = _traceColor(s);
+    var isErr = s.status === 'error';
+    var active = window._traceActiveSpanId === s.span_id;
+    var left = total > 0 ? (((s.start_ms || 0) - t0) / total) * 100 : 0;
+    var width = total > 0 ? Math.max(0.6, ((s.duration_ms || 0) / total) * 100) : 0.6;
+    if (left + width > 100) width = Math.max(0.6, 100 - left);
+    var cost = _traceCost(s);
+    var costStr = cost ? '$' + (cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)) : '';
+    var tok = _traceTokens(s);
+    var tokStr = tok ? (tok / 1000).toFixed(1) + 'K' : '';
+    var bg = active ? 'rgba(99,102,241,0.12)' : (isErr ? 'rgba(239,68,68,0.06)' : '');
+    var hasKids = !!(children[s.span_id] || []).length;
+    var collapsed = !!window._traceCollapsed[s.span_id];
+    var toggleBtn = hasKids
+      ? '<span onclick="_traceGanttToggle(\'' + escHtml(s.span_id) + '\',event)" data-toggle-for="' + escHtml(s.span_id) + '" style="width:14px;flex-shrink:0;text-align:center;cursor:pointer;color:var(--text-muted);user-select:none;" title="Toggle children">' + (collapsed ? '▶' : '▼') + '</span>'
+      : '<span style="width:14px;flex-shrink:0;"></span>';
+    var h = '<div onclick="traceShowSpan(\'' + escHtml(s.span_id) + '\')" data-span-id="' + escHtml(s.span_id) + '" class="trace-row" '
+      + 'style="display:flex;align-items:center;gap:8px;padding:5px 8px;cursor:pointer;border-radius:4px;background:' + bg + ';" '
+      + 'onmouseover="if(!this.classList.contains(\'active\'))this.style.background=\'var(--bg-tertiary,#1e293b)\'" '
+      + 'onmouseout="this.style.background=\'' + bg + '\'">'
+      + '<span style="width:260px;flex-shrink:0;display:flex;align-items:center;gap:6px;min-width:0;">'
+        + '<span style="padding-left:' + (depth * 14) + 'px;"></span>'
+        + toggleBtn
+        + '<span style="width:9px;height:9px;border-radius:2px;background:' + color + ';flex-shrink:0;"></span>'
+        + '<span style="flex-shrink:0;font-size:11px;width:14px;text-align:center;">' + _traceIcon(s) + '</span>'
+        + '<span style="flex:1;min-width:0;font-size:12px;color:' + (isErr ? '#f87171' : 'var(--text-primary)') + ';white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + escHtml(s.name) + '">' + escHtml(s.name) + (isErr ? ' ⚠' : '') + '</span>'
+      + '</span>'
+      + '<span style="flex:1;position:relative;height:14px;background:var(--bg-primary);border-radius:3px;">'
+        + '<span style="position:absolute;left:' + left.toFixed(2) + '%;width:' + width.toFixed(2) + '%;top:2px;height:10px;background:' + color + ';border-radius:3px;min-width:2px;" title="' + _traceFmtDur(s.duration_ms) + '"></span>'
+      + '</span>'
+      + '<span style="width:60px;flex-shrink:0;text-align:right;font-size:11px;color:var(--text-muted);">' + _traceFmtDur(s.duration_ms) + '</span>'
+      + '<span style="width:54px;flex-shrink:0;text-align:right;font-size:11px;color:var(--text-muted);">' + tokStr + '</span>'
+      + '<span style="width:60px;flex-shrink:0;text-align:right;font-size:11px;color:var(--text-muted);">' + costStr + '</span>'
+      + '</div>';
+    if (hasKids) {
+      var kidHtml = '';
+      (children[s.span_id] || []).forEach(function(c){ kidHtml += row(c, depth + 1); });
+      h += '<div data-children-of="' + escHtml(s.span_id) + '" style="display:' + (collapsed ? 'none' : '') + ';">' + kidHtml + '</div>';
+    }
+    return h;
+  }
+  var body = '';
+  rootIds.forEach(function(rid){ if (byId[rid]) body += row(byId[rid], 0); });
+  el.innerHTML = axisHtml + body;
+}
+
+function _traceRenderWaterfall(spans) {
+  var el = document.getElementById('trace-waterfall');
+  if (!el) return;
+  if (!spans.length) { el.innerHTML = '<div style="padding:18px;color:var(--text-muted);">' + t("app.no_spans_in_this_trace", null, "No spans in this trace.") + '</div>'; return; }
+  var ordered = spans.slice().sort(function(a, b){ return (a.start_ms || 0) - (b.start_ms || 0); });
+  var t0 = ordered[0].start_ms || 0;
+  var t1 = 0;
+  ordered.forEach(function(s){ t1 = Math.max(t1, (s.start_ms || 0) + (s.duration_ms || 0)); });
+  var total = Math.max(1, t1 - t0);
+  var html = '<div style="min-width:680px;">';
+  ordered.forEach(function(s) {
+    var left = ((s.start_ms - t0) / total) * 100;
+    var width = Math.max(0.6, ((s.duration_ms || 0) / total) * 100);
+    if (left + width > 100) width = Math.max(0.6, 100 - left);
+    var color = _traceColor(s);
+    html += '<div onclick="traceShowSpan(\'' + escHtml(s.span_id) + '\')" style="display:flex;align-items:center;gap:8px;padding:3px 8px;cursor:pointer;border-radius:4px;" onmouseover="this.style.background=\'var(--bg-tertiary,#1e293b)\'" onmouseout="this.style.background=\'\'">'
+      + '<span style="width:230px;flex-shrink:0;font-size:12px;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;' + (s.is_subagent ? 'padding-left:14px;' : '') + '" title="' + escHtml(s.name) + '">' + escHtml(s.name) + '</span>'
+      + '<span style="flex:1;position:relative;height:16px;background:var(--bg-primary);border-radius:3px;">'
+        + '<span style="position:absolute;left:' + left.toFixed(2) + '%;width:' + width.toFixed(2) + '%;top:2px;height:12px;background:' + color + ';border-radius:3px;min-width:2px;" title="' + _traceFmtDur(s.duration_ms) + '"></span>'
+      + '</span>'
+      + '<span style="width:64px;flex-shrink:0;text-align:right;font-size:11px;color:var(--text-muted);">' + _traceFmtDur(s.duration_ms) + '</span>'
+      + '</div>';
+  });
+  html += '</div>';
+  el.innerHTML = html;
+}
+
+function _traceRenderTree(spans, roots) {
+  var el = document.getElementById('trace-tree');
+  if (!el) return;
+  if (!spans.length) { el.innerHTML = '<div style="padding:18px;color:var(--text-muted);">' + t("app.no_spans_in_this_trace", null, "No spans in this trace.") + '</div>'; return; }
+  var byId = {}; spans.forEach(function(s){ byId[s.span_id] = s; });
+  var children = {};
+  spans.forEach(function(s) {
+    var p = s.parent_span_id;
+    if (p && byId[p]) { (children[p] = children[p] || []).push(s); }
+  });
+  function row(s, depth) {
+    var color = _traceColor(s);
+    var isErr = s.status === 'error';
+    var cost = _traceCost(s);
+    var costStr = cost ? '$' + (cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)) : '';
+    var h = '<div onclick="traceShowSpan(\'' + escHtml(s.span_id) + '\')" style="display:flex;align-items:center;gap:8px;padding:4px 8px;cursor:pointer;border-radius:4px;' + (isErr ? 'background:rgba(239,68,68,0.08);' : '') + '" onmouseover="this.style.background=\'var(--bg-tertiary,#1e293b)\'" onmouseout="this.style.background=\'' + (isErr ? 'rgba(239,68,68,0.08)' : '') + '\'">'
+      + '<span style="padding-left:' + (depth * 16) + 'px;"></span>'
+      + '<span style="width:9px;height:9px;border-radius:2px;background:' + color + ';flex-shrink:0;"></span>'
+      + '<span style="flex-shrink:0;font-size:11px;width:14px;text-align:center;">' + _traceIcon(s) + '</span>'
+      + '<span style="flex:1;font-size:13px;color:' + (isErr ? '#f87171' : 'var(--text-primary)') + ';white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escHtml(s.name) + (isErr ? ' ⚠' : '') + '</span>'
+      + (_traceTokens(s) ? '<span style="font-size:11px;color:var(--text-muted);width:64px;text-align:right;">' + (_traceTokens(s) / 1000).toFixed(1) + 'K tok</span>' : '<span style="width:64px;"></span>')
+      + '<span style="font-size:11px;color:var(--text-muted);width:64px;text-align:right;">' + costStr + '</span>'
+      + '<span style="font-size:11px;color:var(--text-muted);width:60px;text-align:right;">' + _traceFmtDur(s.duration_ms) + '</span>'
+      + '</div>';
+    (children[s.span_id] || []).forEach(function(c){ h += row(c, depth + 1); });
+    return h;
+  }
+  var html = '';
+  (roots && roots.length ? roots : spans.filter(function(s){return !s.parent_span_id;}).map(function(s){return s.span_id;}))
+    .forEach(function(rid){ if (byId[rid]) html += row(byId[rid], 0); });
+  el.innerHTML = html || '<div style="padding:18px;color:var(--text-muted);">No span tree.</div>';
+}
+
+function _traceGanttToggle(spanId, ev) {
+  ev.stopPropagation();
+  window._traceCollapsed[spanId] = !window._traceCollapsed[spanId];
+  var d = window._traceData;
+  if (d) _traceRenderTreeGantt(d.spans || [], d.root_span_ids || []);
+}
+
+function _traceRenderGraph(graph) {
+  var el = document.getElementById('trace-graph');
+  if (!el) return;
+  var nodes = graph.nodes || [];
+  if (!nodes.length) { el.innerHTML = '<div style="padding:18px;color:var(--text-muted);">' + t("app.no_agents_in_this_trace", null, "No agents in this trace.") + '</div>'; return; }
+  var html = '<div style="display:flex;align-items:center;gap:0;flex-wrap:wrap;padding:20px;">';
+  nodes.forEach(function(n, i) {
+    var color = n.kind === 'subagent' ? '#f59e0b' : '#6366f1';
+    if (i > 0) {
+      html += '<span style="color:var(--text-muted);font-size:22px;margin:0 6px;">&rarr;</span>';
+    }
+    html += '<div style="border:2px solid ' + color + ';border-radius:10px;padding:12px 18px;background:' + color + '14;min-width:140px;">'
+      + '<div style="font-weight:700;font-size:14px;color:var(--text-primary);">' + escHtml(n.label) + '</div>'
+      + '<div style="font-size:11px;color:var(--text-muted);margin-top:4px;">' + (n.span_count || 0) + ' spans &middot; ' + ((n.tokens || 0) / 1000).toFixed(1) + 'K tok</div>'
+      + '</div>';
+  });
+  html += '</div>';
+  el.innerHTML = html;
+}
+
+// MLflow-style span-detail pane (right side of the split). The 5 tabs are
+// stable — they appear even when the OTel span row hasn't loaded yet, so the
+// UI doesn't flicker tab additions after the fetch. Each tab handles its own
+// empty state.
+var _TRACE_SPAN_TABS = ['chat', 'inputs', 'outputs', 'attributes', 'events'];
+
+function traceShowSpan(spanId) {
+  var d = window._traceData;
+  if (!d) return;
+  var s = (d.spans || []).find(function(x){ return x.span_id === spanId; });
+  if (!s) return;
+  var pane = document.getElementById('trace-span-pane');
+  if (!pane) return;
+  window._traceActiveSpanId = spanId;
+  if (!window._traceActiveTab || _TRACE_SPAN_TABS.indexOf(window._traceActiveTab) < 0) {
+    window._traceActiveTab = 'chat';
+  }
+  // Highlight the selected row in the tree + Gantt panel.
+  document.querySelectorAll('#trace-treegantt .trace-row').forEach(function(r) {
+    var on = r.dataset.spanId === spanId;
+    r.classList.toggle('active', on);
+    r.style.background = on ? 'rgba(99,102,241,0.12)' : '';
+  });
+
+  var isErr = s.status === 'error';
+  var cost = _traceCost(s), tok = _traceTokens(s);
+  function chip(label, val, color) {
+    return '<span style="background:var(--bg-primary);border:1px solid var(--border-secondary);border-radius:6px;padding:3px 9px;font-size:11px;color:' + (color || 'var(--text-secondary)') + ';"><span style="color:var(--text-muted);">' + label + '</span> ' + val + '</span>';
+  }
+  var chips = [
+    chip('kind', '<b style="color:' + _traceColor(s) + '">' + _traceIcon(s) + ' ' + escHtml(s.kind || '') + '</b>'),
+    chip('duration', _traceFmtDur(s.duration_ms)),
+  ];
+  if (isErr) chips.unshift(chip('status', '<b>error ⚠</b>', '#f87171'));
+  if (tok) chips.push(chip('tokens', (tok / 1000).toFixed(2) + 'K' + (s.rolled_tokens != null ? ' (incl. children)' : '')));
+  if (cost) chips.push(chip('cost', '$' + (cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)) + (s.rolled_cost != null ? ' (incl. children)' : '')));
+  if (s.model) chips.push(chip('model', escHtml(s.model)));
+  if (s.tool) chips.push(chip('tool', escHtml(s.tool)));
+
+  // Render fixed 5-tab structure (Chat / Inputs / Outputs / Attributes / Events).
+  // Tabs are always present — empty state is handled per-renderer.
+  pane.innerHTML =
+    '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;gap:8px;">'
+    + '<div style="font-weight:700;font-size:14px;color:' + (isErr ? '#f87171' : 'var(--text-primary)') + ';flex:1;min-width:0;word-break:break-word;">' + _traceIcon(s) + ' ' + escHtml(s.name) + '</div>'
+    + '</div>'
+    + '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;">' + chips.join('') + '</div>'
+    + '<div id="span-tabs-bar" style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--border-primary);">'
+    + _TRACE_SPAN_TABS.map(function(t) { return _traceSpanTabBtn(t, t === window._traceActiveTab); }).join('')
+    + '</div>'
+    + '<div id="span-tab-content"></div>';
+
+  // Render the active tab now; load the OTel row in the background for the
+  // input/output/attributes/events tabs that need it. Cache so re-clicking
+  // is instant.
+  _traceSpanRenderActive(s);
+  if (!window._traceSpanCache[spanId]) {
+    fetch('/api/local/spans/' + encodeURIComponent(spanId))
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        if (data && data.available && data.span) {
+          window._traceSpanCache[spanId] = data.span;
+          if (window._traceActiveSpanId === spanId) _traceSpanRenderActive(s);
+        }
+      })
+      .catch(function() {});
+  }
+}
+
+function _traceSpanTabBtn(name, active) {
+  return '<button onclick="_traceSpanSwitchTab(\'' + name + '\')" data-tab="' + name
+    + '" style="padding:3px 11px;border-radius:4px;border:1px solid ' + (active ? '#6366f1' : 'var(--border-secondary)') + ';background:' + (active ? '#6366f1' : 'transparent') + ';color:' + (active ? '#fff' : 'var(--text-muted)') + ';font-size:11px;cursor:pointer;">'
+    + name.charAt(0).toUpperCase() + name.slice(1) + '</button>';
+}
+
+function _traceSpanSwitchTab(tab) {
+  window._traceActiveTab = tab;
+  var bar = document.getElementById('span-tabs-bar');
+  if (bar) bar.querySelectorAll('button').forEach(function(b) {
+    var on = b.dataset.tab === tab;
+    b.style.background = on ? '#6366f1' : 'transparent';
+    b.style.color = on ? '#fff' : 'var(--text-muted)';
+    b.style.borderColor = on ? '#6366f1' : 'var(--border-secondary)';
+  });
+  var d = window._traceData;
+  var s = d && (d.spans || []).find(function(x) { return x.span_id === window._traceActiveSpanId; });
+  if (s) _traceSpanRenderActive(s);
+}
+
+// Dispatcher: routes the active tab to the matching renderer. Chat reads the
+// span's semantic content (works without the OTel BLOB row); Inputs / Outputs
+// / Attributes / Events read from the full OTel span row when available.
+function _traceSpanRenderActive(s) {
+  var t = window._traceActiveTab || 'chat';
+  if (t === 'chat')           _traceSpanRenderChat(s);
+  else if (t === 'inputs')    _traceSpanRenderBlob('input');
+  else if (t === 'outputs')   _traceSpanRenderBlob('output');
+  else if (t === 'attributes')_traceSpanRenderBlob('attributes');
+  else if (t === 'events')    _traceSpanRenderBlob('events');
+}
+
+// MLflow-style Chat tab — renders the conversation turn at this span as a
+// friendly user/assistant view. Falls back to the trace summary's
+// derived first-prompt + the span's captured detail/output when the OTel
+// BLOB row doesn't carry rich message content. Always shows SOMETHING so
+// the tab never reads empty for real spans.
+function _traceSpanRenderChat(s) {
+  var content = document.getElementById('span-tab-content');
+  if (!content) return;
+  var full = window._traceSpanCache[window._traceActiveSpanId];
+  var msgs = _traceExtractMessages(s, full);
+  if (!msgs.length) {
+    content.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:6px;">No conversation content for this span. Try <b>' + t("app.inputs", null, "Inputs") + '</b> / <b>' + t("app.outputs", null, "Outputs") + '</b> for the raw payload.</div>';
+    return;
+  }
+  var html = '<div style="display:flex;flex-direction:column;gap:10px;max-height:520px;overflow:auto;padding:2px;">';
+  msgs.forEach(function(m) {
+    var isUser = m.role === 'user';
+    var isAssistant = m.role === 'assistant';
+    var bg = isUser ? 'rgba(99,102,241,0.10)' : isAssistant ? 'var(--bg-primary)' : 'rgba(245,158,11,0.08)';
+    var border = isUser ? '#6366f1' : isAssistant ? 'var(--border-secondary)' : '#f59e0b';
+    var label = isUser ? 'User' : isAssistant ? 'Assistant' : (m.role || 'system');
+    html += '<div style="background:' + bg + ';border:1px solid ' + border + ';border-left:3px solid ' + border + ';border-radius:6px;padding:8px 10px;">'
+      + '<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:var(--text-muted);margin-bottom:4px;">' + escHtml(label) + '</div>'
+      + '<div style="font-size:13px;color:var(--text-primary);white-space:pre-wrap;word-break:break-word;line-height:1.4;">' + escHtml(m.text || '') + '</div>'
+      + '</div>';
+  });
+  html += '</div>';
+  content.innerHTML = html;
+}
+
+// Walk a span + its OTel BLOB row to extract {role,text}[] for the Chat view.
+// Tries (in order): full.input/output message arrays, the span's detail +
+// output fields (populated by _build_spans for synthetic-from-events spans),
+// and finally the trace's derived first-prompt title.
+function _traceExtractMessages(s, full) {
+  var out = [];
+  function add(role, text) {
+    if (text == null) return;
+    var t = (typeof text === 'string') ? text : JSON.stringify(text);
+    t = t.trim();
+    if (t) out.push({role: role, text: t});
+  }
+  function walk(val, fallbackRole) {
+    if (val == null) return;
+    if (Array.isArray(val)) { val.forEach(function(x) { walk(x, fallbackRole); }); return; }
+    if (typeof val === 'string') { add(fallbackRole, val); return; }
+    if (typeof val !== 'object') return;
+    var role = val.role || fallbackRole;
+    // Anthropic-style content list: [{type:'text',text:'...'},{type:'tool_use',...}]
+    if (Array.isArray(val.content)) {
+      val.content.forEach(function(b) {
+        if (b && typeof b === 'object' && typeof b.text === 'string') add(role, b.text);
+        else if (typeof b === 'string') add(role, b);
+      });
+      return;
+    }
+    if (typeof val.content === 'string') { add(role, val.content); return; }
+    if (typeof val.text === 'string')    { add(role, val.text); return; }
+    if (val.message)                     { walk(val.message, role); return; }
+    if (val.messages)                    { walk(val.messages, role); return; }
+  }
+  // Agent-root spans (invoke_agent) are CONTAINERS with empty own detail — the
+  // user prompt lives on a child `prompt` span and the assistant reply on a
+  // child `chat`/llm span's detail. Aggregate the whole subtree FIRST so the
+  // Chat tab shows the full user -> assistant(+tools) conversation. (Bug:
+  // clicking "invoke_agent main" showed only the user prompt, never the reply
+  // — the trace-title fallback added the prompt before this could run, so it
+  // must come before the full/title fallbacks and win when it yields content.)
+  if (s && s.kind === 'agent'
+      && window._traceData && Array.isArray(window._traceData.spans)) {
+    var _kids = {};
+    window._traceData.spans.forEach(function(x) {
+      if (x.parent_span_id) (_kids[x.parent_span_id] = _kids[x.parent_span_id] || []).push(x);
+    });
+    (function _collect(id) {
+      (_kids[id] || []).slice()
+        .sort(function(a, b) { return (a.start_ms || 0) - (b.start_ms || 0); })
+        .forEach(function(c) {
+          if (c.kind === 'prompt') add('user', c.detail);
+          else if (c.kind === 'llm') add('assistant', c.detail);
+          else if (c.kind === 'tool') {
+            if (c.detail) add('tool', (c.tool ? c.tool + ': ' : '') + c.detail);
+            if (c.output) add('tool_result', c.output);
+          }
+          _collect(c.span_id);
+        });
+    })(s.span_id);
+    if (out.length) return out;  // aggregated conversation wins for agent spans
+  }
+  if (full) { walk(full.input, 'user'); walk(full.output, 'assistant'); }
+  // Span-level captured detail + output (set by _build_spans). For tool
+  // spans, detail is the tool input and output is the tool_result content.
+  if (!out.length && s) {
+    var role = s.kind === 'llm' ? 'assistant'
+             : s.kind === 'prompt' ? 'user'
+             : s.kind === 'tool' ? 'tool' : 'system';
+    if (s.detail) add(role, s.detail);
+    if (s.output) add('tool_result', s.output);
+  }
+  // Last resort: the trace's derived first-prompt title.
+  if (!out.length) {
+    var t = (window._traceData && window._traceData.summary && window._traceData.summary.title) || '';
+    if (t) add('user', t);
+  }
+  return out;
+}
+
+function _traceSpanRenderBlob(blobKey) {
+  var content = document.getElementById('span-tab-content');
+  if (!content) return;
+  var d = window._traceData;
+  var s = d && (d.spans || []).find(function(x) { return x.span_id === window._traceActiveSpanId; });
+  var full = window._traceSpanCache[window._traceActiveSpanId];
+  // Pick a value: OTel BLOB row first; otherwise fall back to the
+  // synthetic-span fields populated by _build_spans. This is what stops the
+  // "Loading…" forever state for spans that aren't in the OTel spans table.
+  var val = null;
+  if (full && full[blobKey] != null) val = full[blobKey];
+  else if (s) {
+    if (blobKey === 'input' && s.detail) val = s.detail;
+    else if (blobKey === 'output' && s.output) val = s.output;
+    else if (blobKey === 'attributes') {
+      // Synthesise an attributes view from the lightweight span fields.
+      val = {
+        name: s.name, kind: s.kind, event_type: s.event_type,
+        model: s.model || null, tool: s.tool || null,
+        tokens: s.tokens || 0, cost: s.cost || 0,
+        duration_ms: s.duration_ms || 0, status: s.status,
+        is_subagent: !!s.is_subagent,
+        rolled_tokens: s.rolled_tokens != null ? s.rolled_tokens : null,
+        rolled_cost:   s.rolled_cost   != null ? s.rolled_cost   : null,
+      };
+    }
+  }
+  if (val == null) {
+    var hint = blobKey === 'events'
+      ? 'This span has no nested timeline events. Tool spans roll up here as children in the tree on the left.'
+      : 'No ' + escHtml(blobKey) + ' captured for this synthetic span. Try the <b>Chat</b> tab — it falls back to the span\'s detail when raw I/O isn\'t recorded.';
+    content.innerHTML = '<div style="color:var(--text-muted);font-size:12px;line-height:1.45;">' + hint + '</div>';
+    return;
+  }
+  var str = (typeof val === 'string') ? val : JSON.stringify(val, null, 2);
+  window._traceSpanCopyBuf = str;
+  content.innerHTML =
+    '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">'
+    + '<input type="text" placeholder="Filter keys…" oninput="_traceSpanFilter(this.value,\'' + escHtml(blobKey) + '\')" style="padding:3px 8px;border-radius:4px;border:1px solid var(--border-secondary);background:var(--bg-primary);color:var(--text-primary);font-size:11px;flex:1;max-width:200px;">'
+    + '<button onclick="try{navigator.clipboard.writeText(window._traceSpanCopyBuf)}catch(e){}" style="padding:3px 10px;border-radius:4px;border:1px solid var(--border-secondary);background:transparent;color:var(--text-muted);font-size:11px;cursor:pointer;white-space:nowrap;">Copy JSON</button>'
+    + '</div>'
+    + '<pre id="span-blob-pre" style="white-space:pre-wrap;word-break:break-word;font-size:12px;color:var(--text-secondary);margin:0;max-height:480px;overflow:auto;background:var(--bg-primary);border:1px solid var(--border-secondary);border-radius:6px;padding:8px 10px;">' + escHtml(str) + '</pre>';
+}
+
+function _traceSpanFilter(query, blobKey) {
+  var pre = document.getElementById('span-blob-pre');
+  if (!pre) return;
+  var full = window._traceSpanCache[window._traceActiveSpanId];
+  if (!full) return;
+  var val = full[blobKey];
+  if (val == null) return;
+  var str = (typeof val === 'string') ? val : JSON.stringify(val, null, 2);
+  if (!query) { pre.textContent = str; return; }
+  var q = query.toLowerCase();
+  pre.textContent = str.split('\n').filter(function(l) { return l.toLowerCase().indexOf(q) !== -1; }).join('\n') || '(no matches)';
 }
 
 // Entry point called by nav switchTab + loadAll bootstrap.
@@ -5983,7 +12097,7 @@ async function loadMemory() {
 async function _loadMemoryAllFiles() {
   if (window.CLOUD_MODE) {
     var el = document.getElementById('memory-list');
-    if (el) el.innerHTML = '<div style="color:var(--text-secondary);padding:24px;text-align:center;font-size:13px;">Memory files are stored locally on the agent machine and are not synced to cloud.</div>';
+    if (el) el.innerHTML = '<div style="color:var(--text-secondary);padding:24px;text-align:center;font-size:13px;">' + t("app.memory_files_are_stored_locally_on_the_agent_machi", null, "Memory files are stored locally on the agent machine and are not synced to cloud.") + '</div>';
     return;
   }
   loadMemoryAnalytics();
@@ -5996,7 +12110,7 @@ async function _loadMemoryAllFiles() {
   if (!document.getElementById('mem-ide-css')) {
     var cs = document.createElement('style');
     cs.id = 'mem-ide-css';
-    cs.textContent = '.mem-file:hover,.mem-file.active{background:var(--bg-tertiary,#1e293b)!important}';
+    cs.textContent = t("app.mem_file_hover_mem_file_active_background_var_bg_t", null, ".mem-file:hover,.mem-file.active{background:var(--bg-tertiary,#1e293b)!important}");
     document.head.appendChild(cs);
   }
   // IDE layout: sidebar + content viewer
@@ -6054,13 +12168,13 @@ async function _loadMemoryAllFiles() {
         '<pre style="margin:0;padding:16px;font-family:monospace;font-size:12px;line-height:1.6;color:var(--text-secondary);white-space:pre-wrap;word-break:break-word">Loading...</pre>';
       try {
         var d = await fetch('/api/file?path=' + encodeURIComponent(p)).then(function(r) { return r.json(); });
-        if (d.error) { viewer.querySelector('pre').textContent = 'Error: ' + d.error; return; }
+        if (d.error) { viewer.querySelector('pre').textContent = t("app.error", null, "Error: ") + d.error; return; }
         var content = d.content || '';
         viewer.innerHTML = '<div style="padding:8px 16px;border-bottom:1px solid var(--border-primary);display:flex;align-items:center;gap:8px;background:var(--bg-secondary);position:sticky;top:0;z-index:1">' +
           '<span style="font-size:12px">📝</span><span style="font-size:12px;font-weight:600;color:var(--text-primary)">' + escHtml(p) + '</span>' +
           '<span style="margin-left:auto;font-size:10px;color:var(--text-muted)">' + content.length + ' chars</span></div>' +
           '<pre style="margin:0;padding:16px;font-family:monospace;font-size:12px;line-height:1.6;color:var(--text-secondary);white-space:pre-wrap;word-break:break-word">' + escHtml(content) + '</pre>';
-      } catch(e) { viewer.querySelector('pre').textContent = 'Failed: ' + e.message; }
+      } catch(e) { viewer.querySelector('pre').textContent = t("app.failed", null, "Failed: ") + e.message; }
     };
   });
 }
@@ -6127,7 +12241,7 @@ async function _loadGatewayHealthSparkline() {
     rows = [];
   }
   if (!Array.isArray(rows) || rows.length === 0) {
-    el.innerHTML = '<div style="font-size:10px;color:var(--text-muted);font-style:italic;opacity:0.7;">Sparkline available after daemon captures 24h of samples.</div>';
+    el.innerHTML = '<div style="font-size:10px;color:var(--text-muted);font-style:italic;opacity:0.7;">' + t("app.sparkline_available_after_daemon_captures_24h_of_s", null, "Sparkline available after daemon captures 24h of samples.") + '</div>';
     return;
   }
   // Only keep rows with a numeric rss_mb — daemon may have written
@@ -6137,7 +12251,7 @@ async function _loadGatewayHealthSparkline() {
     return r && typeof r.rss_mb === 'number';
   });
   if (pts.length === 0) {
-    el.innerHTML = '<div style="font-size:10px;color:var(--text-muted);font-style:italic;opacity:0.7;">Sparkline available after daemon captures 24h of samples.</div>';
+    el.innerHTML = '<div style="font-size:10px;color:var(--text-muted);font-style:italic;opacity:0.7;">' + t("app.sparkline_available_after_daemon_captures_24h_of_s", null, "Sparkline available after daemon captures 24h of samples.") + '</div>';
     return;
   }
   var W = 240, H = 36, pad = 2;
@@ -6182,6 +12296,9 @@ async function _loadGatewayHealthSparkline() {
 async function loadSystemHealth() {
   try {
     var d = await fetchJsonWithTimeout('/api/system-health', 18000);
+    // Connector liveness: surface a 'down' inbound channel loudly (incident:
+    // a channel went deaf ~37h with no alarm). Driven by the same payload.
+    try { _renderConnectorBanner(d.connector_liveness); } catch(e) {}
     var services = Array.isArray(d.services) ? d.services : [];
     var channels = Array.isArray(d.channels) ? d.channels : [];
     var disks = Array.isArray(d.disks) ? d.disks : [];
@@ -6353,21 +12470,40 @@ async function loadSystemHealth() {
       var ciWrap = document.getElementById('sh-channel-ingest-wrap');
       var ciEl = document.getElementById('sh-channel-ingest');
       if (ciEl && ciWrap) {
+        // Always show the wrap — even empty state is diagnostic (#1321).
+        ciWrap.style.display = '';
+        var emoji = function(p) {
+          return p === 'telegram'        ? '✈️'
+               : p === 'signal'         ? '📡'
+               : p === 'slack'          ? '💼'
+               : p === 'discord'        ? '🎮'
+               : p === 'whatsapp'       ? '🟢'
+               : p === 'imessage'       ? '🍎'
+               : p === 'webchat'        ? '🌐'
+               : p === 'irc'            ? '#️⃣'
+               : p === 'googlechat'     ? '💬'
+               : p === 'bluebubbles'    ? '🫧'
+               : p === 'msteams'        ? '🏢'
+               : p === 'tui'            ? '⌨️'
+               : p === 'matrix'         ? '🔷'
+               : p === 'mattermost'     ? '📢'
+               : p === 'line'           ? '🟩'
+               : p === 'nostr'          ? '⚡'
+               : p === 'twitch'         ? '🟣'
+               : p === 'feishu'         ? '🪶'
+               : p === 'zalo'           ? '🔵'
+               : p === 'tlon'           ? '🌊'
+               : p === 'synology-chat'  ? '🖥️'
+               : p === 'nextcloud-talk' ? '☁️'
+               : '📨';
+        };
         if (ingest.length === 0) {
-          ciWrap.style.display = 'none';
+          ciEl.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:4px 0;">'
+            + 'No channel activity yet. '
+            + '<a href="#" onclick="switchTab(\'flow\');return false;" '
+            + 'style="color:var(--accent-primary,#3b82f6);text-decoration:underline;">Connect a channel →</a>'
+            + '</div>';
         } else {
-          ciWrap.style.display = '';
-          var emoji = function(p) {
-            return p === 'telegram' ? '✈️'
-                 : p === 'signal'   ? '📡'
-                 : p === 'slack'    ? '💬'
-                 : p === 'discord'  ? '🎮'
-                 : p === 'whatsapp' ? '🟢'
-                 : p === 'imessage' ? '🍎'
-                 : p === 'webchat'  ? '🌐'
-                 : p === 'irc'      ? '#'
-                 : '📨';
-          };
           var fmtMins = function(m) {
             if (m == null) return 'never';
             if (m < 1) return 'just now';
@@ -6376,6 +12512,7 @@ async function loadSystemHealth() {
             return Math.floor(m/1440) + 'd ago';
           };
           var cihtml = '';
+          var silentCount = 0;
           ingest.forEach(function(row) {
             var mins = row.mins_ago;
             // Hot < 10m → green, warm < 60m → amber, stale → muted.
@@ -6383,13 +12520,29 @@ async function loadSystemHealth() {
                          : (mins != null && mins < 60) ? '#d97706'
                          : '#6b7280';
             var border = (mins != null && mins < 10) ? 'rgba(22,163,74,0.3)' : 'var(--border-secondary)';
+            // Amber (≥60m) or never → counts toward the silent-channel alert CTA (#1322)
+            if (mins == null || mins >= 60) silentCount++;
             cihtml += '<div title="total ' + row.total + ' (' + (row.msg_in||0) + ' in / ' + (row.msg_out||0) + ' out)" '
-              + 'style="display:flex;align-items:center;gap:7px;padding:7px 12px;background:var(--bg-secondary);border-radius:8px;border:1px solid ' + border + ';font-size:12px;margin-bottom:4px;">'
+              + 'onclick="switchTab(\'flow\')" '
+              + 'onmouseover="this.style.background=\'var(--bg-primary)\'" '
+              + 'onmouseout="this.style.background=\'var(--bg-secondary)\'" '
+              + 'style="display:flex;align-items:center;gap:7px;padding:7px 12px;background:var(--bg-secondary);'
+              + 'border-radius:8px;border:1px solid ' + border + ';font-size:12px;margin-bottom:4px;cursor:pointer;">'
               + '<span style="width:9px;height:9px;border-radius:50%;background:' + dotColor + ';flex-shrink:0;display:inline-block;"></span>'
               + emoji(row.provider) + ' <span style="font-weight:600;color:var(--text-primary);">' + escHtml(row.provider) + '</span>'
               + '<span style="color:var(--text-muted);font-size:11px;margin-left:auto;">' + fmtMins(mins) + ' &middot; ' + row.total + ' total</span>'
               + '</div>';
           });
+          // Footer CTA at the silent-channel alert moment (#1322).
+          // Surfaces the Cloud-Pro alert pitch at the exact moment the operator
+          // sees the signal — without this they read "silent" and have no next step.
+          if (silentCount > 0) {
+            cihtml += '<div style="font-size:11px;color:#d97706;padding:6px 10px;border-radius:6px;'
+              + 'background:rgba(217,119,6,0.08);border:1px solid rgba(217,119,6,0.2);margin-top:4px;">'
+              + '&#x26A0;&#xFE0F; ' + silentCount + ' channel' + (silentCount > 1 ? 's' : '') + ' silent &gt;1h &middot; '
+              + '<a href="#" onclick="switchTab(\'alerts\');return false;" '
+              + 'style="color:#d97706;font-weight:600;text-decoration:underline;">Set up alerts &rarr;</a></div>';
+          }
           ciEl.innerHTML = cihtml;
         }
       }
@@ -6653,7 +12806,13 @@ async function _loadReliabilityWidget() {
 function startSystemHealthRefresh() {
   loadSystemHealth();
   if (window._sysHealthTimer) clearInterval(window._sysHealthTimer);
-  window._sysHealthTimer = visibilitySetInterval(loadSystemHealth, 30000);
+  // Tab-scoped: loadSystemHealth fans out to system-health + delegation-tree
+  // + handler-latency + reliability (4 endpoints) and is an Overview widget.
+  // Only refresh on Overview; it was firing all 4 on every tab.
+  window._sysHealthTimer = visibilitySetInterval(function() {
+    if (window._cmCurrentTab && window._cmCurrentTab !== 'overview') return;
+    loadSystemHealth();
+  }, 30000);
 }
 
 async function loadDiagnostics() {
@@ -6664,7 +12823,7 @@ async function loadDiagnostics() {
   // URLs, which the browser logs as console errors on every System Health
   // refresh. Skip the call entirely and render a static "local-only" note.
   if (window.CLOUD_MODE) {
-    el.innerHTML = '<div style="color:var(--text-muted);">Diagnostics are local-only — open the dashboard on the host to inspect detected config.</div>';
+    el.innerHTML = '<div style="color:var(--text-muted);">' + t("app.diagnostics_are_local_only_open_the_dashboard_on_t", null, "Diagnostics are local-only — open the dashboard on the host to inspect detected config.") + '</div>';
     return true;
   }
   try {
@@ -6694,7 +12853,7 @@ async function loadDiagnostics() {
     return true;
   } catch (e) {
     console.warn('diagnostics load failed', e);
-    el.innerHTML = '<div style="color:var(--text-muted);">Unable to load diagnostics right now</div>';
+    el.innerHTML = '<div style="color:var(--text-muted);">' + t("app.unable_to_load_diagnostics_right_now", null, "Unable to load diagnostics right now") + '</div>';
     return false;
   }
 }
@@ -6707,7 +12866,7 @@ function copyDiagnostics() {
   function done() {
     if (!btn) return;
     var old = btn.textContent;
-    btn.textContent = 'Copied';
+    btn.textContent = t("app.copied", null, "Copied");
     setTimeout(function(){ btn.textContent = old || '📋 Copy'; }, 1200);
   }
   if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -6800,6 +12959,32 @@ async function loadSandboxStatus() {
   }
 }
 
+// ===== 30-day Session Activity Heatmap (#875) =====
+async function loadActivityHeatmap() {
+  var card = document.getElementById('activity-heatmap-card');
+  var grid = document.getElementById('activity-heatmap-grid');
+  if (!card || !grid) return;
+  var data;
+  try { data = await fetchJsonWithTimeout('/api/activity-heatmap', 5000); } catch(e) { return; }
+  var days = (data && data.days) || [];
+  if (!days.length) return;
+  var maxSessions = Math.max.apply(null, days.map(function(d){ return d.sessions || 0; }));
+  var shades = ['#12122a','#1a3a2a','#2a6a3a','#4a9a2a','#6adb3a'];
+  var html = '';
+  days.forEach(function(day) {
+    var s = day.sessions || 0;
+    var idx = (maxSessions > 0 && s > 0) ? Math.min(4, Math.ceil(s / maxSessions * 4)) : 0;
+    var tooltip = day.label + ': ' + s + ' session' + (s !== 1 ? 's' : '')
+      + ', ' + (day.tokens || 0).toLocaleString() + ' tokens'
+      + (day.cost > 0 ? ', $' + day.cost.toFixed(4) : '');
+    html += '<div class="heatmap-cell" style="background:' + shades[idx] + ';" title="' + tooltip + '"></div>';
+  });
+  grid.innerHTML = html;
+  var legend = document.getElementById('activity-heatmap-legend');
+  if (legend) legend.innerHTML = 'Less <div class="heatmap-legend-cell" style="background:#12122a"></div><div class="heatmap-legend-cell" style="background:#1a3a2a"></div><div class="heatmap-legend-cell" style="background:#2a6a3a"></div><div class="heatmap-legend-cell" style="background:#4a9a2a"></div><div class="heatmap-legend-cell" style="background:#6adb3a"></div> More';
+  card.style.display = '';
+}
+
 // ===== Activity Heatmap =====
 var _heatmapDays = 7;
 async function loadHeatmap(days) {
@@ -6834,47 +13019,300 @@ async function loadHeatmap(days) {
     if (legend) legend.innerHTML = 'Less <div class="heatmap-legend-cell" style="background:#12122a"></div><div class="heatmap-legend-cell" style="background:#1a3a2a"></div><div class="heatmap-legend-cell" style="background:#2a6a3a"></div><div class="heatmap-legend-cell" style="background:#4a9a2a"></div><div class="heatmap-legend-cell" style="background:#6adb3a"></div> More';
   } catch(e) {
     var grid2 = document.getElementById('heatmap-grid');
-    if (grid2) grid2.innerHTML = '<span style="color:#555">No activity data</span>';
+    if (grid2) grid2.innerHTML = '<span style="color:#555">' + t("app.no_activity_data", null, "No activity data") + '</span>';
   }
 }
 
+// ===== Efficiency grade + savings ideas =====
+// Design spec: .claude/ux_audit/DESIGN_SPEC.md (§1a chip, §1b card, §5 addendum).
+// One shared fetch feeds BOTH the overview hero chip and the Cost-tab card
+// (perf budget: never two pollers for one blob) — 60s TTL + in-flight dedup,
+// keyed by the runtime filter so a scoped read is never satisfied with
+// node-wide data (FLYWHEEL §1c). Every number comes precomputed from the
+// daemon's `efficiency` slice (/api/efficiency locally, the snapshot slice on
+// cloud); nothing is derived client-side from runtimeSummary, which carries
+// no cache fields.
+window._cmEff = { data: undefined, rt: null, ts: 0, cbs: null };
+function _cmLoadEfficiency(cb) {
+  var rt = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+  var c = window._cmEff;
+  if (c.rt === rt && c.data !== undefined && (Date.now() - c.ts) < 60000) { if (cb) cb(c.data); return; }
+  if (c.cbs && c.rt === rt) { if (cb) c.cbs.push(cb); return; }
+  c.cbs = cb ? [cb] : []; c.rt = rt; c.data = undefined;
+  var url = '/api/efficiency' + (rt && rt !== 'all' ? '?runtime=' + encodeURIComponent(rt) : '');
+  fetch(url).then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (j) { c.data = j; c.ts = Date.now(); var cbs = c.cbs || []; c.cbs = null; cbs.forEach(function (f) { try { f(j); } catch (e) {} }); })
+    .catch(function () { c.data = null; c.ts = Date.now(); var cbs = c.cbs || []; c.cbs = null; cbs.forEach(function (f) { try { f(null); } catch (e) {} }); });
+}
+var _CM_EFF_COLORS = { A: '#22c55e', B: '#4ade80', C: '#f59e0b', D: '#ef4444', F: '#dc2626' };
+function _cmEffTotalSavings(eff) {
+  var s = 0; ((eff && eff.actions) || []).forEach(function (a) { s += Number(a.savings_monthly_usd) || 0; });
+  return s;
+}
+// Trust gate (spec §1a): a grade renders ONLY from a present, sufficient slice
+// with a nonzero projected cost. Otherwise nothing — never a placeholder grade.
+function _cmEffUsable(eff) {
+  return !!(eff && !eff.insufficient_data && eff.grade && Number(eff.projected_monthly_cost_usd) > 0);
+}
+function _cmEffScopeLine(rt) {
+  return (rt && rt !== 'all')
+    ? _cmRuntimeLabel(rt) + ' ' + t('efficiency.scope_only', null, 'only') + '.'
+    : t('efficiency.scope_all', null, 'All agents on this machine.');
+}
+function _cmEffBadgeHtml(grade, px) {
+  var col = _CM_EFF_COLORS[grade] || 'var(--text-muted)';
+  var solid = grade === 'F';
+  return '<span style="display:inline-block;min-width:' + Math.round(px * 1.3) + 'px;text-align:center;padding:1px 6px;border-radius:6px;font-weight:700;font-size:' + px + 'px;line-height:1.4;'
+    + (solid ? 'background:' + col + ';color:#fff;' : 'border:1.5px solid ' + col + ';color:' + col + ';')
+    + '">' + grade + '</span>';
+}
+function _cmEffChipHtml(eff) {
+  if (!_cmEffUsable(eff)) return '';
+  var rt = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+  var tip = t('efficiency.tooltip', null, 'A to F score of how much of your spend does useful work: how often your agent reuses what it already read, how much history each reply carries, and whether saved work pays for itself.')
+    + ' ' + _cmEffScopeLine(rt);
+  var save = Math.round(_cmEffTotalSavings(eff));
+  return '<a href="#" title="' + escHtml(tip) + '" '
+    + 'onclick="switchTab(\'usage\');setTimeout(function(){var el=document.getElementById(\'efficiency-card\');if(el&&el.scrollIntoView)el.scrollIntoView({behavior:\'smooth\'});},400);return false;" '
+    + 'style="text-decoration:none;color:var(--text-secondary);">'
+    + '🎯 ' + t('efficiency.label', null, 'Efficiency') + ' ' + _cmEffBadgeHtml(eff.grade, 13)
+    + (save >= 1 ? ' · ' + t('efficiency.chip_save', null, 'save about') + ' $' + save + '/mo' : '')
+    + '</a>';
+}
+function _cmEffFmtTokens(n) {
+  n = Number(n) || 0;
+  if (n >= 1000000) return (n / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
+  if (n >= 1000) return Math.round(n / 1000) + 'K';
+  return String(Math.round(n));
+}
+// Maps a slice action id -> icon + i18n stem. Copy lives in en.json
+// (efficiency.idea_*); the backend ships numbers only, never copy.
+var _CM_EFF_IDEAS = {
+  model_downgrade: { icon: '🔁', stem: 'model', evidenceTab: 'models' },
+  context_trim: { icon: '✂️', stem: 'ctx', evidenceTab: 'context-economics' },
+  cache_warm: { icon: '♻️', stem: 'reread', evidenceTab: 'context-economics' },
+};
+function _cmEffIdeaRowHtml(a) {
+  var m = _CM_EFF_IDEAS[a.id];
+  if (!m) return '';
+  var d = a.data || {};
+  var vars = {
+    model: a.model || d.model || 'your main model',
+    n: (d.calls != null ? d.calls : 'several'),
+    target: d.target_model || 'a smaller model',
+  };
+  var save = Math.max(1, Math.round(Number(a.savings_monthly_usd) || 0));
+  var title = t('efficiency.idea_' + m.stem + '_title', null, '');
+  var finding = t('efficiency.idea_' + m.stem + '_finding', vars, '');
+  var how = t('efficiency.idea_' + m.stem + '_how', vars, '');
+  return '<div style="display:flex;gap:10px;align-items:flex-start;padding:10px 0;border-top:1px solid var(--border-primary,#1f2937);">'
+    + '<span style="flex-shrink:0;font-size:15px;">' + m.icon + '</span>'
+    + '<div style="flex:1;min-width:0;">'
+      + '<div style="font-size:14px;font-weight:600;color:var(--text-primary);">' + escHtml(title) + '</div>'
+      + '<div style="font-size:12px;color:var(--text-secondary);margin-top:2px;">' + escHtml(finding) + '</div>'
+      + '<details style="margin-top:4px;"><summary style="cursor:pointer;font-size:12px;color:#3b82f6;">' + escHtml(t('efficiency.how', null, 'How')) + '</summary>'
+        + '<div style="font-size:12px;color:var(--text-secondary);padding:6px 0 0 2px;">' + escHtml(how)
+        + ' <a href="#" onclick="switchTab(\'' + m.evidenceTab + '\');return false;" style="color:#3b82f6;text-decoration:none;">' + escHtml(t('efficiency.evidence', null, 'See the evidence')) + ' →</a></div>'
+      + '</details>'
+    + '</div>'
+    + '<div style="flex-shrink:0;font-size:13px;font-weight:700;color:#22c55e;white-space:nowrap;">' + escHtml(t('efficiency.save_mo', { amt: '$' + save }, 'save about $' + save + '/mo')) + '</div>'
+    + '</div>';
+}
+function renderEfficiencyCard() {
+  var card = document.getElementById('efficiency-card');
+  if (!card) return;
+  _cmLoadEfficiency(function (eff) {
+    try { _renderEfficiencyCardInner(card, eff); }
+    catch (e) { card.style.display = 'none'; }
+  });
+}
+function _renderEfficiencyCardInner(card, eff) {
+  // Endpoint missing/errored (old server, transient): stay hidden — the
+  // cloud interceptor owns the "update your daemon" state (spec §5).
+  if (!eff) { card.style.display = 'none'; return; }
+  var rt = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+  if (eff.stale_daemon) {
+    // Cloud-only: the node's daemon predates the efficiency slice. An update
+    // prompt, NOT the "collecting" promise — time alone will never fix a
+    // version gap (design spec §5, verifier finding).
+    card.style.display = '';
+    card.innerHTML = '<div style="padding:16px;color:var(--text-muted);font-size:13px;">⬆️ '
+      + escHtml(t('efficiency.update_daemon', null, 'Update ClawMetry on this machine to see your efficiency grade.')) + '</div>';
+    return;
+  }
+  if (eff.insufficient_data || !eff.grade) {
+    card.style.display = '';
+    card.innerHTML = '<div style="padding:16px;color:var(--text-muted);font-size:13px;">⏳ '
+      + escHtml(t('efficiency.collecting', null, 'Collecting efficiency data. Your grade appears after about a day of activity.')) + '</div>';
+    return;
+  }
+  if (!(Number(eff.projected_monthly_cost_usd) > 0)) {
+    // Trust gate, honest version: an explained pause, never a silent gap.
+    card.style.display = '';
+    card.innerHTML = '<div style="padding:16px;color:var(--text-muted);font-size:13px;">'
+      + escHtml(t('efficiency.paused', null, 'Efficiency grade paused: cost numbers on this machine do not agree yet.')) + '</div>';
+    return;
+  }
+  var met = eff.metrics || {};
+  var hit = Math.round(Number(met.cache_hit_rate_pct) || 0);
+  var ctx = _cmEffFmtTokens(met.avg_context_tokens);
+  var sentence = t('efficiency.grade_sentence', { hit: hit, ctx: ctx },
+    'Your agent reuses ' + hit + '% of what it reads and carries about ' + ctx + ' tokens of history into each reply.');
+  var tip = t('efficiency.tooltip', null, 'A to F score of how much of your spend does useful work: how often your agent reuses what it already read, how much history each reply carries, and whether saved work pays for itself.');
+  var rows = (eff.actions || []).map(_cmEffIdeaRowHtml).filter(Boolean);
+  var total = Math.round(_cmEffTotalSavings(eff));
+  var saved = Math.round(Number(eff.cache_saved_monthly_usd) || 0);
+  var right;
+  if (rows.length) {
+    right = '<div style="font-size:14px;font-weight:600;color:var(--text-primary);">' + escHtml(t('efficiency.savings_ideas', null, 'Savings ideas')) + '</div>'
+      + '<div style="font-size:12px;color:var(--text-muted);margin:2px 0 4px;">' + escHtml(t('efficiency.subtitle', null, 'Things you can do to spend less. ClawMetry only suggests; it never changes your agent.')) + '</div>'
+      + rows.join('')
+      + (rows.length >= 2 && total >= 1
+        ? '<div style="border-top:1px solid var(--border-primary,#1f2937);padding-top:8px;font-size:12px;color:var(--text-secondary);">'
+          + escHtml(t('efficiency.footer_total', null, 'Estimated savings: about')) + ' <strong style="color:#22c55e;">$' + total + '/mo</strong></div>'
+        : '');
+  } else {
+    right = '<div style="font-size:14px;font-weight:600;color:var(--text-primary);">' + escHtml(t('efficiency.savings_ideas', null, 'Savings ideas')) + '</div>'
+      + '<div style="font-size:13px;color:var(--text-secondary);margin-top:8px;">' + escHtml(t('efficiency.empty_efficient', null, 'No savings ideas right now. Your agent is spending efficiently. We keep checking.')) + '</div>';
+  }
+  if (saved >= 1) {
+    right += '<div style="font-size:12px;color:var(--text-muted);margin-top:8px;">✨ '
+      + escHtml(t('efficiency.already_saved', { amt: '$' + saved }, 'Reusing work already saved you about $' + saved + '/mo.')) + '</div>';
+  }
+  card.style.display = '';
+  card.innerHTML = '<div style="display:flex;gap:24px;flex-wrap:wrap;padding:16px;">'
+    + '<div style="flex:0 0 200px;min-width:180px;">'
+      + '<div style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-muted);">'
+        + escHtml(t('efficiency.label', null, 'Efficiency'))
+        + ' <span class="tooltip-info-icon" title="' + escHtml(tip) + '" style="cursor:help;">i</span></div>'
+      + '<div style="margin:8px 0 6px;">' + _cmEffBadgeHtml(eff.grade, 44) + '</div>'
+      + '<div style="font-size:12px;color:var(--text-secondary);line-height:1.5;">' + escHtml(sentence) + '</div>'
+      + '<div style="font-size:11px;color:var(--text-muted);margin-top:6px;">' + escHtml(_cmEffScopeLine(rt)) + '</div>'
+    + '</div>'
+    + '<div style="flex:1;min-width:260px;">' + right + '</div>'
+    + '</div>';
+}
+
 // ===== Usage / Token Tracking =====
+
+// QW4: the "Token Usage (14 days)" title + card hide together when the series
+// is empty, so an empty chart box never renders under populated totals.
+function _setUsageChartSectionVisible(show) {
+  var title = document.getElementById('usage-chart-title');
+  var card = document.getElementById('usage-chart-card');
+  if (title) title.style.display = show ? '' : 'none';
+  if (card) card.style.display = show ? '' : 'none';
+}
+
+// QW10: the "See Fleet for all machines." link only makes sense when this
+// account knows about more than one machine. Cheap client-side check via the
+// nodes list; on any failure the link just stays hidden.
+function _cmUpdateUsageFleetNote() {
+  var el = document.getElementById('usage-fleet-note');
+  if (!el) return;
+  fetch('/api/nodes').then(function(r) { return r.json(); }).then(function(d) {
+    var n = (d && Array.isArray(d.nodes)) ? d.nodes.length : 0;
+    el.style.display = n > 1 ? '' : 'none';
+  }).catch(function() {});
+}
+
 async function loadUsage() {
+  // Efficiency grade + savings ideas card (design spec §1b). Fired BEFORE the
+  // main try block: it has its own error handling and must paint its honest
+  // state even when an unrelated usage loader throws below (on nodes where
+  // /api/usage fails, the tail of the try block never runs).
+  try { renderEfficiencyCard(); } catch (_eEff) {}
+  try { _cmUpdateUsageFleetNote(); } catch (_eFleet) {}
   try {
-    var [data, byPlugin] = await Promise.all([
-      fetch('/api/usage').then(r => r.json()),
-      fetch('/api/usage/by-plugin').then(r => r.json()).catch(function(){ return {plugins: []}; })
+    // Append the global runtime filter so Cost/Tokens scopes to the selected
+    // runtime (server-side, via query_aggregates' runtime= param). Numbers
+    // reconcile with the unfiltered total by construction.
+    var _uRt = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+    var _uRtQ = (_uRt && _uRt !== 'all') ? ('?runtime=' + encodeURIComponent(_uRt)) : '';
+    var [_uResp, byPlugin] = await Promise.all([
+      fetch('/api/usage' + _uRtQ).then(async function(r) { return {s: r.status, b: await r.json()}; }),
+      fetch('/api/usage/by-plugin' + _uRtQ).then(r => r.json()).catch(function(){ return {plugins: []}; })
     ]);
+    var data = _uResp.b || {};
+    // Issue #1804: show outage banner when ingest is offline (503 envelope).
+    if (_uResp.s === 503 && data && data.error === 'local_store ingest is offline') {
+      var _uChart = document.getElementById('usage-chart');
+      _setUsageChartSectionVisible(true); // the outage notice lives in the chart slot
+      if (_uChart) _uChart.innerHTML = '<div style="background:#fff7ed;border:1px solid #f59e0b;color:#92400e;padding:12px 16px;border-radius:6px;"><strong>' + t("app.ingest_temporarily_offline", null, "Ingest temporarily offline.") + '</strong> Token usage data unavailable; the local_store writer is not responding.</div>';
+      return;
+    }
     function fmtTokens(n) { return n >= 1000000 ? (n/1000000).toFixed(1) + 'M' : n >= 1000 ? (n/1000).toFixed(0) + 'K' : String(n); }
     function fmtCost(c) { return c >= 0.01 ? '$' + c.toFixed(2) : c > 0 ? '<$0.01' : '$0.00'; }
-    document.getElementById('usage-today').textContent = fmtTokens(data.today);
-    document.getElementById('usage-today-cost').textContent = '≈ ' + fmtCost(data.todayCost);
-    document.getElementById('usage-week').textContent = fmtTokens(data.week);
-    document.getElementById('usage-week-cost').textContent = '≈ ' + fmtCost(data.weekCost);
-    document.getElementById('usage-month').textContent = fmtTokens(data.month);
-    document.getElementById('usage-month-cost').textContent = '≈ ' + fmtCost(data.monthCost);
+    // QW3: dollars are the headline (card-value), tokens the sub-line; the
+    // estimation marker is the word "about", never the ≈ glyph.
+    function setUsageCard(valId, cost, tokens) {
+      var v = document.getElementById(valId);
+      var s = document.getElementById(valId + '-cost');
+      var costStr = fmtCost(cost || 0);
+      var tokStr = fmtTokens(tokens || 0);
+      if (v) v.textContent = t('usage.cost_about', { cost: costStr }, 'about ' + costStr);
+      if (s) s.textContent = t('usage.tokens_sub', { tokens: tokStr }, tokStr + ' tokens');
+    }
+    setUsageCard('usage-today', data.todayCost, data.today);
+    setUsageCard('usage-week', data.weekCost, data.week);
+    setUsageCard('usage-month', data.monthCost, data.month);
+    // Runtime-scoped empty state: when a specific runtime is selected but has
+    // no cost data in any window, surface a clear note rather than showing all zeros.
+    var _uEmptyEl = document.getElementById('usage-runtime-empty-note');
+    if (_uRt && _uRt !== 'all' && !data.today && !data.week && !data.month) {
+      var _uRtLabel = _cmRuntimeLabel(_uRt);
+      var _uEmptyHtml = '<div id="usage-runtime-empty-note" style="margin:8px 0 12px;padding:9px 13px;border-radius:8px;background:rgba(99,102,241,0.07);border:1px solid rgba(99,102,241,0.25);font-size:12px;color:var(--text-secondary);">No cost data recorded for <strong>' + escHtml(_uRtLabel) + '</strong> yet.</div>';
+      // Anchor on the section title (not the chart div) so the note stays
+      // visible when QW4 hides the empty chart section below it.
+      var _uAnchor = document.getElementById('usage-chart-title') || document.getElementById('usage-chart');
+      if (!_uEmptyEl && _uAnchor) _uAnchor.insertAdjacentHTML('beforebegin', _uEmptyHtml);
+    } else {
+      if (_uEmptyEl) _uEmptyEl.remove();
+    }
 
-    // Display cost warnings
-    displayCostWarnings(data.warnings || []);
-    
-    // Display trend analysis
-    displayTrendAnalysis(data.trend || {}, data);
-    // Bar chart
-    var maxTokens = Math.max.apply(null, data.days.map(function(d){return d.tokens;})) || 1;
-    var chartHtml = '';
-    data.days.forEach(function(d) {
-      var pct = Math.max(1, (d.tokens / maxTokens) * 100);
-      var label = d.date.substring(5);
-      var val = d.tokens >= 1000 ? (d.tokens/1000).toFixed(0) + 'K' : d.tokens;
-      chartHtml += '<div class="usage-bar-wrap"><div class="usage-bar" style="height:' + pct + '%"><div class="usage-bar-value">' + (d.tokens > 0 ? val : '') + '</div></div><div class="usage-bar-label">' + label + '</div></div>';
-    });
-    document.getElementById('usage-chart').innerHTML = chartHtml;
+    // Display cost warnings + trend. Wrapped so a render bug in either card
+    // cannot abort the rest of loadUsage and leave every card below stuck on
+    // "Loading…" (the Cost-tab-blank regression).
+    try { displayCostWarnings(data.warnings || []); } catch (_eCW) { console.error('displayCostWarnings failed', _eCW); }
+    try { displayTrendAnalysis(data.trend || {}, data); } catch (_eTA) { console.error('displayTrendAnalysis failed', _eTA); }
+    // Bar chart — QW4: with no data at all, hide the whole section (title +
+    // card) instead of an empty box; render as before when data exists.
+    var _uDays = Array.isArray(data.days) ? data.days : [];
+    var _uHasChartData = _uDays.some(function(d) { return d && d.tokens > 0; });
+    _setUsageChartSectionVisible(_uHasChartData);
+    if (_uHasChartData) {
+      var maxTokens = Math.max.apply(null, _uDays.map(function(d){return d.tokens;})) || 1;
+      var chartHtml = '';
+      _uDays.forEach(function(d) {
+        var pct = Math.max(1, (d.tokens / maxTokens) * 100);
+        var label = d.date.substring(5);
+        var val = d.tokens >= 1000 ? (d.tokens/1000).toFixed(0) + 'K' : d.tokens;
+        chartHtml += '<div class="usage-bar-wrap"><div class="usage-bar" style="height:' + pct + '%"><div class="usage-bar-value">' + (d.tokens > 0 ? val : '') + '</div></div><div class="usage-bar-label">' + label + '</div></div>';
+      });
+      document.getElementById('usage-chart').innerHTML = chartHtml;
+    }
+    // Issue #1448 surface 2 — OSS / Cloud-Free callers get clamped to 24h
+    // of history; render the upgrade CTA above the chart so users see why
+    // the chart is mostly empty.
+    _renderUsageCapCTA(!!data.capped_at_24h);
     // Cost table
     var usageInfoIcon = document.getElementById('usage-cost-info-icon');
     if (usageInfoIcon) {
-      if (data.billingSummary === 'likely_oauth_or_included' || data.billingSummary === 'mixed') {
+      // Cost shown is API-EQUIVALENT (tokens x API rates, same method as
+      // ccusage). It's only an actual cash charge when the account bills
+      // per-token (an API key). For OAuth/subscription plans (e.g. Claude Max
+      // via the Claude CLI) the incremental cost is $0 — the plan covers it.
+      // Surface the caveat for EVERY mode except confidently-metered
+      // ('likely_api_key'), so an "unknown / billing unconfirmed" account no
+      // longer reads as if it owes the displayed dollars (#web-accuracy).
+      var bs = data.billingSummary;
+      if (bs && bs !== 'likely_api_key') {
         usageInfoIcon.style.display = '';
-        usageInfoIcon.title = 'Equivalent if billed from token usage. OAuth/included models may be billed $0 at provider level.';
+        if (bs === 'likely_oauth_or_included' || bs === 'mixed') {
+          usageInfoIcon.title = 'API-equivalent (tokens × API rates). OAuth/included models are typically billed $0 at the provider — your subscription covers them.';
+        } else {
+          usageInfoIcon.title = 'API-equivalent (tokens × API rates). Billing basis unconfirmed — if your account is on a subscription plan (e.g. Claude Max via the Claude CLI), the actual incremental cost is $0.';
+        }
       } else {
         usageInfoIcon.style.display = 'none';
         usageInfoIcon.title = '';
@@ -6921,14 +13359,14 @@ async function loadUsage() {
       renderSessionCostChart();
     }).catch(function() {
       var el = document.getElementById('usage-session-cost-table');
-      if (el) el.innerHTML = '<span style="color:var(--text-muted)">No session cost data available</span>';
+      if (el) el.innerHTML = '<span style="color:var(--text-muted)">' + t("app.no_session_cost_data_available", null, "No session cost data available") + '</span>';
     });
     // Load trace clusters
     fetch('/api/sessions/clusters').then(r => r.json()).then(function(cd) {
       renderTraceClusters(cd.clusters || [], cd.total_sessions || 0);
     }).catch(function() {
       var el = document.getElementById('trace-clusters-content');
-      if (el) el.innerHTML = '<span style="color:var(--text-muted)">No cluster data available</span>';
+      if (el) el.innerHTML = '<span style="color:var(--text-muted)">' + t("app.no_cluster_data_available", null, "No cluster data available") + '</span>';
     });
     // Load cost comparison panel (GH#554)
     loadCostComparison();
@@ -6936,8 +13374,97 @@ async function loadUsage() {
     loadHeatmap();
     // Load prompt cache analytics (GH #979)
     loadCacheAnalytics();
+    // Load cache re-read tax card (issue #2839)
+    loadCacheRisk();
+    // Load compression-potential card (issue #2837)
+    loadCompressionPotential();
+    // Load cost forecast (issue #1413)
+    loadCostForecast();
+    // Load per-agent / per-team cost attribution (issue #3000)
+    loadUsageByTeam();
+    // Load spend optimization recommendations (issue #1415)
+    loadSpendOptimization();
+    // NeMo daily-cap banner (issue #1170) — only visible when a free-tier
+    // user has tripped the 1000-events/day ceiling.
+    _refreshNemoCapBanner('usage-chart');
   } catch(e) {
-    document.getElementById('usage-chart').innerHTML = '<span style="color:#555">No usage data available</span>';
+    // QW4: never render "No usage data available" in an empty box — hide the
+    // section instead (but leave it alone if a populated chart already painted).
+    try {
+      var _ucErr = document.getElementById('usage-chart');
+      if (_ucErr && !_ucErr.querySelector('.usage-bar')) _setUsageChartSectionVisible(false);
+    } catch (_e2) {}
+  }
+}
+
+// ── NeMo free-tier daily cap banner (issue #1170) ─────────────────────
+// Polls /api/nemo-cap-status and renders a one-line upsell row above the
+// chosen anchor element (Brain stream or Tokens chart) when a Free user
+// has hit the daily NeMo ingest cap. Pro users + un-tripped Free users
+// see nothing. Re-uses the same upgrade CTA pattern as the approvals
+// upsell row (#1328) for visual consistency.
+function _renderNemoCapBanner(anchorId, snapshot) {
+  var anchor = document.getElementById(anchorId);
+  if (!anchor || !anchor.parentElement) return;
+  var hostId = 'nemo-cap-banner-' + anchorId;
+  var host = document.getElementById(hostId);
+  var shouldShow = !!(snapshot && snapshot.cap_hit && !snapshot.is_pro);
+  if (!shouldShow) {
+    if (host) { host.style.display = 'none'; host.innerHTML = ''; }
+    return;
+  }
+  if (!host) {
+    host = document.createElement('div');
+    host.id = hostId;
+    host.style.cssText = 'padding:10px 12px;margin-bottom:10px;font-size:12px;line-height:1.5;color:var(--text-secondary);border:1px dashed rgba(124,92,255,0.5);border-radius:6px;background:rgba(124,92,255,0.06);';
+    anchor.parentElement.insertBefore(host, anchor);
+  }
+  host.style.display = '';
+  var cap = Number(snapshot.cap) || 1000;
+  var used = Math.min(Number(snapshot.used) || 0, cap);
+  host.innerHTML =
+    '<strong>NeMo daily cap reached (' + used + '/' + cap + ')</strong> '
+    + 'Further NeMo events are dropped until UTC midnight. '
+    + '<a href="https://app.clawmetry.com/upgrade?source=nemo_cap" target="_blank" rel="noopener" '
+    + 'style="color:var(--accent,#7c5cff);font-weight:600;text-decoration:none;">'
+    + 'Upgrade to Pro</a> for unlimited NeMo ingest.';
+}
+
+function _refreshNemoCapBanner(anchorId) {
+  try {
+    if (window.CLOUD_MODE) return;
+    fetch('/api/nemo-cap-status').then(function(r) {
+      if (!r.ok) return null;
+      return r.json();
+    }).then(function(snap) {
+      if (snap) _renderNemoCapBanner(anchorId, snap);
+    }).catch(function() { /* swallow — banner is non-critical */ });
+  } catch (_e) { /* never block render */ }
+}
+
+// Issue #1448 surface 2 — render the OSS / Cloud-Free retention upsell
+// row above the Token Usage chart when /api/usage reports capped_at_24h.
+// Sibling of _renderFlowRunsCap (PR #1445).
+function _renderUsageCapCTA(capped) {
+  var hostChart = document.getElementById('usage-chart');
+  if (!hostChart || !hostChart.parentElement) return;
+  var foot = document.getElementById('usage-cap-cta');
+  if (!foot) {
+    foot = document.createElement('div');
+    foot.id = 'usage-cap-cta';
+    foot.style.cssText = 'padding:10px 14px;margin-bottom:10px;font-size:12px;color:var(--text-muted);border:1px solid var(--border-secondary,#2a2a4a);border-radius:6px;display:none;';
+    // Insert just before the chart card (parent is the .card wrapper).
+    var card = hostChart.closest('.card') || hostChart.parentElement;
+    if (card && card.parentElement) {
+      card.parentElement.insertBefore(foot, card);
+    }
+  }
+  if (capped) {
+    foot.style.display = '';
+    foot.innerHTML = 'Usage history older than 24 hours is on Cloud-Pro. <a href="https://app.clawmetry.com/upgrade" target="_blank" rel="noopener" style="color:var(--accent,#7c5cff);font-weight:600;">Upgrade for the full 90-day picture.</a>';
+  } else {
+    foot.style.display = 'none';
+    foot.innerHTML = '';
   }
 }
 
@@ -6955,7 +13482,7 @@ function renderTopSessionsByCost(rows) {
     return d || '—';
   }
   if (!rows || rows.length === 0) {
-    el.innerHTML = '<tbody><tr><td colspan="6" style="color:#666;">No session cost data yet</td></tr></tbody>';
+    el.innerHTML = '<tbody><tr><td colspan="6" style="color:#666;">' + t("app.no_session_cost_data_yet", null, "No session cost data yet") + '</td></tr></tbody>';
     return;
   }
   var html = '<thead><tr>'
@@ -6982,6 +13509,96 @@ function renderTopSessionsByCost(rows) {
   });
   html += '</tbody>';
   el.innerHTML = html;
+}
+
+async function loadCacheRisk() {
+  // Issue #2839 Part 1 — surface the prompt-cache re-read tax on the Usage tab.
+  // Data: sum of idle-gap expiries + cache-write cost across all sessions in DuckDB.
+  try {
+    var d = await fetch('/api/usage/cache-risk').then(function(r) { return r.json(); });
+    var title = document.getElementById('cache-risk-title');
+    var card = document.getElementById('cache-risk-card');
+    if (!title || !card) return;
+    var expiries = Number(d.total_expiry_count) || 0;
+    var writeCost = Number(d.total_write_cost_usd) || 0;
+    var savedUsd = Number(d.total_saved_usd) || 0;
+    var affected = Number(d.affected_sessions) || 0;
+    var maxGap = Number(d.max_idle_gap_sec) || 0;
+    if (!expiries && !writeCost) return;
+    title.style.display = '';
+    card.style.display = '';
+    var gapMin = maxGap > 0 ? Math.round(maxGap / 60) : 0;
+    var netTax = writeCost - savedUsd;
+    var html = '<div style="display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start;">'
+      + '<div style="min-width:160px;">'
+      + '<div style="font-size:28px;font-weight:700;color:' + (netTax > 0.01 ? '#ef4444' : '#f59e0b') + ';">'
+      + (writeCost > 0 ? '$' + writeCost.toFixed(3) : expiries + '') + '</div>'
+      + '<div style="font-size:12px;color:var(--text-muted);margin-top:2px;">'
+      + (writeCost > 0 ? 'paid to rebuild the cache' : 'cache expiries') + '</div>'
+      + '</div>'
+      + '<div style="flex:1;min-width:220px;font-size:13px;color:var(--text-secondary);">'
+      + '<div style="margin-bottom:6px;">'
+      + '<strong>' + expiries + ' cache ' + (expiries === 1 ? 'expiry' : 'expiries') + '</strong>'
+      + (affected > 0 ? ' across <strong>' + affected + ' session' + (affected === 1 ? '' : 's') + '</strong>' : '')
+      + ' — idle gaps crossed the 5-min cache TTL so context was re-derived from scratch.</div>';
+    if (writeCost > 0 && savedUsd > 0) {
+      html += '<div style="margin-bottom:6px;">Paid <strong>$' + writeCost.toFixed(3) + '</strong> to rebuild; only saved <strong>$' + savedUsd.toFixed(3) + '</strong> on reads'
+        + (netTax > 0 ? ' — <strong style="color:#ef4444;">$' + netTax.toFixed(3) + ' net re-read tax</strong>' : '') + '.</div>';
+    }
+    if (gapMin > 0) {
+      html += '<div style="color:var(--text-muted);font-size:12px;">Longest idle gap: ' + (gapMin >= 60 ? Math.round(gapMin/60) + 'h ' + (gapMin % 60) + 'm' : gapMin + ' min') + '</div>';
+    }
+    html += '<div style="margin-top:8px;font-size:12px;color:var(--text-muted);">Keep sessions warm — batch turns within the 5-min TTL so context is read at ~0.1× instead of re-written at full price.</div>'
+      + '</div></div>';
+    document.getElementById('cache-risk-content').innerHTML = html;
+  } catch(e) {}
+}
+
+async function loadCompressionPotential() {
+  // Issue #2837 sub-task #1 — surface compression-potential fleet roll-up on the Usage tab.
+  try {
+    var d = await fetch('/api/usage/compression').then(function(r) { return r.json(); });
+    var title = document.getElementById('compression-potential-title');
+    var card = document.getElementById('compression-potential-card');
+    if (!title || !card) return;
+    var sessions = Number(d.compressible_sessions) || 0;
+    if (!sessions) return;
+    title.style.display = '';
+    card.style.display = '';
+    var toks = Number(d.compressible_tokens) || 0;
+    var usd = Number(d.recoverable_usd) || 0;
+    var total = Number(d.total_sessions) || 0;
+    var pct = total > 0 ? Math.round(sessions / total * 100) : 0;
+    var byType = d.by_type || {};
+
+    function fmtToks(n) { return n >= 1e6 ? (n/1e6).toFixed(1)+'M' : n >= 1e3 ? (n/1e3).toFixed(0)+'K' : String(n||0); }
+    function fmtCost(c) { return c >= 0.01 ? '$'+c.toFixed(2) : c > 0 ? '<$0.01' : '$0.00'; }
+
+    var html = '<div style="display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start;">'
+      + '<div style="min-width:140px;text-align:center;">'
+      + '<div style="font-size:28px;font-weight:700;color:#f59e0b;">'+fmtToks(toks)+'</div>'
+      + '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">compressible tokens</div>'
+      + (usd > 0 ? '<div style="font-size:12px;color:#22c55e;margin-top:4px;font-weight:600;">'+fmtCost(usd)+' recoverable</div>' : '')
+      + '</div>'
+      + '<div style="flex:1;min-width:200px;font-size:13px;color:var(--text-secondary);">'
+      + '<div style="margin-bottom:6px;"><strong>'+sessions+'</strong> of '+total+' sessions ('+pct+'%) have compressible tool output.'
+      + ' Summarising repeated JSON, diffs, or log blobs before context re-injection could recover these tokens.</div>';
+
+    var typeKeys = Object.keys(byType);
+    if (typeKeys.length > 0) {
+      html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px;">';
+      typeKeys.sort(function(a, b) { return (byType[b]||0) - (byType[a]||0); }).forEach(function(k) {
+        html += '<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:var(--bg-secondary);color:var(--text-muted);">'
+          + escHtml(k)+' '+fmtToks(byType[k])+'</span>';
+      });
+      html += '</div>';
+    }
+
+    html += '</div></div>';
+    document.getElementById('compression-potential-content').innerHTML = html;
+  } catch(e) {
+    // Compression panel is optional — skip silently on error
+  }
 }
 
 async function loadCacheAnalytics() {
@@ -7056,7 +13673,7 @@ function renderProviderCostChart(providers) {
   var el = document.getElementById('provider-cost-chart');
   if (!el) return;
   if (!providers || providers.length === 0) {
-    el.innerHTML = '<span style="color:var(--text-muted);">No provider cost data yet — start using models from multiple providers.</span>';
+    el.innerHTML = '<span style="color:var(--text-muted);">' + t("app.no_provider_cost_data_yet_start_using_models_from_", null, "No provider cost data yet — start using models from multiple providers.") + '</span>';
     return;
   }
   var providerColors = {
@@ -7120,7 +13737,7 @@ function renderCostComparison(data) {
   var actualModel = actual.model || 'current model';
   var actualTokens = actual.tokens || 0;
   if (actualTokens === 0) {
-    el.innerHTML = '<span style="color:var(--text-muted)">No token data for the last 30 days — usage will appear here once available.</span>';
+    el.innerHTML = '<span style="color:var(--text-muted)">' + t("app.no_token_data_for_the_last_30_days_usage_will_appe", null, "No token data for the last 30 days — usage will appear here once available.") + '</span>';
     return;
   }
   var providerColors = {
@@ -7169,11 +13786,144 @@ function renderCostComparison(data) {
   el.innerHTML = html;
 }
 
+// ===== Spend Optimization Recommendations (issue #1415) =====
+async function loadSpendOptimization() {
+  var card = document.getElementById('spend-optimization-card');
+  var el = document.getElementById('spend-optimization-content');
+  if (!card || !el) return;
+  try {
+    var data = await fetch('/api/usage/optimization-recommendations').then(function(r){return r.json();});
+    if (!data || !data.recommendations || data.recommendations.length === 0) return;
+    card.style.display = 'block';
+    renderSpendOptimization(data);
+  } catch(e) {
+    // silently skip if unavailable
+  }
+}
+
+function renderSpendOptimization(data) {
+  var el = document.getElementById('spend-optimization-content');
+  if (!el) return;
+  var recs = data.recommendations || [];
+  if (recs.length === 0) {
+    el.innerHTML = '<span style="color:var(--text-muted)">' + t("app.no_optimization_suggestions_yet_run_more_agents_wi", null, "No optimization suggestions yet — run more agents with span data enabled to see recommendations.") + '</span>';
+    return;
+  }
+  var totalSave = data.total_projected_savings_usd_30d || 0;
+  var saveFmt = totalSave >= 0.01 ? '$' + totalSave.toFixed(2) : totalSave > 0 ? '<$0.01' : '$0.00';
+  var html = '<div style="margin-bottom:14px;padding:10px 14px;background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.25);border-radius:8px;">';
+  html += '<div style="font-size:12px;color:#86efac;margin-bottom:4px;">Projected 30-day savings</div>';
+  html += '<div style="font-size:22px;font-weight:700;color:#22c55e;">' + saveFmt + '</div>';
+  html += '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">by routing simple tools to a cheaper model tier</div>';
+  html += '</div>';
+  html += '<div style="display:flex;flex-direction:column;gap:8px;">';
+  recs.forEach(function(rec) {
+    var savStr = rec.projected_savings_usd_30d >= 0.01 ? '$' + rec.projected_savings_usd_30d.toFixed(2) : '<$0.01';
+    var curStr = rec.current_cost_usd_30d >= 0.01 ? '$' + rec.current_cost_usd_30d.toFixed(2) : rec.current_cost_usd_30d > 0 ? '<$0.01' : '$0.00';
+    html += '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);border-radius:8px;padding:10px 14px;display:flex;align-items:center;gap:12px;">';
+    html += '<div style="flex:1;min-width:0;">';
+    html += '<div style="font-size:13px;font-weight:600;color:var(--text-primary);">' + escHtml(rec.tool) + '</div>';
+    html += '<div style="font-size:11px;color:var(--text-muted);">' + escHtml(rec.current_model) + ' → ' + escHtml(rec.suggested_model_tier) + ' &middot; ' + rec.call_count + ' calls</div>';
+    html += '</div>';
+    html += '<div style="text-align:right;flex-shrink:0;">';
+    html += '<div style="font-size:14px;font-weight:700;color:#22c55e;">save ' + savStr + '</div>';
+    html += '<div style="font-size:11px;color:var(--text-muted);">' + curStr + ' now &middot; ' + rec.savings_pct + '% off</div>';
+    html += '</div></div>';
+  });
+  html += '</div>';
+  html += '<div style="margin-top:10px;font-size:11px;color:var(--text-muted);line-height:1.5;">Based on a static heuristic: deterministic tools (bash, read, ls) rarely need heavy reasoning. Validate quality before applying routing rules.</div>';
+  el.innerHTML = html;
+}
+
+// ===== Cost Forecast (issue #1413) =====
+// ── Per-agent / per-team cost attribution (issue #3000) ──────────────────────
+async function loadUsageByTeam() {
+  var title = document.getElementById('usage-by-team-title');
+  var card = document.getElementById('usage-by-team-card');
+  var el = document.getElementById('usage-by-team-content');
+  if (!card || !el) return;
+  try {
+    var d = await fetch('/api/usage/by-team?window=7').then(function(r){return r.json();});
+    var teams = (d && d.teams) || [];
+    if (!teams.length) return;
+    var totalCost = teams.reduce(function(s, t) { return s + (t.cost_usd || 0); }, 0);
+    var rows = teams.map(function(t) {
+      var pct = totalCost > 0 ? Math.round((t.cost_usd / totalCost) * 100) : 0;
+      var rts = (t.runtimes || []).join(', ');
+      return '<tr>'
+        + '<td style="padding:4px 8px;font-weight:500;">' + (t.label || '—') + '</td>'
+        + '<td style="padding:4px 8px;text-align:right;">$' + (t.cost_usd || 0).toFixed(4) + '</td>'
+        + '<td style="padding:4px 8px;text-align:right;color:var(--text-muted);">' + pct + '%</td>'
+        + '<td style="padding:4px 8px;text-align:right;color:var(--text-muted);">' + (t.sessions || 0) + ' sessions</td>'
+        + '<td style="padding:4px 8px;font-size:11px;color:var(--text-muted);">' + rts + '</td>'
+        + '</tr>';
+    }).join('');
+    el.innerHTML = '<table style="width:100%;border-collapse:collapse;">'
+      + '<thead><tr style="font-size:11px;color:var(--text-muted);">'
+      + '<th style="padding:2px 8px;text-align:left;">Team / Agent</th>'
+      + '<th style="padding:2px 8px;text-align:right;">Cost (7d)</th>'
+      + '<th style="padding:2px 8px;text-align:right;">Share</th>'
+      + '<th style="padding:2px 8px;text-align:right;">Sessions</th>'
+      + '<th style="padding:2px 8px;text-align:left;">Runtimes</th>'
+      + '</tr></thead><tbody>' + rows + '</tbody></table>';
+    title.style.display = '';
+    card.style.display = '';
+  } catch(e) { /* non-fatal */ }
+}
+
+async function loadCostForecast() {
+  var title = document.getElementById('cost-forecast-title');
+  var card = document.getElementById('cost-forecast-card');
+  var el = document.getElementById('cost-forecast-content');
+  if (!card || !el) return;
+  try {
+    var d = await fetch('/api/usage/forecast').then(function(r){return r.json();});
+    if (!d || !d.available) return;
+    // Hide card when daily rate is effectively zero (no meaningful data yet)
+    if ((d.daily_rate_usd || 0) === 0 && (d.cost_this_month_usd || 0) === 0) return;
+    if (title) title.style.display = '';
+    card.style.display = '';
+    var proj = d.projected_month_usd || 0;
+    var budget = d.monthly_budget_usd || 0;
+    var exceeded = d.budget_exceeded;
+    var color = exceeded ? 'var(--danger, #ef4444)' : '#22c55e';
+    var icon = exceeded ? '⚠️' : '✅';
+    var statusMsg = '';
+    if (budget > 0) {
+      if (exceeded) {
+        var over = proj - budget;
+        statusMsg = 'Will exceed $' + budget.toFixed(2) + ' budget by $' + over.toFixed(2);
+        if (d.days_to_budget !== null && d.days_to_budget <= d.days_remaining_in_month) {
+          statusMsg += ' · exceeds in ~' + Math.ceil(d.days_to_budget) + ' day' + (Math.ceil(d.days_to_budget) !== 1 ? 's' : '');
+        }
+      } else {
+        statusMsg = 'On track vs $' + budget.toFixed(2) + ' budget';
+      }
+    } else {
+      statusMsg = d.days_remaining_in_month + 'd remaining this month';
+    }
+    el.innerHTML =
+      '<div style="display:flex;gap:24px;flex-wrap:wrap;align-items:center;">' +
+        '<div>' +
+          '<div style="font-size:12px;color:var(--text-muted);">Projected month-end</div>' +
+          '<div style="font-size:22px;font-weight:700;color:' + color + ';">' + icon + ' $' + proj.toFixed(2) + '</div>' +
+        '</div>' +
+        '<div style="color:var(--text-muted);font-size:13px;">' + escHtml(statusMsg) + '</div>' +
+        '<div style="margin-left:auto;text-align:right;font-size:12px;color:var(--text-muted);">' +
+          '$' + (d.daily_rate_usd || 0).toFixed(4) + '/day avg<br>' +
+          '$' + (d.cost_this_month_usd || 0).toFixed(2) + ' spent so far' +
+        '</div>' +
+      '</div>';
+  } catch(e) {
+    // silently skip if endpoint unavailable
+  }
+}
+
 function renderTraceClusters(clusters, totalSessions) {
   var el = document.getElementById('trace-clusters-content');
   if (!el) return;
   if (!clusters || clusters.length === 0) {
-    el.innerHTML = '<span style="color:var(--text-muted)">No sessions to cluster yet</span>';
+    el.innerHTML = '<span style="color:var(--text-muted)">' + t("app.no_sessions_to_cluster_yet", null, "No sessions to cluster yet") + '</span>';
     return;
   }
   var categoryIcons = {
@@ -7222,7 +13972,7 @@ function renderSessionCostChart() {
     ctx.font = '13px monospace';
     ctx.textAlign = 'center';
     ctx.fillText('No session cost data', W/2, H/2);
-    if (tableEl) tableEl.innerHTML = '<span style="color:var(--text-muted)">No sessions found</span>';
+    if (tableEl) tableEl.innerHTML = '<span style="color:var(--text-muted)">' + t("app.no_sessions_found", null, "No sessions found") + '</span>';
     return;
   }
   var maxCost = Math.max.apply(null, rows.map(function(r) { return r.cost_usd || 0; })) || 0.001;
@@ -7300,7 +14050,7 @@ function renderPluginPieChart(rows) {
   if (!data.length) {
     var ctxEmpty = canvas.getContext('2d');
     ctxEmpty.clearRect(0, 0, canvas.width, canvas.height);
-    legend.innerHTML = '<div style="color:var(--text-muted);">No plugin tool-call attribution detected yet.</div>';
+    legend.innerHTML = '<div style="color:var(--text-muted);">' + t("app.no_plugin_tool_call_attribution_detected_yet", null, "No plugin tool-call attribution detected yet.") + '</div>';
     return;
   }
 
@@ -7374,8 +14124,12 @@ function displayCostWarnings(warnings) {
 
 function displayTrendAnalysis(trend, usageData) {
   var card = document.getElementById('trend-card');
-  if (!trend || trend.trend === 'insufficient_data') {
-    card.style.display = 'none';
+  // Guard an empty/partial trend object ({}), not just null. When /api/usage
+  // returns trend:{} (no history yet), trend.trend is undefined; reaching the
+  // `trend.trend.charAt(0)` below threw and, since this runs early inside
+  // loadUsage's try, aborted every Cost card after it (all stuck on "Loading…").
+  if (!trend || !trend.trend || trend.trend === 'insufficient_data') {
+    if (card) card.style.display = 'none';
     return;
   }
   
@@ -7406,7 +14160,7 @@ function displayTrendAnalysis(trend, usageData) {
 
     predictionEl.textContent = line;
   } else {
-    predictionEl.textContent = 'Analyzing usage patterns...';
+    predictionEl.textContent = t("app.analyzing_usage_patterns", null, "Analyzing usage patterns...");
   }
   
   card.style.display = 'block';
@@ -7420,7 +14174,12 @@ function exportUsageData() {
 // ===== Model Attribution =====
 async function loadModelAttribution() {
   try {
-    var data = await fetch('/api/model-attribution').then(function(r) { return r.json(); });
+    // Scope to the selected runtime (the server route + cloud interceptor both
+    // honour ?runtime=<prefix> and return that runtime's attribution, or an
+    // honest empty set — never the merged view).
+    var _maRt = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+    var _maQ = (_maRt && _maRt !== 'all') ? ('?runtime=' + encodeURIComponent(_maRt)) : '';
+    var data = await fetch('/api/model-attribution' + _maQ).then(function(r) { return r.json(); });
     var models = data.models || [];
     var switches = data.switches || [];
     var totalTurns = data.total_turns || 0;
@@ -7453,7 +14212,10 @@ async function loadModelAttribution() {
       chartHtml += '<div style="min-width:55px;text-align:right;font-size:12px;color:var(--text-secondary);">' + m.turns.toLocaleString() + ' turns</div>';
       chartHtml += '</div>';
     });
-    document.getElementById('model-mix-chart').innerHTML = chartHtml || '<div style="color:#666;">No model data found in sessions.</div>';
+    var _maEmpty = (_maRt && _maRt !== 'all')
+      ? 'No model activity for <strong>' + escHtml(_cmRuntimeLabel(_maRt)) + '</strong> yet.'
+      : 'No model data found in sessions.';
+    document.getElementById('model-mix-chart').innerHTML = chartHtml || '<div style="color:#666;">' + _maEmpty + '</div>';
 
     // Per-model session table
     var tbodyHtml = '';
@@ -7500,7 +14262,7 @@ async function loadSkillAttribution() {
     var totalCost = data.total_cost || 0;
     function fmtCost(c) { return c >= 0.01 ? '$' + c.toFixed(2) : c > 0 ? '<$0.01' : '$0.00'; }
     if (top5.length === 0) {
-      el.innerHTML = '<span style="color:var(--text-muted);font-size:13px;">No skill invocations detected yet. Skills are detected when SKILL.md files are read during sessions.</span>';
+      el.innerHTML = '<span style="color:var(--text-muted);font-size:13px;">' + t("app.no_skill_invocations_detected_yet_skills_are_detec", null, "No skill invocations detected yet. Skills are detected when SKILL.md files are read during sessions.") + '</span>';
       return;
     }
     var html = '<table class="usage-table" style="width:100%;">';
@@ -7521,7 +14283,7 @@ async function loadSkillAttribution() {
     html += '<div style="margin-top:8px;font-size:11px;color:var(--text-muted);">All-time total: ' + fmtCost(totalCost) + ' · ' + escHtml(data.note || '') + '</div>';
     el.innerHTML = html;
   } catch(e) {
-    if (el) el.innerHTML = '<span style="color:var(--text-muted)">Skill attribution unavailable</span>';
+    if (el) el.innerHTML = '<span style="color:var(--text-muted)">' + t("app.skill_attribution_unavailable", null, "Skill attribution unavailable") + '</span>';
     console.error('loadSkillAttribution', e);
   }
 }
@@ -7549,27 +14311,108 @@ function loadAllSkills() {
 }
 
 // ===== Transcripts =====
+// ── Session-replay "Show plumbing" toggle ───────────────────────────────────
+// Self-Evolve sessions are the agent's own standing self-review runs (FIX mode
+// + re-analyze) — machine-initiated, not user work. Left in, they pile up and
+// bury real sessions, so they're hidden by default behind a "Show plumbing"
+// toggle (same treatment the Brain tab gives queue/metric rows).
+window._transcriptShowPlumbing = window._transcriptShowPlumbing || false;
+function _isPlumbingTranscript(titleSrc) {
+  // Internal/machine sessions that bury real work in the list — hidden by
+  // default behind "Show plumbing". Matched anywhere in the derived title,
+  // which often carries a "[Wed 2026-05-20 22:30 GMT+2] …" timestamp prefix
+  // ahead of the prompt text, so we can't anchor at the start.
+  var s = String(titleSrc || '').toLowerCase();
+  return s.indexOf('you are clawmetry self-evolve') !== -1     // Self-Evolve runs (FIX + re-analyze)
+      || s.indexOf('[subagent context]') !== -1                 // spawned subagents
+      || s.indexOf('you are running as a subagent') !== -1      // subagent prompt (belt-and-suspenders)
+      || s.indexOf('base directory for this skill:') !== -1;    // skill-bootstrap sessions
+}
+window.toggleTranscriptPlumbing = function() {
+  window._transcriptShowPlumbing = !window._transcriptShowPlumbing;
+  var st = document.getElementById('transcript-plumbing-state');
+  if (st) st.textContent = window._transcriptShowPlumbing ? '●' : '○';
+  loadTranscripts();
+};
 async function loadTranscripts() {
   try {
     var data = await fetch('/api/transcripts').then(r => r.json());
     var html = '';
+    // ChatGPT-style row: derived title on top (first user prompt, when the
+    // daemon shipped one in the snapshot), with the full session id demoted
+    // to a small muted sub-line. Falls back to t.name/"Untitled session" so
+    // older snapshots (before #1959) don't go blank. Looks-like-an-id detector
+    // catches the "name === sid" / "name === sid[:40]" cases the legacy
+    // endpoint emits.
+    var UUIDISH = /^[0-9a-f]{6,}([-_][0-9a-f]+)*$/i;
+    // Runtime scoping (OpenClaw-family). Count runtimes across ALL transcripts
+    // so the switcher always lists every runtime present, then narrow the list
+    // to the active one ("all" = merged, the default).
+    var _allTx = data.transcripts || [];
+    var _rtCounts = {};
+    _allTx.forEach(function(t) { var r = _cmRuntimeOf(t); _rtCounts[r] = (_rtCounts[r] || 0) + 1; });
+    var _rtFilter = _cmRuntimeFilter();
+    // Don't silently fall back to "all" when the selected runtime has no
+    // transcripts — that's exactly the "I picked Qwen but see Claude Code"
+    // confusion. Keep the filter and show a scoped empty state below.
+    var _rtNoTx = (_rtFilter !== 'all' && !_rtCounts[_rtFilter]);
+    // Feed the freshest runtime counts to the global header switcher (merge-MAX,
+    // so this transcript subset can't drop runtimes from the dropdown).
+    _cmPopulateGlobalRuntime(_rtCounts);
+    if (_rtFilter !== 'all') {
+      data.transcripts = _allTx.filter(function(t) { return _cmRuntimeOf(t) === _rtFilter; });
+    }
+    var plumbingTotal = 0;
     data.transcripts.forEach(function(t) {
-      html += '<div class="transcript-item" onclick="viewTranscript(\'' + escHtml(t.id) + '\')">';
-      html += '<div><div class="transcript-name">' + escHtml(t.name) + '</div>';
-      html += '<div class="transcript-meta-row">';
+      var raw = String(t.id || '');
+      var titleSrc = (t.title && String(t.title).trim()) || (t.name && String(t.name).trim()) || '';
+      var looksLikeId = !titleSrc || titleSrc === raw || UUIDISH.test(titleSrc) || raw.indexOf(titleSrc) === 0;
+      var title = looksLikeId ? 'Untitled session' : titleSrc;
+      var isPlumbing = _isPlumbingTranscript(titleSrc);
+      if (isPlumbing) plumbingTotal++;
+      // Self-Evolve runs are hidden by default; "Show plumbing" reveals them de-emphasized.
+      if (isPlumbing && !window._transcriptShowPlumbing) return;
+      html += '<div class="transcript-item" style="' + (isPlumbing ? 'opacity:0.5;' : '') + '" onclick="viewTranscript(\'' + escHtml(raw) + '\')">';
+      html += '<div style="min-width:0;flex:1;">';
+      html += '<div class="transcript-name" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escHtml(title) + '</div>';
+      html += '<div class="transcript-meta-row" style="gap:10px;">';
+      html += '<span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--text-muted,#888);font-size:11px;" title="' + escHtml(raw) + '">' + escHtml(raw.slice(0, 8)) + '</span>';
       html += '<span>' + t.messages + ' messages</span>';
-      html += '<span>' + (t.size > 1024 ? (t.size/1024).toFixed(1) + ' KB' : t.size + ' B') + '</span>';
+      if (t.size > 0) html += '<span>' + (t.size > 1024 ? (t.size/1024).toFixed(1) + ' KB' : t.size + ' B') + '</span>';
       html += '<span>' + timeAgo(t.modified) + '</span>';
       html += '</div></div>';
       html += '<span style="color:#444;font-size:18px;">▸</span>';
       html += '</div>';
     });
-    document.getElementById('transcript-list').innerHTML = html || '<div style="padding:16px;color:#666;">No transcript files found</div>';
+    var plumbCountEl = document.getElementById('transcript-plumbing-count');
+    if (plumbCountEl) plumbCountEl.textContent = plumbingTotal > 0 ? (window._transcriptShowPlumbing ? '(' + plumbingTotal + ' shown)' : '(' + plumbingTotal + ' hidden)') : '';
+    var plumbBtn = document.getElementById('transcript-plumbing-btn');
+    if (plumbBtn) plumbBtn.style.display = plumbingTotal > 0 ? '' : 'none';
+    var emptyMsg = _rtNoTx
+      ? '<div style="padding:16px;color:#666;">No <strong>' + escHtml(_cmRuntimeLabel(_rtFilter)) + '</strong> sessions have a transcript yet. Pick <strong>All runtimes</strong> in the header to see every session.</div>'
+      : (plumbingTotal > 0 && !window._transcriptShowPlumbing)
+      ? '<div style="padding:16px;color:#666;">No sessions to show — ' + plumbingTotal + ' Self-Evolve session' + (plumbingTotal === 1 ? '' : 's') + ' hidden. Click “Show plumbing” to reveal.</div>'
+      : '<div style="padding:16px;color:#666;">No transcript files found</div>';
+    document.getElementById('transcript-list').innerHTML = html || emptyMsg;
     document.getElementById('transcript-list').style.display = '';
     document.getElementById('transcript-viewer').style.display = 'none';
     document.getElementById('transcript-back-btn').style.display = 'none';
+    // Deep-link support: if the URL hash carries `#session=<id>` (set by the
+    // alerts-banner "Open session →" button or any other surface that wants
+    // to jump straight to a specific session), open that transcript now and
+    // clear the hash so a reload doesn't keep re-opening it.
+    try {
+      var h = (window.location.hash || '').replace(/^#/, '');
+      var m = h.split('&').reduce(function(acc, p) {
+        var kv = p.split('='); if (kv[0]) acc[kv[0]] = decodeURIComponent(kv[1] || ''); return acc;
+      }, {});
+      if (m.session && typeof viewTranscript === 'function') {
+        viewTranscript(m.session);
+        history.replaceState(null, '', window.location.pathname + window.location.search);
+      }
+    } catch (e) {}
   } catch(e) {
-    document.getElementById('transcript-list').innerHTML = '<div style="padding:16px;color:#666;">Failed to load transcripts</div>';
+    document.getElementById('transcript-list').innerHTML = '<div style="padding:16px;color:#666;">' + t("app.failed_to_load_transcripts", null, "Failed to load transcripts") + '</div>';
   }
 }
 
@@ -7583,11 +14426,16 @@ function showTranscriptList() {
 window._replayEvents = [];
 window._replayIndex = 0;
 window._replayFilter = 'all';
+window._replayPlaying = false;
+window._replayInterval = null;
 
 function _buildReplayEvent(m, idx) {
   var role = m.role || 'unknown';
   // Determine event type for filtering
-  var type = role;
+  var type = m.type || role;
+  // #1911: tool turns carry a structured `tool` object (name + input/output);
+  // classify them as tool_use so the "Tools" filter and deep-dive chip pick up.
+  if (m.tool) type = 'tool_use';
   if (role === 'assistant' && m.content && m.content.indexOf('[tool_use]') !== -1) type = 'tool_use';
   if (role === 'assistant' && m.content && m.content.indexOf('<antml_thinking>') !== -1) type = 'thinking';
   if (role === 'compaction') type = 'compaction';
@@ -7609,9 +14457,64 @@ function _buildReplayEvent(m, idx) {
     timestamp: m.timestamp,
     tokens: m.tokens || null,
     params: m.params || null,
+    // #1911: structured tool call/result detail for the deep-dive chip.
+    tool: m.tool || null,
+    // Issue #1895: verbatim event payload for the Raw/Pretty toggle.
+    raw: (m.raw !== undefined ? m.raw : null),
     originalIndex: idx,
-    extra: extra
+    extra: extra,
+    modelId: m.modelId || null,
+    thinkingLevel: m.thinkingLevel || null
   };
+}
+
+// ── Raw payload toggle (issue #1895) ───────────────────────────────────────
+// Lets users flip the whole transcript between the beautified turns and the
+// exact JSON payload OpenClaw recorded/sent upstream. Requested by users who
+// want to study OpenClaw's behavior, not just read a cleaned-up conversation.
+window._transcriptRawMode = false;
+
+function toggleTranscriptRaw() {
+  window._transcriptRawMode = !window._transcriptRawMode;
+  var btn = document.getElementById('replay-raw-toggle');
+  if (btn) {
+    var on = window._transcriptRawMode;
+    btn.style.background = on ? '#6366f1' : 'var(--button-bg)';
+    btn.style.color = on ? '#fff' : 'var(--text-secondary)';
+    btn.style.borderColor = on ? '#6366f1' : 'var(--border-secondary)';
+    btn.textContent = on ? '{ } Raw ✓' : '{ } Raw';
+  }
+  if (typeof _replayRenderCurrent === 'function') _replayRenderCurrent();
+}
+
+// Render the verbatim JSON body for a turn (raw mode). Returns '' when the
+// turn carries no captured payload so the caller can fall back to pretty.
+function _renderRawPayload(ev) {
+  var raw = ev && ev.raw;
+  if (raw == null) return '';
+  if (raw && typeof raw === 'object' && raw._raw_truncated) {
+    return '<div style="font-size:11px;color:var(--text-muted);font-style:italic;">'
+      + 'Raw payload too large to show inline (' + (raw._raw_bytes || 0)
+      + ' bytes). Open this transcript locally to view the full payload.</div>';
+  }
+  var pretty;
+  try { pretty = JSON.stringify(raw, null, 2); }
+  catch (e) { pretty = String(raw); }
+  var html = '<button type="button" onclick="copyTranscriptRaw(this)" style="float:right;background:none;border:1px solid var(--border-secondary);color:var(--text-muted);border-radius:5px;padding:1px 7px;font-size:10px;cursor:pointer;">Copy</button>';
+  html += '<pre style="white-space:pre-wrap;word-break:break-word;font-size:11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--text-secondary);margin:0;overflow-x:auto;max-height:420px;">' + escHtml(pretty) + '</pre>';
+  return html;
+}
+
+function copyTranscriptRaw(btn) {
+  try {
+    var pre = btn.parentElement.querySelector('pre');
+    if (pre && navigator.clipboard) {
+      navigator.clipboard.writeText(pre.textContent);
+      var orig = btn.textContent;
+      btn.textContent = t("app.copied", null, "Copied");
+      setTimeout(function () { btn.textContent = orig; }, 1200);
+    }
+  } catch (e) {}
 }
 
 // Format the decoding-params dict into a compact inline pill. Returns ''
@@ -7630,11 +14533,93 @@ function _fmtDecodingParams(p) {
   return '⚙ ' + parts.join(' · ');
 }
 
+// #1911: render a tool call/result as a named, expandable deep-dive chip.
+// The header shows the tool name (and an error badge for failed results); the
+// body — the exact input args or result output — toggles open on click.
+function _renderToolDiveChip(ev, highlighted) {
+  var t = ev.tool || {};
+  var isResult = t.kind === 'result';
+  var name = escHtml(t.name || 'tool');
+  var icon = isResult ? '↩' : '🔧';
+  var side = isResult ? 'flex-end' : 'flex-start';
+  var ring = highlighted ? 'box-shadow:0 0 0 2px #6366f1;' : '';
+  var ts = ev.timestamp ? new Date(ev.timestamp).toLocaleTimeString() : '';
+  var body = isResult ? (t.output || '') : (t.input || '');
+  var hasBody = !!(body && String(body).trim());
+  var did = 'tooldive-' + ev.originalIndex;
+  var labelText = isResult ? (name + ' · result') : name;
+  var html = '<div class="chat-tool-chip chat-tool-dive ' + (isResult ? 'tc-user' : 'tc-asst') + '"'
+    + ' id="replay-msg-' + ev.originalIndex + '" style="align-self:' + side + ';' + ring + '">';
+  html += '<div class="ctd-head"' + (hasBody ? ' onclick="toggleToolDive(\'' + did + '\')"' : '') + '>';
+  html += '<span class="chat-tool-chip-label">' + icon + ' ' + labelText + '</span>';
+  if (isResult && t.is_error) html += '<span class="chat-tool-chip-meta" style="color:#e0625a;">error</span>';
+  if (hasBody) html += '<span class="ctd-caret" id="' + did + '-caret">▾</span>';
+  if (ts) html += '<span class="chat-tool-chip-meta">' + ts + '</span>';
+  html += '</div>';
+  if (hasBody) {
+    // Default expanded so the args/output (the debugging signal) are visible
+    // without an extra click. Click the header to collapse a noisy tool turn.
+    html += '<pre class="ctd-body" id="' + did + '" style="display:block;">' + escHtml(String(body)) + '</pre>';
+  }
+  html += '</div>';
+  return html;
+}
+
+function toggleToolDive(id) {
+  var pre = document.getElementById(id);
+  var caret = document.getElementById(id + '-caret');
+  if (!pre) return;
+  var open = pre.style.display !== 'none';
+  pre.style.display = open ? 'none' : 'block';
+  if (caret) caret.textContent = open ? '▸' : '▾';
+}
+
 function _renderReplayEvent(ev, highlighted) {
   var role = ev.role;
   // Handle compaction events specially
   if (role === 'compaction') {
     return _renderCompactionEvent(ev, highlighted);
+  }
+  // Raw mode (#1895): show the verbatim payload bubble when this turn has one.
+  // Compaction markers carry no captured payload, so they fall through above.
+  if (window._transcriptRawMode && ev.raw != null) {
+    var rawBody = _renderRawPayload(ev);
+    if (rawBody) {
+      var rRing = highlighted ? 'box-shadow:0 0 0 2px #6366f1;' : '';
+      var rTs = ev.timestamp ? new Date(ev.timestamp).toLocaleString() : '';
+      var rCls = role === 'user' ? 'user' : role === 'assistant' ? 'assistant'
+               : role === 'system' ? 'system' : 'tool';
+      return '<div class="chat-msg ' + rCls + '" id="replay-msg-' + ev.originalIndex + '" style="' + rRing + '">'
+        + '<div class="chat-role">' + escHtml(role) + ' · raw</div>'
+        + rawBody
+        + (rTs ? '<div class="chat-ts">' + rTs + '</div>' : '')
+        + '</div>';
+    }
+  }
+  // #1911: a tool turn carries a structured `tool` object (name + input or
+  // output). Render an expandable deep-dive chip — the tool name up front, the
+  // exact args/result one click away — instead of a nameless "Tool call".
+  if (ev.tool) {
+    return _renderToolDiveChip(ev, highlighted);
+  }
+  // Tool turns (assistant tool_use / user tool_result) carry no prose, so they
+  // used to render as blank bubbles with just a role + timestamp — looking
+  // broken. Render them as a compact, labelled chip instead so the real
+  // (prose) turns stand out and the timeline reads cleanly.
+  var _c = ev.content;
+  if (!_c || !String(_c).trim()) {
+    var chipLabel = role === 'assistant' ? '🔧 Tool call'
+                  : role === 'user' ? '↩ Tool result'
+                  : role === 'system' ? '⚙ System'
+                  : (escHtml(role) + ' · no text');
+    var chipTs = ev.timestamp ? new Date(ev.timestamp).toLocaleTimeString() : '';
+    var chipRing = highlighted ? 'box-shadow:0 0 0 2px #6366f1;' : '';
+    var chipSide = role === 'user' ? 'flex-end' : 'flex-start';
+    return '<div class="chat-tool-chip ' + (role === 'user' ? 'tc-user' : 'tc-asst') + '" id="replay-msg-' + ev.originalIndex + '" style="align-self:' + chipSide + ';' + chipRing + '">'
+      + '<span class="chat-tool-chip-label">' + chipLabel + '</span>'
+      + (ev.tokens ? '<span class="chat-tool-chip-meta">' + ev.tokens + ' tok</span>' : '')
+      + (chipTs ? '<span class="chat-tool-chip-meta">' + chipTs + '</span>' : '')
+      + '</div>';
   }
   var cls = role === 'user' ? 'user' : role === 'assistant' ? 'assistant' : role === 'system' ? 'system' : 'tool';
   var content = ev.content;
@@ -7701,11 +14686,11 @@ function toggleCompaction(idx) {
   if (short.style.display === 'none') {
     short.style.display = '';
     full.style.display = 'none';
-    if (toggle) toggle.textContent = '\u2193 Expand summary';
+    if (toggle) toggle.textContent = t("app.expand_summary", null, "\u2193 Expand summary");
   } else {
     short.style.display = 'none';
     full.style.display = '';
-    if (toggle) toggle.textContent = '\u2191 Collapse summary';
+    if (toggle) toggle.textContent = t("app.collapse_summary", null, "\u2191 Collapse summary");
   }
 }
 
@@ -7718,7 +14703,7 @@ function _replayFilteredEvents() {
 function _replayRenderCurrent() {
   var filtered = _replayFilteredEvents();
   if (!filtered.length) {
-    document.getElementById('transcript-messages').innerHTML = '<div style="color:var(--text-muted);padding:16px;">No events match this filter.</div>';
+    document.getElementById('transcript-messages').innerHTML = '<div style="color:var(--text-muted);padding:16px;">' + t("app.no_events_match_this_filter", null, "No events match this filter.") + '</div>';
     document.getElementById('replay-pos').textContent = '0/0';
     return;
   }
@@ -7741,6 +14726,7 @@ function _replayRenderCurrent() {
   // Scroll highlighted message into view
   var el = document.getElementById('replay-msg-' + filtered[idx].originalIndex);
   if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  _updateReplayStatePanel(filtered[idx] ? filtered[idx].timestamp : null);
 }
 
 function replayNext() {
@@ -7780,21 +14766,95 @@ function replayFilter(type) {
   _replayRenderCurrent();
 }
 
+function _updateReplayStatePanel(currentTimestamp) {
+  var model = null;
+  var thinkingLevel = null;
+  var totalTokens = 0;
+  for (var i = 0; i < window._replayEvents.length; i++) {
+    var ev = window._replayEvents[i];
+    if (currentTimestamp && ev.timestamp && ev.timestamp > currentTimestamp) break;
+    if (ev.type === 'model_change' && ev.modelId) model = ev.modelId;
+    if (ev.type === 'thinking_level_change' && ev.thinkingLevel) thinkingLevel = ev.thinkingLevel;
+    if (typeof ev.tokens === 'number') totalTokens += ev.tokens;
+  }
+  var panel = document.getElementById('replay-state');
+  if (!panel) return;
+  panel.style.display = 'flex';
+  var el;
+  el = document.getElementById('replay-state-model');
+  if (el) el.textContent = model || '—';
+  el = document.getElementById('replay-state-thinking');
+  if (el) el.textContent = thinkingLevel || '—';
+  el = document.getElementById('replay-state-tokens');
+  if (el) el.textContent = totalTokens > 1000 ? (totalTokens / 1000).toFixed(1) + 'K' : String(totalTokens);
+}
+
+function replayTogglePlay() {
+  if (window._replayPlaying) {
+    clearInterval(window._replayInterval);
+    window._replayPlaying = false;
+    var btn = document.getElementById('replay-play-btn');
+    if (btn) btn.innerHTML = '&#9654; <span data-i18n="transcripts.play">Play</span>';
+  } else {
+    window._replayPlaying = true;
+    var btn = document.getElementById('replay-play-btn');
+    if (btn) btn.innerHTML = '&#9646;&#9646; <span data-i18n="transcripts.pause">Pause</span>';
+    window._replayInterval = setInterval(function() {
+      var filtered = _replayFilteredEvents();
+      if (window._replayIndex >= filtered.length - 1) {
+        clearInterval(window._replayInterval);
+        window._replayPlaying = false;
+        var doneBtn = document.getElementById('replay-play-btn');
+        if (doneBtn) doneBtn.innerHTML = '&#9654; <span data-i18n="transcripts.play">Play</span>';
+        return;
+      }
+      window._replayIndex++;
+      _replayRenderCurrent();
+    }, 100);
+  }
+}
+
+// Phase B (UX_AUDIT.md): open a session-scoped deep-dive view with the session
+// preselected. Tracing / Turn timing / Compare sessions left the global nav
+// (they are meaningless without a session); this is their entry point from any
+// session drill-down. switchTab keeps working for old bookmarks regardless.
+function openSessionDeepDive(kind, sessionId) {
+  if (!sessionId) return;
+  // The tab loaders (loadTracing/loadTurnAnatomy) render their LIST view and
+  // their async continuation resets the list's style.cssText, which would wipe
+  // a display:none set here (list bleeding under the detail). So instead of
+  // racing them, hand the session over: the loader itself opens the detail
+  // when a pending deep-dive session is set.
+  if (kind === 'trace') {
+    window._pendingTraceSession = sessionId;
+    switchTab('tracing');
+  } else if (kind === 'turns') {
+    window._pendingTurnSession = sessionId;
+    switchTab('turn-anatomy');
+  } else if (kind === 'compare') {
+    switchTab('swimlane');
+    swimlaneAddLane(sessionId);
+  }
+}
+
 async function viewTranscript(sessionId) {
   document.getElementById('transcript-list').style.display = 'none';
   document.getElementById('transcript-viewer').style.display = '';
   document.getElementById('transcript-back-btn').style.display = '';
-  document.getElementById('transcript-messages').innerHTML = '<div style="padding:20px;color:#666;">Loading transcript...</div>';
+  document.getElementById('transcript-messages').innerHTML = '<div style="padding:20px;color:#666;">' + t("app.loading_transcript", null, "Loading transcript...") + '</div>';
   document.getElementById('replay-controls').style.display = 'none';
   // Reset replay state
   window._replayEvents = [];
   window._replayIndex = 0;
   window._replayFilter = 'all';
   try {
-    // Fetch transcript and compaction markers in parallel
-    var [data, compactionsData] = await Promise.all([
+    // Fetch transcript, compaction markers, config-drift, lexical drift, and policy events in parallel
+    var [data, compactionsData, driftData, lexicalDriftData, policyData] = await Promise.all([
       fetch('/api/transcript/' + encodeURIComponent(sessionId)).then(r => r.json()),
-      fetch('/api/compactions?session_id=' + encodeURIComponent(sessionId) + '&summary_chars=5000').then(r => r.json()).catch(() => ({compactions: []}))
+      fetch('/api/compactions?session_id=' + encodeURIComponent(sessionId) + '&summary_chars=5000').then(r => r.json()).catch(() => ({compactions: []})),
+      fetch('/api/sessions/' + encodeURIComponent(sessionId) + '/config-drift').then(r => r.json()).catch(() => ({has_drift: false})),
+      fetch('/api/sessions/' + encodeURIComponent(sessionId) + '/lexical-drift').then(r => r.json()).catch(() => null),
+      fetch('/api/security/policy-events?session_id=' + encodeURIComponent(sessionId)).then(r => r.json()).catch(() => null)
     ]);
     var compactions = compactionsData.compactions || [];
     // Metadata
@@ -7810,7 +14870,50 @@ async function viewTranscript(sessionId) {
       metaHtml += '<span class="stat-label">💾 Compactions</span><span class="stat-val">' + compactions.length + ' (' + (totalCompacted/1000).toFixed(1) + 'K tokens)</span>';
       metaHtml += '</div>';
     }
+    // Config-drift banner — fires when the session switched providers with changed sampling params
+    if (driftData && driftData.has_drift) {
+      var driftN = driftData.drift_count || 1;
+      var driftKeys = (driftData.drifts && driftData.drifts[0] && driftData.drifts[0].changed_keys || []).join(', ');
+      metaHtml += '<div style="margin-top:10px;padding:7px 10px;background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.35);border-radius:6px;font-size:11px;color:#d97706;line-height:1.4;">';
+      metaHtml += '⚠ <strong>Config Drift</strong>: provider switched ' + driftN + '× with changed sampling params';
+      if (driftKeys) metaHtml += ' (' + escHtml(driftKeys) + ')';
+      metaHtml += '. Different providers interpret the same temperature differently — check the ⚙ pills below to confirm the intended config.';
+      metaHtml += '</div>';
+    }
+    // Lexical drift notice — fires when TF-IDF cosine vs anchor turn drops below threshold
+    if (lexicalDriftData && lexicalDriftData.has_drift) {
+      metaHtml += '<div class="stat-row" style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border-secondary);">';
+      metaHtml += '<span class="stat-label">⚠ Lexical Drift</span><span class="stat-val" title="TF-IDF cosine similarity vs turn 0 (lexical vocabulary overlap)">avg ' + lexicalDriftData.avg_similarity + ' · min ' + lexicalDriftData.min_similarity + ' at turn ' + lexicalDriftData.min_turn + '</span>';
+      metaHtml += '</div>';
+    }
+    // Policy events badge — shown when PII, injection, or credential-leak patterns fire
+    if (policyData && policyData.counts && policyData.counts.total > 0) {
+      var pc = policyData.counts;
+      var hasLeak = (pc.LEAK || 0) > 0;
+      var hasInj  = (pc.INJECT || 0) > 0;
+      var bgCol   = hasLeak ? 'rgba(220,38,38,0.12)' : 'rgba(245,158,11,0.12)';
+      var bdCol   = hasLeak ? 'rgba(220,38,38,0.4)'  : 'rgba(245,158,11,0.4)';
+      var txCol   = hasLeak ? '#fca5a5' : '#fde68a';
+      var parts   = [];
+      if (pc.LEAK)   parts.push('🔑 ' + pc.LEAK + ' cred-leak');
+      if (pc.INJECT) parts.push('⚠ ' + pc.INJECT + ' injection');
+      if (pc.PII)    parts.push('👤 ' + pc.PII + ' PII');
+      metaHtml += '<div style="margin-top:10px;padding:7px 10px;background:' + bgCol + ';border:1px solid ' + bdCol + ';border-radius:6px;font-size:11px;color:' + txCol + ';line-height:1.4;" title="Open the Security tab to view full policy event details">';
+      metaHtml += '🔒 <strong>Policy events:</strong> ' + parts.join(' · ') + '. <a href="#" onclick="switchTab(\'security\');return false;" style="color:inherit;text-decoration:underline;">View in Security tab</a>';
+      metaHtml += '</div>';
+    }
+    // Phase B (UX_AUDIT.md): the session-scoped deep-dive views (Tracing,
+    // Turn timing, Compare sessions) left the global nav; this row is how a
+    // user reaches them, WITH the session already selected.
+    var _ddSid = JSON.stringify(String(sessionId)).replace(/"/g, '&quot;');
+    metaHtml += '<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border-secondary);display:flex;gap:8px;flex-wrap:wrap;align-items:center;">'
+      + '<span style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:var(--text-muted);">' + t('transcript.deep_dive', null, 'Deep dive') + '</span>'
+      + '<button class="refresh-btn" onclick="openSessionDeepDive(\'trace\', ' + _ddSid + ')" title="Span tree + waterfall for this session">' + t('transcript.view_trace', null, 'Trace') + '</button>'
+      + '<button class="refresh-btn" onclick="openSessionDeepDive(\'turns\', ' + _ddSid + ')" title="Per-turn timing breakdown for this session">' + t('transcript.turn_timing', null, 'Turn timing') + '</button>'
+      + '<button class="refresh-btn" onclick="openSessionDeepDive(\'compare\', ' + _ddSid + ')" title="Compare this session side by side with others">' + t('transcript.compare', null, 'Compare') + '</button>'
+      + '</div>';
     document.getElementById('transcript-meta').innerHTML = metaHtml;
+    _loadAuthorityPanel(sessionId);
     // Build replay events array - include compaction markers as special events
     var events = [];
     var compactionIdx = 0;
@@ -7848,11 +14951,70 @@ async function viewTranscript(sessionId) {
       // Reset filter pills to "all"
       replayFilter('all');
     } else {
-      document.getElementById('transcript-messages').innerHTML = '<div style="color:#555;padding:16px;">No messages in this transcript</div>';
+      document.getElementById('transcript-messages').innerHTML = '<div style="color:#555;padding:16px;">' + t("app.no_messages_in_this_transcript", null, "No messages in this transcript") + '</div>';
     }
   } catch(e) {
-    document.getElementById('transcript-messages').innerHTML = '<div style="color:#e74c3c;padding:16px;">Failed to load transcript</div>';
+    document.getElementById('transcript-messages').innerHTML = '<div style="color:#e74c3c;padding:16px;">' + t("app.failed_to_load_transcript", null, "Failed to load transcript") + '</div>';
   }
+}
+
+// Authority footprint panel (#880) — fetches /api/authority for the current
+// session and renders tools/filesystem/network sections in a collapsible card.
+async function _loadAuthorityPanel(sessionId) {
+  var panel = document.getElementById('authority-panel');
+  var body  = document.getElementById('authority-panel-body');
+  var sumEl = document.getElementById('authority-panel-summary');
+  if (!panel || !body) return;
+  panel.style.display = 'none';
+  try {
+    var fp = await fetch('/api/authority?session_id=' + encodeURIComponent(sessionId))
+                    .then(function(r){ return r.json(); });
+    if (!fp || fp.error) return;
+    var tools = fp.tools || [];
+    var files = fp.filesystem || [];
+    var hosts = fp.network || [];
+    if (tools.length === 0 && files.length === 0 && hosts.length === 0) return;
+
+    // Summary line in the toggle header
+    var parts = [];
+    if (tools.length) parts.push(tools.length + ' tool' + (tools.length === 1 ? '' : 's'));
+    if (files.length) parts.push(files.length + ' path' + (files.length === 1 ? '' : 's'));
+    if (hosts.length) parts.push(hosts.length + ' host' + (hosts.length === 1 ? '' : 's'));
+    if (sumEl) sumEl.textContent = parts.join(' · ');
+
+    function _pill(text, color) {
+      return '<span style="display:inline-block;padding:1px 7px;border-radius:99px;font-size:10px;font-family:var(--font-mono,monospace);background:' + color + '22;color:' + color + ';border:1px solid ' + color + '44;margin:2px 2px 2px 0;">' + escHtml(text) + '</span>';
+    }
+
+    var html = '';
+
+    if (tools.length) {
+      html += '<div style="margin-bottom:8px;"><div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:4px;">Tools called</div><div>';
+      tools.forEach(function(t){
+        html += _pill(t.name + (t.calls > 1 ? ' ×' + t.calls : ''), '#6366f1');
+      });
+      html += '</div></div>';
+    }
+
+    if (files.length) {
+      html += '<div style="margin-bottom:8px;"><div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:4px;">Filesystem paths</div><div>';
+      files.forEach(function(f){
+        html += _pill(f.path, '#22c55e');
+      });
+      html += '</div></div>';
+    }
+
+    if (hosts.length) {
+      html += '<div><div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:4px;">Network hosts</div><div>';
+      hosts.forEach(function(h){
+        html += _pill(h.host, '#f59e0b');
+      });
+      html += '</div></div>';
+    }
+
+    body.innerHTML = html;
+    panel.style.display = '';
+  } catch(e) { /* non-critical — panel stays hidden on error */ }
 }
 
 function toggleMsg(idx) {
@@ -7861,11 +15023,11 @@ function toggleMsg(idx) {
   if (short.style.display === 'none') {
     short.style.display = '';
     full.style.display = 'none';
-    short.nextElementSibling.nextElementSibling.textContent = 'Show more';
+    short.nextElementSibling.nextElementSibling.textContent = t("app.show_more", null, "Show more");
   } else {
     short.style.display = 'none';
     full.style.display = '';
-    event.target.textContent = 'Show less';
+    event.target.textContent = t("app.show_less", null, "Show less");
   }
 }
 
@@ -7908,6 +15070,191 @@ async function checkUpgradeBanner() {
 }
 setTimeout(checkUpgradeBanner, 3000);
 
+// ── Sync Status Banner (PRD-sync-status.md) ───────────────────────────────
+// First-install transparency: render the daemon's real per-phase progress so a
+// blank dashboard doesn't read as broken. Sources the 7 named phases from
+// /api/sync-progress (plus /api/local/health for event_count + sync_dlq_depth)
+// and rolls them up into 5 user-facing steps. Auto-clears the moment we have
+// real data; fail-safes to an actionable error after the install grace window.
+window._cmSync = {
+  // 5 user-facing steps. Each maps to one-or-more daemon phases.
+  STEPS: [
+    { id: 'discovering', label: 'Discovering',        phases: ['sessions_recent'] },
+    { id: 'indexing',    label: 'Indexing events',    phases: ['sessions_recent', 'session_metadata'] },
+    { id: 'aggregating', label: 'Aggregating',        phases: ['memory', 'crons', 'channel_messages'] },
+    { id: 'pushing',     label: 'Pushing snapshot',   phases: ['sessions', 'complete'] },
+    { id: 'verified',    label: 'Verified',           phases: ['complete'] },
+  ],
+  PHASE_ORDER: ['sessions_recent', 'session_metadata', 'memory', 'crons', 'channel_messages', 'sessions', 'complete'],
+  startedAt: 0,
+  pollTimer: null,
+  detailsOpen: false,
+  done: false,
+};
+
+function cmSyncToggleDetails() {
+  var d = document.getElementById('sync-status-details');
+  var btn = document.getElementById('sync-status-toggle');
+  if (!d || !btn) return;
+  window._cmSync.detailsOpen = !window._cmSync.detailsOpen;
+  d.style.display = window._cmSync.detailsOpen ? 'block' : 'none';
+  btn.setAttribute('aria-expanded', String(window._cmSync.detailsOpen));
+  btn.textContent = window._cmSync.detailsOpen ? 'Hide details' : 'Show details';
+}
+
+function _cmSyncDismiss() {
+  var el = document.getElementById('sync-status-banner');
+  if (el) el.style.display = 'none';
+  if (window._cmSync.pollTimer) { clearInterval(window._cmSync.pollTimer); window._cmSync.pollTimer = null; }
+  window._cmSync.done = true;
+  try { localStorage.setItem('cm-sync-verified-ts', String(Date.now())); } catch (e) {}
+}
+
+function _cmSyncRender(prog, health) {
+  var bar = document.getElementById('sync-status-banner');
+  if (!bar) return;
+  var sub = document.getElementById('sync-status-subtitle');
+  var details = document.getElementById('sync-status-details');
+  var stepper = document.getElementById('sync-status-stepper');
+  var errBox = document.getElementById('sync-status-error');
+  var title = document.getElementById('sync-status-title');
+  if (!sub || !details || !stepper || !errBox || !title) return;
+
+  // Determine the active phase: highest-index phase that's running/complete.
+  var phase = (prog && prog.phase) || '';
+  var idx = window._cmSync.PHASE_ORDER.indexOf(phase);
+  // Decide each step's state by whether any of its phases has run.
+  var html = '';
+  var maxReached = idx;
+  var hasErr = (health && (health.sync_dlq_depth || 0) > 0) ||
+               (prog && prog.error);
+  window._cmSync.STEPS.forEach(function(step) {
+    var stepMax = Math.max.apply(null, step.phases.map(function(p) {
+      return window._cmSync.PHASE_ORDER.indexOf(p);
+    }));
+    var state = 'pending';
+    if (step.id === 'verified') {
+      state = (prog && prog.status === 'complete' && health && (health.event_count || 0) > 0) ? 'done' : 'pending';
+    } else if (maxReached >= stepMax) state = 'done';
+    else if (maxReached >= 0 && step.phases.indexOf(phase) !== -1) state = 'active';
+    var mark = state === 'done' ? '✓' : state === 'active' ? '···' : '·';
+    html += '<span class="cm-sync-step" data-state="' + state + '">' + mark + ' ' + step.label + '</span>';
+  });
+  stepper.innerHTML = html;
+
+  // Subtitle: counts + ETA
+  var elapsed = Math.max(0, (Date.now() - window._cmSync.startedAt) / 1000);
+  var pct = (idx + 1) / window._cmSync.PHASE_ORDER.length;
+  var etaTxt = '';
+  if (pct > 0.05 && pct < 1) {
+    var remaining = Math.max(2, Math.round(elapsed * (1 - pct) / pct));
+    etaTxt = ' · about ' + (remaining < 60 ? remaining + 's' : Math.round(remaining/60) + 'm') + ' remaining';
+  }
+  var counts = '';
+  if (prog && (prog.total || prog.done)) {
+    counts = ' · ' + (prog.done || 0) + (prog.total ? ' / ' + prog.total : '') + ' items';
+  }
+  var phaseLabel = phase ? phase.replace(/_/g, ' ') : 'starting';
+  sub.textContent = t("app.step", null, "Step: ") + phaseLabel + counts + etaTxt;
+
+  // Details log (structured)
+  var ts = new Date().toLocaleTimeString();
+  var line = ts + '  → phase=' + (phase || '-') +
+             '  done=' + (prog && prog.done || 0) +
+             (prog && prog.total ? '/' + prog.total : '') +
+             '  events=' + (health && health.event_count || 0) +
+             '  ring=' + (health && health.ring_depth || 0) +
+             '  dlq=' + (health && health.sync_dlq_depth || 0);
+  // Keep the latest 20 lines (auto-bound, no PII).
+  var prev = (details.dataset.lines || '').split('\n').filter(Boolean);
+  prev.push(line);
+  if (prev.length > 20) prev = prev.slice(-20);
+  details.dataset.lines = prev.join('\n');
+  details.textContent = prev.join('\n');
+
+  // Error surface
+  if (hasErr) {
+    var msg = prog && prog.error
+      ? String(prog.error)
+      : 'Sync queued ' + (health && health.sync_dlq_depth || 0) + ' batches for retry — the daemon will keep trying.';
+    errBox.innerHTML = '<div style="font-weight:600;margin-bottom:4px;">' + t("app.sync_needs_attention", null, "⚠️ Sync needs attention") + '</div>'
+      + '<div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;white-space:pre-wrap;word-break:break-word;">' + escHtml(msg) + '</div>'
+      + '<div style="margin-top:6px;font-size:11px;"><a href="https://github.com/vivekchand/clawmetry#troubleshooting" target="_blank" rel="noopener" style="color:#fca5a5;">Open troubleshooting docs →</a></div>';
+    errBox.style.display = 'block';
+    title.textContent = t("app.sync_needs_attention", null, "Sync needs attention");
+    bar.style.background = 'linear-gradient(90deg,#3b1416 0%,#1a0e15 100%)';
+    bar.style.borderBottom = '1px solid #7f1d1d';
+  }
+
+  // Hard fail-safe: if no progress for 90s after start, surface an error.
+  if (!hasErr && elapsed > 90 && (!prog || !prog.phase)) {
+    errBox.innerHTML = '<div style="font-weight:600;margin-bottom:4px;">' + t("app.sync_hasn_t_reported_progress_yet", null, "⚠️ Sync hasn’t reported progress yet") + '</div>'
+      + '<div style="font-size:12px;">Check that the daemon is running. On macOS: <code>launchctl kickstart -k gui/$(id -u)/com.clawmetry.sync</code></div>';
+    errBox.style.display = 'block';
+  }
+
+  // Auto-clear when verified (3 independent signals).
+  var verified = prog && prog.status === 'complete' &&
+                 health && (health.event_count || 0) > 0;
+  if (verified) {
+    title.textContent = t("app.verified_your_data_is_live", null, "✓ Verified — your data is live");
+    sub.textContent = (health.event_count || 0).toLocaleString() + ' events indexed';
+    setTimeout(_cmSyncDismiss, 1500);
+  }
+}
+
+async function _cmSyncTick() {
+  if (window._cmSync.done) return;
+  try {
+    var [prog, health] = await Promise.all([
+      fetch('/api/sync-progress').then(function(r){ return r.ok ? r.json() : null; }).catch(function(){ return null; }),
+      fetch('/api/local/health').then(function(r){ return r.ok ? r.json() : null; }).catch(function(){ return null; }),
+    ]);
+    _cmSyncRender(prog, health);
+  } catch (e) {}
+}
+
+async function cmSyncInit() {
+  // Cloud mode keeps its existing cm-sync-bar (Phase 2 promotes this component).
+  if (window.CLOUD_MODE) return;
+  // #1937: the banner describes CLOUD-side sync work. Don't show it when
+  //   * the user opted out (CLAWMETRY_NO_CLOUD=1 or ~/.clawmetry/nocloud), or
+  //   * the user never connected (no config.json -> nothing to sync).
+  // Without this gate the banner freezes on the last phase the daemon
+  // happened to be in before disconnect ("Step: crons · about 2m remaining"
+  // -- forever), which is the exact symptom that prompted the fix.
+  try {
+    var cs = await fetch('/api/cloud-status').then(function(r){ return r.ok ? r.json() : null; }).catch(function(){ return null; });
+    if (cs && (cs.disabled || !cs.configured)) return;
+  } catch (e) {}
+  // Only show on a cold install: no events yet, or a sync explicitly in progress.
+  var health = await fetch('/api/local/health').then(function(r){ return r.ok ? r.json() : null; }).catch(function(){ return null; });
+  var prog = await fetch('/api/sync-progress').then(function(r){ return r.ok ? r.json() : null; }).catch(function(){ return null; });
+  var cold = !health || (health.event_count || 0) === 0;
+  var syncing = prog && prog.phase && prog.status !== 'complete';
+  // Don't show again for 1 hour after we last cleared.
+  var lastVerified = 0;
+  try { lastVerified = parseInt(localStorage.getItem('cm-sync-verified-ts') || '0', 10) || 0; } catch (e) {}
+  var recentlyVerified = lastVerified && (Date.now() - lastVerified < 3600000);
+  if (recentlyVerified && !syncing) return;
+  if (!cold && !syncing) return;
+  // Show + start polling.
+  var el = document.getElementById('sync-status-banner');
+  if (!el) return;
+  el.style.display = 'block';
+  window._cmSync.startedAt = Date.now();
+  _cmSyncRender(prog, health);
+  // #1969: was setInterval(.., 2500) ungated -> fired /api/sync-progress AND
+  // /api/local/health every 2.5s on every tab and while hidden (24 reqs in a
+  // 25s window). Route through the visibility wrapper and slow to 15s; the
+  // banner self-dismisses via _cmSyncDismiss when sync verifies, so this
+  // bounds the cost to ~1 request-pair / 15s when active and 0 when hidden.
+  window._cmSync.pollTimer = (typeof visibilitySetInterval === 'function'
+    ? visibilitySetInterval
+    : setInterval)(_cmSyncTick, 15000);
+}
+setTimeout(function(){ try { cmSyncInit(); } catch (e) {} }, 800);
+
 // ── Sub-Agent Tree ────────────────────────────────────────────────────────
 var _subagentsTimer = null;
 var _subagentsExpanded = {};
@@ -7920,7 +15267,7 @@ async function loadSubagents() {
     var agents = data.subagents || [];
     var counts = data.counts || {};
     if (agents.length === 0) {
-      el.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:24px;text-align:center;">No sub-agents found. Sub-agents appear here when spawned by the main session.</div>';
+      el.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:24px;text-align:center;">' + t("app.no_sub_agents_found_sub_agents_appear_here_when_sp", null, "No sub-agents found. Sub-agents appear here when spawned by the main session.") + '</div>';
       return;
     }
     var byId = {};
@@ -7937,9 +15284,10 @@ async function loadSubagents() {
       }
     });
     function statusDot(status) {
-      var colors = { active: '#16a34a', idle: '#d97706', stale: '#6b7280', failed: '#ef4444' };
+      var colors = { active: '#16a34a', idle: '#d97706', stale: '#6b7280', failed: '#ef4444', paused: '#7c3aed' };
       var glow = status === 'active' ? 'box-shadow:0 0 6px rgba(22,163,74,0.6);'
-               : status === 'failed' ? 'box-shadow:0 0 6px rgba(239,68,68,0.5);' : '';
+               : status === 'failed' ? 'box-shadow:0 0 6px rgba(239,68,68,0.5);'
+               : status === 'paused' ? 'box-shadow:0 0 6px rgba(124,58,237,0.5);' : '';
       return '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + (colors[status] || '#6b7280') + ';' + glow + 'flex-shrink:0;margin-right:4px;"></span>';
     }
     function renderAgent(a, depth) {
@@ -7970,6 +15318,18 @@ async function loadSubagents() {
       html += '<span style="font-size:11px;color:var(--text-muted);white-space:nowrap;margin-left:8px;">' + escHtml(a.model || '') + '</span>';
       html += '<span style="font-size:11px;color:var(--text-muted);white-space:nowrap;margin-left:8px;">' + tokens + ' tok</span>';
       html += '<span style="font-size:11px;color:var(--text-faint);white-space:nowrap;margin-left:8px;">' + escHtml(a.runtime || '') + '</span>';
+      if (a.status !== 'failed' && a.status !== 'stale' && a.status !== 'stopped') {
+        var keyBtn = (a.key || a.sessionId || '').replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+        var isPaused = a.status === 'paused';
+        html += '<span onclick="event.stopPropagation();" style="margin-left:8px;display:inline-flex;gap:4px;flex-shrink:0;">';
+        if (isPaused) {
+          html += '<button onclick="event.stopPropagation();controlAgent(\'' + keyBtn + '\',\'resume\')" style="font-size:10px;padding:2px 6px;border-radius:4px;border:1px solid #16a34a;background:transparent;color:#16a34a;cursor:pointer;">Resume</button>';
+        } else {
+          html += '<button onclick="event.stopPropagation();controlAgent(\'' + keyBtn + '\',\'pause\')" style="font-size:10px;padding:2px 6px;border-radius:4px;border:1px solid var(--border-primary);background:transparent;color:var(--text-muted);cursor:pointer;">Pause</button>';
+        }
+        html += '<button onclick="event.stopPropagation();controlAgent(\'' + keyBtn + '\',\'stop\')" style="font-size:10px;padding:2px 6px;border-radius:4px;border:1px solid rgba(239,68,68,0.5);background:transparent;color:#ef4444;cursor:pointer;">Stop</button>';
+        html += '</span>';
+      }
       html += '</div>';
       if (hasChildren && isExpanded) {
         childrenOf[sid].forEach(function(child) { html += renderAgent(child, depth + 1); });
@@ -7988,7 +15348,7 @@ async function loadSubagents() {
     treeHtml += '</div>';
     el.innerHTML = treeHtml;
   } catch(e) {
-    el.innerHTML = '<div style="color:#e74c3c;font-size:13px;padding:16px;">Failed to load sub-agents: ' + escHtml(String(e)) + '</div>';
+    el.innerHTML = '<div style="color:#e74c3c;font-size:13px;padding:16px;">' + t("app.failed_to_load_sub_agents", null, "Failed to load sub-agents") + ': ' + escHtml(String(e)) + '</div>';
   }
 }
 
@@ -7997,15 +15357,864 @@ function _saToggle(sid) {
   loadSubagents();
 }
 
+async function loadOrchestration() {
+  var el = document.getElementById('orchestration-board');
+  if (!el) return;
+  try {
+    var data = await fetch('/api/orchestration').then(function(r) { return r.json(); });
+    var agents = data.agents || [];
+    var summary = data.summary || {};
+    if (agents.length === 0) { el.innerHTML = ''; return; }
+    var statusColors = {
+      active: '#16a34a', running: '#16a34a', idle: '#d97706',
+      stale: '#6b7280', failed: '#ef4444', paused: '#7c3aed', completed: '#3b82f6'
+    };
+    var html = '<div style="border:1px solid var(--border-primary);border-radius:10px;overflow:hidden;margin-bottom:4px;">';
+    html += '<div style="display:flex;align-items:center;gap:16px;padding:8px 14px;background:var(--bg-secondary);border-bottom:1px solid var(--border-primary);font-size:12px;flex-wrap:wrap;">';
+    html += '<span style="font-weight:700;color:var(--text-primary);font-size:13px;">🤖 Orchestration</span>';
+    html += '<span style="color:var(--text-muted);"><strong style="color:var(--text-primary);">' + (summary.total || 0) + '</strong> agents</span>';
+    if (summary.active) html += '<span style="color:#16a34a;"><strong>' + summary.active + '</strong> active</span>';
+    if (summary.total_cost_usd) {
+      html += '<span style="color:var(--text-muted);">$<strong style="color:var(--text-primary);">' + summary.total_cost_usd.toFixed(4) + '</strong> total cost</span>';
+    }
+    html += '</div>';
+    html += '<div style="display:flex;flex-wrap:wrap;gap:8px;padding:10px;">';
+    agents.forEach(function(a) {
+      var color = statusColors[a.status] || '#6b7280';
+      var glow = (a.status === 'active' || a.status === 'running') ? 'box-shadow:0 0 0 1px ' + color + '40;' : '';
+      var costStr = (a.costUsd > 0) ? '$' + a.costUsd.toFixed(4) : '';
+      var tokens = a.totalTokens >= 1000 ? (a.totalTokens / 1000).toFixed(1) + 'K tok' : (a.totalTokens > 0 ? a.totalTokens + ' tok' : '');
+      var depthBadge = (a.depth > 1) ? '<span style="font-size:9px;background:var(--bg-secondary);border:1px solid var(--border-primary);border-radius:3px;padding:0 4px;color:var(--text-muted);margin-left:4px;">d' + a.depth + '</span>' : '';
+      html += '<div style="flex:0 0 auto;min-width:155px;max-width:215px;border:1px solid var(--border-primary);border-radius:8px;padding:8px 10px;background:var(--bg-card);' + glow + '">';
+      html += '<div style="display:flex;align-items:center;gap:5px;margin-bottom:4px;">';
+      html += '<span style="width:8px;height:8px;border-radius:50%;background:' + color + ';display:inline-block;flex-shrink:0;"></span>';
+      html += '<span style="font-size:12px;font-weight:600;color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;" title="' + escHtml(a.displayName) + '">' + escHtml(a.displayName) + '</span>';
+      html += depthBadge;
+      html += '</div>';
+      if (a.model && a.model !== 'unknown') {
+        html += '<div style="font-size:10px;color:var(--text-muted);margin-bottom:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escHtml(a.model) + '</div>';
+      }
+      if (costStr || tokens) {
+        html += '<div style="display:flex;gap:8px;font-size:10px;color:var(--text-faint);">';
+        if (costStr) html += '<span style="color:#16a34a;">' + escHtml(costStr) + '</span>';
+        if (tokens) html += '<span>' + escHtml(tokens) + '</span>';
+        html += '</div>';
+      }
+      html += '</div>';
+    });
+    html += '</div></div>';
+    el.innerHTML = html;
+  } catch(e) {
+    var board = document.getElementById('orchestration-board');
+    if (board) board.innerHTML = '';
+  }
+}
+
+async function controlAgent(key, action) {
+  if (action === 'stop') {
+    if (!confirm('Stop agent ' + key + '? This will attempt to terminate it via the gateway and cannot be undone.')) return;
+  }
+  try {
+    var body = action === 'stop' ? {confirm: true} : {};
+    var r = await fetch('/api/agents/' + encodeURIComponent(key) + '/' + action, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    var d = await r.json();
+    if (d.ok) {
+      loadSubagents();
+    } else {
+      alert('Agent ' + action + ' failed: ' + (d.error || 'unknown error'));
+    }
+  } catch(e) {
+    alert('Request failed: ' + e);
+  }
+}
+
+// OpenClaw queue-lane defaults (docs.openclaw.ai/concepts/queue): the
+// subagent lane caps at 8 and the main lane at 4 concurrent runs. cli/cron
+// have no fixed small cap, so we show live running count without a "/cap".
+var _RUN_LEDGER_LANE_CAPS = { subagent: 8, main: 4 };
+// Interactive state: which lane is filtered (null = all) and which run rows
+// are expanded into their detail drawer. Kept module-level so a 5s refresh
+// re-render preserves the user's drill-down.
+var _rlLaneFilter = null;
+var _rlExpanded = {};
+var _rlData = { lanes: [], runs: [] };
+
+// Live OpenClaw run-ledger view: queue-lane saturation bars + recent runs.
+// `runtime` IS the OpenClaw queue lane (cli / cron / subagent), so the lane
+// rollup doubles as the queue/concurrency monitor. Reads /api/run-ledger,
+// which the sync daemon mirrors from ~/.openclaw/tasks/runs.sqlite.
+// Interactive: click a lane to filter, click a run to expand its detail +
+// jump to the child session transcript.
+async function loadRunLedger() {
+  var el = document.getElementById('run-ledger-panel');
+  if (!el) return;
+  try {
+    var data = await fetch('/api/run-ledger?limit=120').then(function(r){ return r.json(); });
+    _rlData = { lanes: data.lanes || [], runs: data.runs || [] };
+    _rlRender();
+  } catch(e) {
+    el.innerHTML = '<div style="color:#e74c3c;font-size:13px;padding:16px;">' + t("app.failed_to_load_run_ledger", null, "Failed to load run ledger") + ': '+escHtml(String(e))+'</div>';
+  }
+}
+
+function _rlSetLane(lane) {
+  _rlLaneFilter = (_rlLaneFilter === lane) ? null : lane;  // toggle
+  _rlRender();
+}
+function _rlToggleRun(tid) {
+  _rlExpanded[tid] = !_rlExpanded[tid];
+  _rlRender();
+}
+function _rlOpenSession(key) {
+  // Jump to the child session's transcript (same deep-link the tree uses).
+  try { if (typeof viewTranscript === 'function') { viewTranscript(key); return; } } catch(e) {}
+  try { window.location.hash = 'session=' + encodeURIComponent(key); } catch(e) {}
+}
+
+function _rlRender() {
+  var el = document.getElementById('run-ledger-panel');
+  if (!el) return;
+  var lanes = _rlData.lanes || [], runs = _rlData.runs || [];
+  if (lanes.length === 0 && runs.length === 0) {
+    el.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;border:1px solid var(--border-primary);border-radius:10px;">' + t("app.no_background_runs_yet_sub_agent_cron_and_cli_runs", null, "No background runs yet. Sub-agent, cron and CLI runs from OpenClaw’s task ledger appear here as they execute.") + '</div>';
+    return;
+  }
+  function laneColor(lane){ return ({subagent:'#8b5cf6',cron:'#0ea5e9',cli:'#16a34a'})[lane] || '#6b7280'; }
+  function jsq(s){ return String(s==null?'':s).replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
+
+  // ── Lane bars (clickable filters) ──
+  var laneHtml = '<div style="border:1px solid var(--border-primary);border-radius:10px;padding:14px;">';
+  laneHtml += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;"><span style="font-size:12px;font-weight:700;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.5px;">Queue lanes</span>';
+  if (_rlLaneFilter) laneHtml += '<span style="font-size:11px;color:var(--text-muted);">· filtered to <strong style="color:'+laneColor(_rlLaneFilter)+'">'+escHtml(_rlLaneFilter)+'</strong> <a onclick="_rlSetLane(\''+jsq(_rlLaneFilter)+'\')" style="cursor:pointer;color:var(--accent,#3b82f6);">clear ✕</a></span>';
+  else laneHtml += '<span style="font-size:11px;color:var(--text-faint);">click a lane to filter</span>';
+  laneHtml += '</div>';
+  lanes.forEach(function(L){
+    var cap = _RUN_LEDGER_LANE_CAPS[L.lane];
+    var running = L.running||0, total = L.total||0, ok = L.succeeded||0, failed = L.failed||0, queued = L.queued||0;
+    var capLabel = cap ? (running + '/' + cap) : ('' + running);
+    var active = (_rlLaneFilter === L.lane);
+    function seg(n,color){ return total>0 ? '<span style="height:100%;width:'+(n/total*100)+'%;background:'+color+';display:inline-block;"></span>' : ''; }
+    laneHtml += '<div onclick="_rlSetLane(\''+jsq(L.lane)+'\')" title="Filter runs to the '+escHtml(L.lane)+' lane" style="margin-bottom:10px;cursor:pointer;border-radius:7px;padding:6px 8px;'+(active?'background:var(--bg-hover);outline:1px solid '+laneColor(L.lane)+';':'')+'transition:background .1s;" onmouseover="this.style.background=\'var(--bg-hover)\'" onmouseout="this.style.background=\''+(active?'var(--bg-hover)':'')+'\'">';
+    laneHtml += '<div style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:4px;">';
+    laneHtml += '<span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:'+laneColor(L.lane)+';"></span>';
+    laneHtml += '<span style="font-weight:700;color:var(--text-primary);">'+escHtml(L.lane)+'</span>';
+    laneHtml += '<span style="font-size:11px;font-weight:600;color:'+(running>0?'#16a34a':'var(--text-muted)')+';">'+(running>0 ? ('● '+capLabel+' running') : 'idle')+'</span>';
+    laneHtml += '<span style="flex:1;"></span>';
+    laneHtml += '<span style="font-size:11px;color:var(--text-muted);">'+total+' runs · '+ok+'✓'+(failed?(' · '+failed+'✗'):'')+'</span>';
+    laneHtml += '</div>';
+    laneHtml += '<div style="display:flex;height:7px;border-radius:4px;overflow:hidden;background:var(--bg-secondary);">';
+    laneHtml += seg(ok,'#16a34a')+seg(running,'#3b82f6')+seg(queued,'#d97706')+seg(failed,'#ef4444');
+    laneHtml += '</div></div>';
+  });
+  laneHtml += '</div>';
+
+  function pill(status){
+    var m = {succeeded:['#16a34a','rgba(22,163,74,.12)'],success:['#16a34a','rgba(22,163,74,.12)'],running:['#3b82f6','rgba(59,130,246,.12)'],failed:['#ef4444','rgba(239,68,68,.12)'],timeout:['#ef4444','rgba(239,68,68,.12)']};
+    var c = m[status] || ['#6b7280','var(--bg-secondary)'];
+    return '<span style="font-size:10px;font-weight:700;color:'+c[0]+';background:'+c[1]+';border-radius:4px;padding:1px 6px;">'+escHtml(String(status||'?'))+'</span>';
+  }
+  function dur(s){ if(!s.started_at||!s.ended_at) return ''; var ms=s.ended_at-s.started_at; if(ms<0) return ''; if(ms<1000) return ms+'ms'; if(ms<60000) return (ms/1000).toFixed(1)+'s'; return Math.round(ms/60000)+'m'; }
+  function tsLabel(ms){ if(!ms) return '-'; try { return new Date(ms).toLocaleString(); } catch(e){ return String(ms); } }
+
+  // ── Recent runs (filtered + clickable to expand) ──
+  var shown = _rlLaneFilter ? runs.filter(function(r){ return r.runtime === _rlLaneFilter; }) : runs;
+  var runHtml = '<div style="border:1px solid var(--border-primary);border-radius:10px;margin-top:14px;overflow:hidden;">';
+  runHtml += '<div style="font-size:12px;font-weight:700;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.5px;padding:12px 14px;border-bottom:1px solid var(--border-primary);">Recent runs'+(_rlLaneFilter?(' · '+escHtml(_rlLaneFilter)):'')+' <span style="color:var(--text-faint);font-weight:500;">('+shown.length+')</span></div>';
+  if (shown.length === 0) {
+    runHtml += '<div style="padding:14px;color:var(--text-muted);font-size:12px;">No runs in this lane.</div>';
+  }
+  shown.slice(0,60).forEach(function(s){
+    var tid = s.task_id || s.run_id || '';
+    var open = !!_rlExpanded[tid];
+    runHtml += '<div onclick="_rlToggleRun(\''+jsq(tid)+'\')" style="display:flex;align-items:center;gap:10px;padding:7px 14px;border-bottom:1px solid var(--border-secondary);font-size:12px;cursor:pointer;" onmouseover="this.style.background=\'var(--bg-hover)\'" onmouseout="this.style.background=\'\'">';
+    runHtml += '<span style="color:var(--text-faint);font-size:10px;width:10px;">'+(open?'▼':'▶')+'</span>';
+    runHtml += pill(s.status);
+    runHtml += '<span style="font-size:10px;color:var(--text-faint);background:var(--bg-secondary);border-radius:4px;padding:1px 6px;min-width:54px;text-align:center;">'+escHtml(s.runtime||'')+'</span>';
+    runHtml += '<span style="flex:1;color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="'+escHtml(s.label||'')+'">'+escHtml(s.label||'(untitled)')+'</span>';
+    var d = dur(s); if(d) runHtml += '<span style="color:var(--text-muted);white-space:nowrap;">'+d+'</span>';
+    runHtml += '</div>';
+    if (open) {
+      runHtml += '<div style="padding:10px 14px 12px 34px;background:var(--bg-secondary);border-bottom:1px solid var(--border-secondary);font-size:11px;color:var(--text-secondary);line-height:1.7;">';
+      function row(k,v){ return '<div><span style="color:var(--text-muted);display:inline-block;min-width:120px;">'+k+'</span>'+v+'</div>'; }
+      if (s.run_id) runHtml += row('run id', '<code style="color:var(--text-primary);">'+escHtml(s.run_id)+'</code>');
+      if (s.agent_id) runHtml += row('agent', escHtml(s.agent_id));
+      if (s.scope_kind || s.task_kind) runHtml += row('scope', escHtml((s.scope_kind||'')+(s.task_kind?(' · '+s.task_kind):'')));
+      if (s.delivery_status) runHtml += row('delivery', escHtml(s.delivery_status));
+      if (s.terminal_outcome) runHtml += row('outcome', escHtml(s.terminal_outcome));
+      runHtml += row('created', tsLabel(s.created_at));
+      if (s.ended_at) runHtml += row('ended', tsLabel(s.ended_at));
+      if (s.error) runHtml += '<div style="margin-top:4px;color:#ef4444;"><span style="color:var(--text-muted);display:inline-block;min-width:120px;">error</span>'+escHtml(String(s.error).slice(0,400))+'</div>';
+      if (s.child_session_key) {
+        runHtml += '<div style="margin-top:8px;"><button onclick="event.stopPropagation();_rlOpenSession(\''+jsq(s.child_session_key)+'\')" style="font-size:11px;font-weight:600;cursor:pointer;background:var(--accent,#3b82f6);color:#fff;border:none;border-radius:5px;padding:4px 10px;">Open session →</button> <span style="color:var(--text-faint);margin-left:6px;">'+escHtml(s.child_session_key)+'</span></div>';
+      }
+      runHtml += '</div>';
+    }
+  });
+  runHtml += '</div>';
+  el.innerHTML = laneHtml + runHtml;
+}
+
+// ── Tool catalog: provenance + p50/p95 latency (PRD P1-3) ───────────────────
+// Interactive catalog of every tool the agent invoked, grouped by provenance
+// (builtin / MCP / plugin) with call count + p50/p95 latency + error rate.
+// Rows are clickable → expand to the tool's recent individual calls (each
+// linking to its session transcript). Sortable + provenance-filterable.
+// Reads /api/tool-catalog (derived from DuckDB tool_call/tool_result pairs).
+var _toolCatalogData = null;       // last /api/tool-catalog payload
+var _tcExpanded = {};              // tool name -> bool (row expanded)
+var _tcCallsCache = {};            // tool name -> recent-calls payload
+
+function _tcProvBadge(prov, provider) {
+  var map = {
+    builtin: ['#0ea5e9', 'rgba(14,165,233,.12)', 'builtin'],
+    mcp:     ['#8b5cf6', 'rgba(139,92,246,.12)', 'MCP' + (provider ? (' · ' + provider) : '')],
+    plugin:  ['#d97706', 'rgba(217,119,6,.12)', 'plugin']
+  };
+  var c = map[prov] || ['#6b7280', 'var(--bg-secondary)', prov || 'unknown'];
+  var tip = prov === 'builtin' ? 'In the OpenClaw sandbox tool allow-list'
+          : prov === 'mcp' ? ('MCP-namespaced tool' + (provider ? (' from provider "' + provider + '"') : ''))
+          : 'Not a sandbox builtin and not MCP-namespaced (plugin / custom / unknown)';
+  return '<span title="' + escHtml(tip) + '" style="font-size:10px;font-weight:700;color:' + c[0] + ';background:' + c[1] + ';border-radius:4px;padding:1px 7px;white-space:nowrap;">' + escHtml(c[2]) + '</span>';
+}
+
+function _tcFmtMs(ms) {
+  if (ms === null || ms === undefined) return '<span style="color:var(--text-faint);" title="No matching tool_result captured for these calls">&mdash;</span>';
+  if (ms < 1000) return ms + 'ms';
+  if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
+  return Math.round(ms / 60000) + 'm';
+}
+
+function _tcSortTools(tools) {
+  var sel = document.getElementById('tc-sort');
+  var mode = sel ? sel.value : 'calls';
+  var arr = tools.slice();
+  if (mode === 'name') arr.sort(function(a, b) { return a.name.localeCompare(b.name); });
+  else if (mode === 'p95') arr.sort(function(a, b) { return (b.p95_ms || 0) - (a.p95_ms || 0); });
+  else if (mode === 'p50') arr.sort(function(a, b) { return (b.p50_ms || 0) - (a.p50_ms || 0); });
+  else if (mode === 'errors') arr.sort(function(a, b) { return (b.error_rate || 0) - (a.error_rate || 0) || (b.calls - a.calls); });
+  else arr.sort(function(a, b) { return (b.calls - a.calls) || ((b.p95_ms || 0) - (a.p95_ms || 0)); });
+  return arr;
+}
+
+async function loadToolCatalog() {
+  var tableEl = document.getElementById('tc-table');
+  var sumEl = document.getElementById('tc-summary');
+  if (!tableEl) return;
+  var provSel = document.getElementById('tc-prov-filter');
+  var provQ = provSel && provSel.value ? ('?provenance=' + encodeURIComponent(provSel.value)) : '';
+  try {
+    var data = await fetch('/api/tool-catalog' + provQ).then(function(r) { return r.json(); });
+    _toolCatalogData = data;
+    _tcCallsCache = {};  // catalog refreshed → drop stale per-call caches
+    // Provenance summary chips.
+    if (sumEl) {
+      var g = data.groups || {}, t = data.totals || {};
+      var chips = '';
+      function chip(label, val, color) {
+        return '<span style="font-size:12px;color:var(--text-muted);background:var(--bg-secondary);border:1px solid var(--border-primary);border-radius:8px;padding:5px 11px;"><strong style="color:' + color + ';">' + val + '</strong> ' + label + '</span>';
+      }
+      chips += chip('tools', t.tool_count || 0, 'var(--text-primary)');
+      chips += chip('calls', t.total_calls || 0, 'var(--text-primary)');
+      chips += chip('builtin', g.builtin || 0, '#0ea5e9');
+      chips += chip('MCP', g.mcp || 0, '#8b5cf6');
+      chips += chip('plugin', g.plugin || 0, '#d97706');
+      sumEl.innerHTML = chips;
+    }
+    renderToolCatalog();
+  } catch (e) {
+    tableEl.innerHTML = '<div style="color:#e74c3c;font-size:13px;padding:16px;">' + t("app.failed_to_load_tool_catalog", null, "Failed to load tool catalog") + ': ' + escHtml(String(e)) + '</div>';
+  }
+  // Per-MCP-server rollup (#2007) — independent of the provenance filter.
+  loadMcpServers();
+}
+
+// ── Per-MCP-server rollup (#2007) ───────────────────────────────────────────
+// Reads /api/mcp-servers (same DuckDB tool_call/tool_result join as the
+// catalog, re-aggregated by MCP server) and renders a compact per-server card:
+// call volume, p50/p95 latency, error rate, top tools, and the model spend of
+// the turns that called the server. Hidden when no MCP servers were used.
+function _mcpFmtMs(ms) {
+  if (ms === null || ms === undefined) return '<span style="color:var(--text-faint);">&mdash;</span>';
+  if (ms < 1000) return ms + 'ms';
+  if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
+  return Math.round(ms / 60000) + 'm';
+}
+
+async function loadMcpServers() {
+  var section = document.getElementById('mcp-servers-section');
+  var card = document.getElementById('mcp-servers-card');
+  if (!section || !card) return;
+  try {
+    var data = await fetch('/api/mcp-servers').then(function(r) { return r.json(); });
+    var servers = (data && data.servers) || [];
+    if (servers.length === 0) { section.style.display = 'none'; return; }
+    section.style.display = 'block';
+    var maxCalls = servers.reduce(function(m, s) { return Math.max(m, s.calls || 0); }, 1);
+    var html = '';
+    servers.forEach(function(s, i) {
+      var errPct = Math.round((s.error_rate || 0) * 100);
+      var errColor = errPct >= 20 ? '#dc2626' : errPct > 0 ? '#d97706' : 'var(--text-muted)';
+      var barW = Math.round(((s.calls || 0) / maxCalls) * 100);
+      var topTools = (s.top_tools || []).map(function(t) {
+        return '<span style="font-size:10px;color:var(--text-muted);background:var(--bg-secondary);border-radius:4px;padding:1px 6px;">' + escHtml(t.name) + ' &middot; ' + t.calls + '</span>';
+      }).join(' ');
+      html += '<div style="padding:11px 14px;' + (i > 0 ? 'border-top:1px solid var(--border-primary);' : '') + '">';
+      html += '<div style="display:flex;align-items:center;gap:12px;">';
+      html += '<div style="flex:1;min-width:0;">';
+      html += '<div style="font-size:13px;font-weight:600;color:var(--text-primary);">' + escHtml(s.display_name || s.server) + '</div>';
+      html += '<div style="height:4px;background:var(--bg-secondary);border-radius:3px;margin-top:5px;max-width:220px;"><div style="width:' + barW + '%;height:100%;background:#8b5cf6;border-radius:3px;"></div></div>';
+      html += '</div>';
+      html += '<div style="display:flex;gap:18px;font-size:12px;text-align:right;flex-shrink:0;">';
+      html += '<div><div style="font-weight:700;color:var(--text-primary);">' + (s.calls || 0) + '</div><div style="font-size:10px;color:var(--text-muted);">calls</div></div>';
+      html += '<div title="median / 95th-percentile call duration"><div style="font-weight:700;color:var(--text-primary);">' + _mcpFmtMs(s.p50_ms) + ' / ' + _mcpFmtMs(s.p95_ms) + '</div><div style="font-size:10px;color:var(--text-muted);">p50 / p95</div></div>';
+      html += '<div><div style="font-weight:700;color:' + errColor + ';">' + errPct + '%</div><div style="font-size:10px;color:var(--text-muted);">errors</div></div>';
+      html += '<div title="Model spend on the turns that called this server (cache-aware). Not the MCP execution cost."><div style="font-weight:700;color:var(--text-primary);">$' + (s.cost_usd >= 0.01 ? Number(s.cost_usd).toFixed(2) : (s.cost_usd > 0 ? '&lt;0.01' : '0.00')) + '</div><div style="font-size:10px;color:var(--text-muted);">turn spend</div></div>';
+      html += '</div></div>';
+      if (topTools) html += '<div style="margin-top:7px;display:flex;gap:5px;flex-wrap:wrap;">' + topTools + '</div>';
+      html += '</div>';
+    });
+    card.innerHTML = html;
+  } catch (e) {
+    section.style.display = 'none';
+  }
+}
+
+function renderToolCatalog() {
+  var tableEl = document.getElementById('tc-table');
+  if (!tableEl || !_toolCatalogData) return;
+  var tools = _tcSortTools(_toolCatalogData.tools || []);
+  if (tools.length === 0) {
+    tableEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:24px;text-align:center;">' + t("app.no_tool_calls_recorded_yet_tools_appear_here_as_th", null, "No tool calls recorded yet. Tools appear here as the agent invokes them (derived from tool_call &rarr; tool_result event pairs).") + '</div>';
+    return;
+  }
+  var html = '';
+  // Header row.
+  html += '<div style="display:flex;align-items:center;gap:10px;padding:9px 14px;background:var(--bg-secondary);border-bottom:1px solid var(--border-primary);font-size:11px;font-weight:700;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.5px;">';
+  html += '<span style="width:14px;"></span>';
+  html += '<span style="flex:1;">Tool</span>';
+  html += '<span style="width:96px;">Provenance</span>';
+  html += '<span style="width:54px;text-align:right;" title="Number of times this tool was called">Calls</span>';
+  html += '<span style="width:62px;text-align:right;" title="Median (50th percentile) call duration">p50</span>';
+  html += '<span style="width:62px;text-align:right;" title="95th percentile call duration">p95</span>';
+  html += '<span style="width:64px;text-align:right;" title="Share of calls that returned an error">Errors</span>';
+  html += '</div>';
+  tools.forEach(function(tool) {
+    var expanded = !!_tcExpanded[tool.name];
+    var errPct = (tool.error_rate || 0) * 100;
+    var errColor = errPct > 0 ? '#ef4444' : 'var(--text-muted)';
+    var nameEsc = tool.name.replace(/'/g, "\\'");
+    html += '<div onclick="_tcToggle(\'' + nameEsc + '\')" title="Click to expand recent calls for ' + escHtml(tool.name) + '" style="display:flex;align-items:center;gap:10px;padding:9px 14px;border-bottom:1px solid var(--border-secondary);font-size:13px;cursor:pointer;transition:background 0.1s;" onmouseover="this.style.background=\'var(--bg-hover)\'" onmouseout="this.style.background=\'\'">';
+    html += '<span style="width:14px;color:var(--text-muted);font-size:11px;">' + (expanded ? '&#9660;' : '&#9654;') + '</span>';
+    html += '<span style="flex:1;font-weight:600;color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono,monospace);" title="' + escHtml(tool.name) + '">' + escHtml(tool.name) + '</span>';
+    html += '<span style="width:96px;">' + _tcProvBadge(tool.provenance, tool.provider) + '</span>';
+    html += '<span style="width:54px;text-align:right;color:var(--text-primary);font-variant-numeric:tabular-nums;">' + tool.calls + '</span>';
+    html += '<span style="width:62px;text-align:right;color:var(--text-muted);font-variant-numeric:tabular-nums;">' + _tcFmtMs(tool.p50_ms) + '</span>';
+    html += '<span style="width:62px;text-align:right;color:var(--text-muted);font-variant-numeric:tabular-nums;">' + _tcFmtMs(tool.p95_ms) + '</span>';
+    html += '<span style="width:64px;text-align:right;color:' + errColor + ';font-variant-numeric:tabular-nums;" title="' + (tool.errors || 0) + ' of ' + tool.calls + ' calls errored">' + errPct.toFixed(errPct > 0 && errPct < 1 ? 1 : 0) + '%</span>';
+    html += '</div>';
+    if (expanded) {
+      html += '<div id="tc-calls-' + encodeURIComponent(tool.name) + '" style="background:var(--bg-secondary);border-bottom:1px solid var(--border-secondary);padding:6px 14px 10px 38px;font-size:12px;color:var(--text-muted);">Loading recent calls&hellip;</div>';
+    }
+  });
+  tableEl.innerHTML = html;
+  // Lazy-load the per-call drill-down for any expanded row.
+  tools.forEach(function(tool) {
+    if (_tcExpanded[tool.name]) _tcLoadCalls(tool.name);
+  });
+}
+
+// ── Harness tab: declarative per-runtime custom panels ────────────────────
+// A "harness template" (served by /api/harness/templates; OSS ships openclaw +
+// nemoclaw, clawmetry-pro registers its 12 closed ones) declares ordered
+// sections, each with a data `source` path and a `render` hint. This renderer is
+// generic — it never hard-codes a harness; it just interprets the template.
+var _cmHarnessTemplates = null;   // {runtime: template}, fetched once
+var _cmHarnessData = null;
+
+// Show the Harness nav iff a specific runtime is selected AND it has a template.
+function _cmRefreshHarnessNav() {
+  var nav = document.getElementById('left-nav-harness');
+  if (!nav) return;
+  var rt = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+  if (!rt || rt === 'all') { nav.style.display = 'none'; return; }
+  nav.style.display = (_cmHarnessTemplates && _cmHarnessTemplates[rt]) ? '' : 'none';
+}
+
+// Eagerly fetch templates at page-init so the nav can appear without waiting
+// for the user to visit the Harness tab.
+async function _cmInitHarnessNav() {
+  if (_cmHarnessTemplates) { _cmRefreshHarnessNav(); return; }
+  try {
+    var t = await fetch('/api/harness/templates').then(function (r) { return r.json(); });
+    _cmHarnessTemplates = (t && t.templates) || {};
+  } catch (e) { /* non-fatal -- nav stays hidden */ }
+  _cmRefreshHarnessNav();
+}
+
+async function loadHarness() {
+  var el = document.getElementById('harness-container');
+  if (!el) return;
+  var rt = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+  if (!rt || rt === 'all') rt = 'openclaw';
+  try {
+    if (!_cmHarnessTemplates) {
+      var t = await fetch('/api/harness/templates').then(function (r) { return r.json(); });
+      _cmHarnessTemplates = (t && t.templates) || {};
+      _cmRefreshHarnessNav();
+    }
+    var tmpl = _cmHarnessTemplates[rt];
+    if (!tmpl) { el.innerHTML = _cmHarnessNoTemplate(rt); return; }
+    var data = await fetch('/api/harness/data?runtime=' + encodeURIComponent(rt))
+                 .then(function (r) { return r.json(); });
+    _cmHarnessData = data;
+    el.innerHTML = renderHarnessPanel(tmpl, data);
+  } catch (e) {
+    el.innerHTML = '<div style="color:var(--muted,#888);">Failed to load harness view: '
+      + escapeHtml(String((e && e.message) || e)) + '</div>';
+  }
+}
+
+function _cmHarnessNoTemplate(rt) {
+  return '<div style="color:var(--muted,#888);line-height:1.5;">No harness panel for <b>'
+    + escapeHtml(rt) + '</b> yet.<br>Pro runtimes light up their panels when '
+    + 'clawmetry-pro is installed (Cloud Pro or a self-hosted license).</div>';
+}
+
+// Resolve a template `source` path against the data blob:
+//   "summary.cost_usd"        -> data.summary.cost_usd  (scalar)
+//   "sessions[]"              -> data.sessions          (array, for tables)
+//   "sessions[].extra.recipe" -> [s.extra.recipe ...]   (plucked, non-empty)
+//   "extra.skills"            -> data.extra.skills
+function _cmHarnessResolve(source, data) {
+  if (!source) return undefined;
+  var m = String(source).match(/^([a-zA-Z0-9_]+)\[\](?:\.(.+))?$/);
+  if (m) {
+    var arr = data && data[m[1]];
+    if (!Array.isArray(arr)) return [];
+    if (!m[2]) return arr;
+    return arr.map(function (it) { return _cmHarnessGet(it, m[2]); })
+              .filter(function (v) { return v !== undefined && v !== null && v !== ''; });
+  }
+  return _cmHarnessGet(data, source);
+}
+
+function _cmHarnessGet(obj, path) {
+  var parts = String(path).split('.'), cur = obj;
+  for (var i = 0; i < parts.length; i++) {
+    if (cur == null) return undefined;
+    cur = cur[parts[i]];
+  }
+  return cur;
+}
+
+function renderHarnessPanel(tmpl, data) {
+  var pro = tmpl.tier === 'pro'
+    ? '<span style="background:#3a2f00;color:#ffd24a;border:1px solid #6b5600;border-radius:10px;padding:2px 8px;font-size:11px;font-weight:700;">PRO</span>'
+    : '';
+  var html = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;">'
+    + '<span style="font-size:22px;">' + escapeHtml(tmpl.icon || '🧩') + '</span>'
+    + '<span style="font-size:17px;font-weight:700;">' + escapeHtml(tmpl.title || tmpl.runtime) + '</span>'
+    + pro + '</div>';
+  html += '<div style="display:flex;flex-wrap:wrap;gap:14px;">';
+  (tmpl.sections || []).forEach(function (sec) { html += renderHarnessSection(sec, data); });
+  html += '</div>';
+  return html;
+}
+
+function renderHarnessSection(sec, data) {
+  var val = _cmHarnessResolve(sec.source, data);
+  var body;
+  switch (sec.render) {
+    case 'count':      body = _hrCount(sec, val); break;
+    case 'kv':         body = _hrKv(sec, val); break;
+    case 'table':      body = _hrTable(sec, val); break;
+    case 'badge-list': body = _hrBadges(sec, val); break;
+    case 'timeline':   body = _hrTimeline(sec, val); break;
+    case 'bar':        body = _hrBar(sec, val); break;
+    default:           body = _hrJson(sec, val); break;   // json + unknown render
+  }
+  var empty = (val === undefined || val === null || val === ''
+               || (Array.isArray(val) && val.length === 0));
+  if (empty && sec.render !== 'count') {
+    body = '<div style="color:var(--muted,#888);font-size:13px;">'
+      + escapeHtml(sec.empty || 'No data') + '</div>';
+  }
+  var wide = (sec.render === 'table' || sec.render === 'timeline' || sec.render === 'json');
+  return '<div class="card" style="padding:12px 14px;flex:' + (wide ? '1 1 100%' : '1 1 200px')
+    + ';min-width:180px;">'
+    + '<div style="font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted,#888);margin-bottom:8px;">'
+    + escapeHtml(sec.title || sec.id) + '</div>' + body + '</div>';
+}
+
+function _hrFmtVal(sec, v) {
+  if (sec.format === 'money') {
+    var n = Number(v) || 0;
+    return '$' + (n > 0 && n < 0.01 ? n.toFixed(4) : n.toFixed(2));
+  }
+  return escapeHtml(String(v == null ? '0' : v));
+}
+
+function _hrCount(sec, v) {
+  return '<div style="font-size:26px;font-weight:700;">' + _hrFmtVal(sec, v == null ? 0 : v)
+    + (sec.unit ? ' <span style="font-size:13px;font-weight:400;color:var(--muted,#888);">'
+                  + escapeHtml(sec.unit) + '</span>' : '')
+    + '</div>';
+}
+
+function _hrKv(sec, v) {
+  if (v == null) return '';
+  if (typeof v !== 'object') return '<div>' + escapeHtml(String(v)) + '</div>';
+  return Object.keys(v).map(function (k) {
+    return '<div style="display:flex;justify-content:space-between;gap:12px;padding:3px 0;border-bottom:1px solid var(--border,#222);">'
+      + '<span style="color:var(--muted,#888);">' + escapeHtml(k) + '</span>'
+      + '<span>' + escapeHtml(String(v[k])) + '</span></div>';
+  }).join('');
+}
+
+function _hrTable(sec, rows) {
+  if (!Array.isArray(rows) || !rows.length) return '';
+  var cols = sec.columns || Object.keys(rows[0] || {});
+  var head = cols.map(function (c) {
+    return '<th style="text-align:left;padding:6px 10px;color:var(--muted,#888);font-weight:600;font-size:12px;">'
+      + escapeHtml(c) + '</th>';
+  }).join('');
+  var body = rows.map(function (r) {
+    return '<tr>' + cols.map(function (c) {
+      var cell = (r && typeof r === 'object') ? r[c] : '';
+      if (c === 'cost_usd') { var n = Number(cell) || 0; cell = '$' + (n > 0 && n < 0.01 ? n.toFixed(4) : n.toFixed(2)); }
+      return '<td style="padding:6px 10px;border-top:1px solid var(--border,#222);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:280px;">'
+        + escapeHtml(String(cell == null ? '' : cell)) + '</td>';
+    }).join('') + '</tr>';
+  }).join('');
+  return '<div style="overflow-x:auto;"><table style="border-collapse:collapse;width:100%;">'
+    + '<thead><tr>' + head + '</tr></thead><tbody>' + body + '</tbody></table></div>';
+}
+
+function _hrBadges(sec, v) {
+  var items = Array.isArray(v) ? v : (v == null ? [] : [v]);
+  var counts = {};
+  items.forEach(function (it) { var k = String(it); counts[k] = (counts[k] || 0) + 1; });
+  var keys = Object.keys(counts);
+  if (!keys.length) return '';
+  return '<div style="display:flex;flex-wrap:wrap;gap:6px;">' + keys.map(function (k) {
+    var c = counts[k];
+    return '<span style="background:var(--chip,#1c1c1c);border:1px solid var(--border,#333);border-radius:12px;padding:3px 10px;font-size:12px;">'
+      + escapeHtml(k) + (c > 1 ? ' <b>×' + c + '</b>' : '') + '</span>';
+  }).join('') + '</div>';
+}
+
+function _hrTimeline(sec, rows) {
+  if (!Array.isArray(rows) || !rows.length) return '';
+  return rows.slice(0, 50).map(function (r) {
+    var ts = (r && (r.ts || r.time || r.ended_at)) || '';
+    var label = (r && (r.label || r.title || r.name)) || (typeof r === 'string' ? r : JSON.stringify(r));
+    return '<div style="display:flex;gap:10px;padding:4px 0;border-bottom:1px solid var(--border,#222);font-size:13px;">'
+      + '<span style="color:var(--muted,#888);white-space:nowrap;">' + escapeHtml(String(ts)) + '</span>'
+      + '<span>' + escapeHtml(String(label)) + '</span></div>';
+  }).join('');
+}
+
+function _hrBar(sec, rows) {
+  var pairs = [];
+  if (Array.isArray(rows)) pairs = rows.map(function (r) { return [r.label || r.name || '', Number(r.value) || 0]; });
+  else if (rows && typeof rows === 'object') pairs = Object.keys(rows).map(function (k) { return [k, Number(rows[k]) || 0]; });
+  if (!pairs.length) return '';
+  var max = Math.max.apply(null, pairs.map(function (p) { return p[1]; })) || 1;
+  return pairs.map(function (p) {
+    var pct = Math.round(p[1] / max * 100);
+    return '<div style="margin:4px 0;font-size:12px;"><div style="display:flex;justify-content:space-between;">'
+      + '<span>' + escapeHtml(String(p[0])) + '</span><span>' + escapeHtml(String(p[1])) + '</span></div>'
+      + '<div style="height:6px;background:var(--border,#222);border-radius:3px;overflow:hidden;">'
+      + '<div style="height:100%;width:' + pct + '%;background:var(--accent,#5b8def);"></div></div></div>';
+  }).join('');
+}
+
+function _hrJson(sec, v) {
+  if (v === undefined || v === null) return '';
+  return '<pre style="white-space:pre-wrap;word-break:break-word;font-size:12px;margin:0;max-height:300px;overflow:auto;">'
+    + escapeHtml(JSON.stringify(v, null, 2)) + '</pre>';
+}
+
+function _tcToggle(name) {
+  _tcExpanded[name] = !_tcExpanded[name];
+  renderToolCatalog();
+}
+
+async function _tcLoadCalls(name) {
+  var el = document.getElementById('tc-calls-' + encodeURIComponent(name));
+  if (!el) return;
+  try {
+    var data = _tcCallsCache[name];
+    if (!data) {
+      data = await fetch('/api/tool-catalog/' + encodeURIComponent(name) + '/calls').then(function(r) { return r.json(); });
+      _tcCallsCache[name] = data;
+    }
+    var calls = data.calls || [];
+    if (calls.length === 0) {
+      el.innerHTML = '<div style="padding:4px 0;">' + t("app.no_individual_calls_captured_in_the_recent_event_w", null, "No individual calls captured in the recent event window.") + '</div>';
+      return;
+    }
+    var rows = '';
+    calls.forEach(function(c) {
+      var when = c.ts_ms ? new Date(c.ts_ms).toLocaleString() : '';
+      var statusColor = c.status === 'error' ? '#ef4444' : '#16a34a';
+      var statusLabel = c.status === 'error' ? 'error' : 'ok';
+      rows += '<div style="display:flex;align-items:center;gap:10px;padding:4px 0;border-top:1px solid var(--border-secondary);">';
+      rows += '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:' + statusColor + ';flex-shrink:0;" title="' + statusLabel + '"></span>';
+      rows += '<span style="width:140px;color:var(--text-faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + escHtml(when) + '">' + escHtml(when) + '</span>';
+      rows += '<span style="width:64px;color:var(--text-primary);font-variant-numeric:tabular-nums;">' + _tcFmtMs(c.duration_ms) + '</span>';
+      rows += '<span style="width:48px;font-size:10px;font-weight:700;color:' + statusColor + ';">' + statusLabel + '</span>';
+      if (c.session_id) {
+        var sidEsc = String(c.session_id).replace(/'/g, "\\'");
+        rows += '<span onclick="event.stopPropagation();viewTranscript(\'' + sidEsc + '\')" title="Open this session\'s transcript" style="flex:1;color:var(--accent,#3b82f6);cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-decoration:underline;">' + escHtml(String(c.session_id).slice(0, 32)) + '</span>';
+      } else {
+        rows += '<span style="flex:1;color:var(--text-faint);">(no session)</span>';
+      }
+      rows += '</div>';
+    });
+    el.innerHTML = '<div style="font-size:11px;font-weight:700;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.5px;padding:2px 0 4px;">' + calls.length + ' recent call' + (calls.length === 1 ? '' : 's') + '</div>' + rows;
+  } catch (e) {
+    el.innerHTML = '<div style="color:#e74c3c;padding:4px 0;">' + t("app.failed_to_load_calls", null, "Failed to load calls") + ': ' + escHtml(String(e)) + '</div>';
+  }
+}
+
+// ── Tool Policy + Sandbox + exec-approval audit (governance, PRD P1-1) ──────
+// Renders per-agent effective sandbox mode + tool allow/deny (from
+// /api/tool-policy, mirrored from `openclaw sandbox explain --json`) plus the
+// exec-approval decision audit (from /api/approvals-audit). Answers: which
+// tools can run, where they run, and what got blocked/approved and why.
+async function loadToolPolicy() {
+  var sumEl = document.getElementById('tool-policy-summary');
+  var agEl = document.getElementById('tool-policy-agents');
+  var apEl = document.getElementById('approvals-audit-panel');
+  if (!agEl) return;
+  // ── Per-agent sandbox + tool policy ──
+  try {
+    var data = await fetch('/api/tool-policy?limit=50').then(function(r){ return r.json(); });
+    var agents = data.agents || [];
+    var s = data.summary || {};
+    if (sumEl) {
+      if (agents.length === 0) {
+        sumEl.innerHTML = '';
+      } else {
+        function chip(label, val, color){
+          return '<div style="border:1px solid var(--border-primary);border-radius:10px;padding:10px 14px;min-width:96px;">'
+            + '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">'+escHtml(label)+'</div>'
+            + '<div style="font-size:18px;font-weight:700;color:'+(color||'var(--text-primary)')+';margin-top:2px;">'+escHtml(String(val))+'</div></div>';
+        }
+        var modeColor = (s.strongest_mode && s.strongest_mode !== 'off') ? '#16a34a' : 'var(--text-muted)';
+        sumEl.innerHTML = '<div style="display:flex;gap:10px;flex-wrap:wrap;">'
+          + chip('Agents', s.agent_count || 0)
+          + chip('Sandboxed', (s.sandboxed_agents||0) + '/' + (s.agent_count||0), modeColor)
+          + chip('Strongest mode', s.strongest_mode || 'off', modeColor)
+          + chip('Tools allowed', s.total_allowed_tools || 0)
+          + chip('Tools denied', s.total_denied_tools || 0, '#ef4444')
+          + '</div>';
+      }
+    }
+    if (agents.length === 0) {
+      agEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;border:1px solid var(--border-primary);border-radius:10px;">' + t("app.no_tool_policy_recorded_yet_per_agent_sandbox_mode", null, "No tool policy recorded yet. Per-agent sandbox mode and tool allow/deny lists appear here once the sync daemon reads OpenClaw’s effective policy.") + '</div>';
+    } else {
+      function modePill(mode){
+        var m = {off:['#6b7280','var(--bg-secondary)'],'non-main':['#d97706','rgba(217,119,6,.12)'],nonmain:['#d97706','rgba(217,119,6,.12)'],all:['#16a34a','rgba(22,163,74,.12)']};
+        var c = m[mode] || ['#6b7280','var(--bg-secondary)'];
+        return '<span style="font-size:11px;font-weight:700;color:'+c[0]+';background:'+c[1]+';border-radius:5px;padding:2px 8px;">sandbox: '+escHtml(String(mode||'off'))+'</span>';
+      }
+      function toolTags(list, color, bg){
+        list = list || [];
+        if (list.length === 0) return '<span style="font-size:11px;color:var(--text-faint);">(none)</span>';
+        return list.map(function(t){
+          return '<span style="font-size:11px;color:'+color+';background:'+bg+';border-radius:4px;padding:1px 7px;margin:0 4px 4px 0;display:inline-block;">'+escHtml(String(t))+'</span>';
+        }).join('');
+      }
+      var html = '';
+      agents.forEach(function(a){
+        html += '<div style="border:1px solid var(--border-primary);border-radius:10px;padding:14px;margin-bottom:12px;">';
+        html += '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">';
+        html += '<span style="font-size:14px;font-weight:700;color:var(--text-primary);">' + escHtml(a.agent_id || 'main') + '</span>';
+        html += modePill(a.sandbox_mode);
+        if (a.sandbox_scope) html += '<span style="font-size:11px;color:var(--text-muted);">scope: '+escHtml(String(a.sandbox_scope))+'</span>';
+        if (a.workspace_access) html += '<span style="font-size:11px;color:var(--text-muted);">workspace: '+escHtml(String(a.workspace_access))+'</span>';
+        if (a.elevated_enabled) html += '<span style="font-size:11px;color:'+(a.elevated_allowed?'#16a34a':'var(--text-muted)')+';">elevated: '+(a.elevated_allowed?'allowed':'gated')+(a.elevated_channel?(' ('+escHtml(String(a.elevated_channel))+')'):'')+'</span>';
+        html += '</div>';
+        html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">';
+        html += '<div><div style="font-size:11px;font-weight:700;color:#16a34a;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Allowed ('+(a.allow_count!=null?a.allow_count:(a.allow||[]).length)+')</div>'+toolTags(a.allow,'#16a34a','rgba(22,163,74,.10)')+'</div>';
+        html += '<div><div style="font-size:11px;font-weight:700;color:#ef4444;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Denied ('+(a.deny_count!=null?a.deny_count:(a.deny||[]).length)+')</div>'+toolTags(a.deny,'#ef4444','rgba(239,68,68,.10)')+'</div>';
+        html += '</div></div>';
+      });
+      agEl.innerHTML = html;
+    }
+  } catch(e) {
+    if (sumEl) sumEl.innerHTML = '';
+    agEl.innerHTML = '<div style="color:#e74c3c;font-size:13px;padding:16px;">' + t("app.failed_to_load_tool_policy", null, "Failed to load tool policy") + ': '+escHtml(String(e))+'</div>';
+  }
+  // ── Exec-approval audit ──
+  if (!apEl) return;
+  try {
+    var ad = await fetch('/api/approvals-audit?limit=80').then(function(r){ return r.json(); });
+    var decisions = ad.decisions || [];
+    var as = ad.summary || {};
+    var head = '<div style="border:1px solid var(--border-primary);border-radius:10px;overflow:hidden;">';
+    head += '<div style="display:flex;align-items:center;gap:12px;font-size:12px;font-weight:700;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.5px;padding:12px 14px;border-bottom:1px solid var(--border-primary);">';
+    head += '<span style="flex:1;">Exec-approval audit</span>';
+    head += '<span style="color:#d97706;">'+(as.pending||0)+' pending</span>';
+    head += '<span style="color:#16a34a;">'+(as.approved||0)+' approved</span>';
+    head += '<span style="color:#ef4444;">'+(as.denied||0)+' denied</span>';
+    head += '</div>';
+    if (decisions.length === 0) {
+      apEl.innerHTML = head + '<div style="color:var(--text-muted);font-size:13px;padding:16px;">No exec-approval decisions recorded yet. When a tool-call hits a policy gate it appears here with its decision and reason.</div></div>';
+    } else {
+      function decPill(st){
+        var m = {pending:['#d97706','rgba(217,119,6,.12)'],approved:['#16a34a','rgba(22,163,74,.12)'],allowed:['#16a34a','rgba(22,163,74,.12)'],denied:['#ef4444','rgba(239,68,68,.12)'],blocked:['#ef4444','rgba(239,68,68,.12)']};
+        var c = m[st] || ['#6b7280','var(--bg-secondary)'];
+        return '<span style="font-size:10px;font-weight:700;color:'+c[0]+';background:'+c[1]+';border-radius:4px;padding:1px 6px;">'+escHtml(String(st||'?'))+'</span>';
+      }
+      var rows = head;
+      decisions.forEach(function(d){
+        rows += '<div style="padding:9px 14px;border-bottom:1px solid var(--border-secondary);font-size:12px;">';
+        rows += '<div style="display:flex;align-items:center;gap:10px;">';
+        rows += decPill(d.status);
+        rows += '<span style="font-weight:600;color:var(--text-primary);">'+escHtml(String(d.action||'tool-call'))+'</span>';
+        if (d.args_preview) rows += '<span style="flex:1;color:var(--text-muted);font-family:monospace;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="'+escHtml(String(d.args_preview))+'">'+escHtml(String(d.args_preview))+'</span>';
+        else rows += '<span style="flex:1;"></span>';
+        if (d.resolver) rows += '<span style="font-size:11px;color:var(--text-faint);">by '+escHtml(String(d.resolver))+'</span>';
+        rows += '</div>';
+        if (d.decision_reason) rows += '<div style="margin-top:3px;color:var(--text-muted);font-size:11px;">'+escHtml(String(d.decision_reason))+'</div>';
+        rows += '</div>';
+      });
+      rows += '</div>';
+      apEl.innerHTML = rows;
+    }
+  } catch(e) {
+    apEl.innerHTML = '<div style="color:#e74c3c;font-size:13px;padding:16px;">' + t("app.failed_to_load_approval_audit", null, "Failed to load approval audit") + ': '+escHtml(String(e))+'</div>';
+  }
+}
+
+// ── Tool Policy + Sandbox + exec-approval audit (governance, PRD P1-1) ──────
+// Renders per-agent effective sandbox mode + tool allow/deny (from
+// /api/tool-policy, mirrored from `openclaw sandbox explain --json`) plus the
+// exec-approval decision audit (from /api/approvals-audit). Answers: which
+// tools can run, where they run, and what got blocked/approved and why.
+async function loadToolPolicy() {
+  var sumEl = document.getElementById('tool-policy-summary');
+  var agEl = document.getElementById('tool-policy-agents');
+  var apEl = document.getElementById('approvals-audit-panel');
+  if (!agEl) return;
+  // ── Per-agent sandbox + tool policy ──
+  try {
+    var data = await fetch('/api/tool-policy?limit=50').then(function(r){ return r.json(); });
+    var agents = data.agents || [];
+    var s = data.summary || {};
+    if (sumEl) {
+      if (agents.length === 0) {
+        sumEl.innerHTML = '';
+      } else {
+        function chip(label, val, color){
+          return '<div style="border:1px solid var(--border-primary);border-radius:10px;padding:10px 14px;min-width:96px;">'
+            + '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;">'+escHtml(label)+'</div>'
+            + '<div style="font-size:18px;font-weight:700;color:'+(color||'var(--text-primary)')+';margin-top:2px;">'+escHtml(String(val))+'</div></div>';
+        }
+        var modeColor = (s.strongest_mode && s.strongest_mode !== 'off') ? '#16a34a' : 'var(--text-muted)';
+        sumEl.innerHTML = '<div style="display:flex;gap:10px;flex-wrap:wrap;">'
+          + chip('Agents', s.agent_count || 0)
+          + chip('Sandboxed', (s.sandboxed_agents||0) + '/' + (s.agent_count||0), modeColor)
+          + chip('Strongest mode', s.strongest_mode || 'off', modeColor)
+          + chip('Tools allowed', s.total_allowed_tools || 0)
+          + chip('Tools denied', s.total_denied_tools || 0, '#ef4444')
+          + '</div>';
+      }
+    }
+    if (agents.length === 0) {
+      agEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;border:1px solid var(--border-primary);border-radius:10px;">' + t("app.no_tool_policy_recorded_yet_per_agent_sandbox_mode", null, "No tool policy recorded yet. Per-agent sandbox mode and tool allow/deny lists appear here once the sync daemon reads OpenClaw’s effective policy.") + '</div>';
+    } else {
+      function modePill(mode){
+        var m = {off:['#6b7280','var(--bg-secondary)'],'non-main':['#d97706','rgba(217,119,6,.12)'],nonmain:['#d97706','rgba(217,119,6,.12)'],all:['#16a34a','rgba(22,163,74,.12)']};
+        var c = m[mode] || ['#6b7280','var(--bg-secondary)'];
+        return '<span style="font-size:11px;font-weight:700;color:'+c[0]+';background:'+c[1]+';border-radius:5px;padding:2px 8px;">sandbox: '+escHtml(String(mode||'off'))+'</span>';
+      }
+      function toolTags(list, color, bg){
+        list = list || [];
+        if (list.length === 0) return '<span style="font-size:11px;color:var(--text-faint);">(none)</span>';
+        return list.map(function(t){
+          return '<span style="font-size:11px;color:'+color+';background:'+bg+';border-radius:4px;padding:1px 7px;margin:0 4px 4px 0;display:inline-block;">'+escHtml(String(t))+'</span>';
+        }).join('');
+      }
+      var html = '';
+      agents.forEach(function(a){
+        html += '<div style="border:1px solid var(--border-primary);border-radius:10px;padding:14px;margin-bottom:12px;">';
+        html += '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">';
+        html += '<span style="font-size:14px;font-weight:700;color:var(--text-primary);">' + escHtml(a.agent_id || 'main') + '</span>';
+        html += modePill(a.sandbox_mode);
+        if (a.sandbox_scope) html += '<span style="font-size:11px;color:var(--text-muted);">scope: '+escHtml(String(a.sandbox_scope))+'</span>';
+        if (a.workspace_access) html += '<span style="font-size:11px;color:var(--text-muted);">workspace: '+escHtml(String(a.workspace_access))+'</span>';
+        if (a.elevated_enabled) html += '<span style="font-size:11px;color:'+(a.elevated_allowed?'#16a34a':'var(--text-muted)')+';">elevated: '+(a.elevated_allowed?'allowed':'gated')+(a.elevated_channel?(' ('+escHtml(String(a.elevated_channel))+')'):'')+'</span>';
+        html += '</div>';
+        html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">';
+        html += '<div><div style="font-size:11px;font-weight:700;color:#16a34a;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Allowed ('+(a.allow_count!=null?a.allow_count:(a.allow||[]).length)+')</div>'+toolTags(a.allow,'#16a34a','rgba(22,163,74,.10)')+'</div>';
+        html += '<div><div style="font-size:11px;font-weight:700;color:#ef4444;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Denied ('+(a.deny_count!=null?a.deny_count:(a.deny||[]).length)+')</div>'+toolTags(a.deny,'#ef4444','rgba(239,68,68,.10)')+'</div>';
+        html += '</div></div>';
+      });
+      agEl.innerHTML = html;
+    }
+  } catch(e) {
+    if (sumEl) sumEl.innerHTML = '';
+    agEl.innerHTML = '<div style="color:#e74c3c;font-size:13px;padding:16px;">' + t("app.failed_to_load_tool_policy", null, "Failed to load tool policy") + ': '+escHtml(String(e))+'</div>';
+  }
+  // ── Exec-approval audit ──
+  if (!apEl) return;
+  try {
+    var ad = await fetch('/api/approvals-audit?limit=80').then(function(r){ return r.json(); });
+    var decisions = ad.decisions || [];
+    var as = ad.summary || {};
+    var head = '<div style="border:1px solid var(--border-primary);border-radius:10px;overflow:hidden;">';
+    head += '<div style="display:flex;align-items:center;gap:12px;font-size:12px;font-weight:700;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.5px;padding:12px 14px;border-bottom:1px solid var(--border-primary);">';
+    head += '<span style="flex:1;">Exec-approval audit</span>';
+    head += '<span style="color:#d97706;">'+(as.pending||0)+' pending</span>';
+    head += '<span style="color:#16a34a;">'+(as.approved||0)+' approved</span>';
+    head += '<span style="color:#ef4444;">'+(as.denied||0)+' denied</span>';
+    head += '</div>';
+    if (decisions.length === 0) {
+      apEl.innerHTML = head + '<div style="color:var(--text-muted);font-size:13px;padding:16px;">No exec-approval decisions recorded yet. When a tool-call hits a policy gate it appears here with its decision and reason.</div></div>';
+    } else {
+      function decPill(st){
+        var m = {pending:['#d97706','rgba(217,119,6,.12)'],approved:['#16a34a','rgba(22,163,74,.12)'],allowed:['#16a34a','rgba(22,163,74,.12)'],denied:['#ef4444','rgba(239,68,68,.12)'],blocked:['#ef4444','rgba(239,68,68,.12)']};
+        var c = m[st] || ['#6b7280','var(--bg-secondary)'];
+        return '<span style="font-size:10px;font-weight:700;color:'+c[0]+';background:'+c[1]+';border-radius:4px;padding:1px 6px;">'+escHtml(String(st||'?'))+'</span>';
+      }
+      var rows = head;
+      decisions.forEach(function(d){
+        rows += '<div style="padding:9px 14px;border-bottom:1px solid var(--border-secondary);font-size:12px;">';
+        rows += '<div style="display:flex;align-items:center;gap:10px;">';
+        rows += decPill(d.status);
+        rows += '<span style="font-weight:600;color:var(--text-primary);">'+escHtml(String(d.action||'tool-call'))+'</span>';
+        if (d.args_preview) rows += '<span style="flex:1;color:var(--text-muted);font-family:monospace;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="'+escHtml(String(d.args_preview))+'">'+escHtml(String(d.args_preview))+'</span>';
+        else rows += '<span style="flex:1;"></span>';
+        if (d.resolver) rows += '<span style="font-size:11px;color:var(--text-faint);">by '+escHtml(String(d.resolver))+'</span>';
+        rows += '</div>';
+        if (d.decision_reason) rows += '<div style="margin-top:3px;color:var(--text-muted);font-size:11px;">'+escHtml(String(d.decision_reason))+'</div>';
+        rows += '</div>';
+      });
+      rows += '</div>';
+      apEl.innerHTML = rows;
+    }
+  } catch(e) {
+    apEl.innerHTML = '<div style="color:#e74c3c;font-size:13px;padding:16px;">' + t("app.failed_to_load_approval_audit", null, "Failed to load approval audit") + ': '+escHtml(String(e))+'</div>';
+  }
+}
+
 // ── Upgrade Impact Panel ───────────────────────────────────────────────────
 async function loadVersionImpact() {
   var el = document.getElementById('version-impact-content');
   if (!el) return;
-  el.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;">Loading version impact data...</div>';
+  el.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;">' + t("app.loading_version_impact_data", null, "Loading version impact data...") + '</div>';
   try {
     var data = await fetch('/api/version-impact').then(r => r.json());
     if (!data.version_detected) {
-      el.innerHTML = '<div class="card" style="padding:20px;text-align:center;"><div style="font-size:15px;font-weight:600;color:var(--text-primary);">Version not detected</div><div style="font-size:13px;color:var(--text-muted);margin-top:8px;">Could not detect OpenClaw version from config.</div></div>';
+      el.innerHTML = '<div class="card" style="padding:20px;text-align:center;"><div style="font-size:15px;font-weight:600;color:var(--text-primary);">' + t("app.version_not_detected", null, "Version not detected") + '</div><div style="font-size:13px;color:var(--text-muted);margin-top:8px;">' + t("app.could_not_detect_openclaw_version_from_config", null, "Could not detect OpenClaw version from config.") + '</div></div>';
       return;
     }
     var html = '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap;">';
@@ -8072,107 +16281,21 @@ async function loadVersionImpact() {
     }
     el.innerHTML = html;
   } catch(e) {
-    el.innerHTML = '<div style="padding:16px;color:var(--text-error);">Failed to load version impact data</div>';
+    el.innerHTML = '<div style="padding:16px;color:var(--text-error);">' + t("app.failed_to_load_version_impact_data", null, "Failed to load version impact data") + '</div>';
   }
 }
 
 // ── Session Clusters Panel ─────────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════
-// Rate Limit Monitor — GH#67
-// ═══════════════════════════════════════════════════════════════════════════
-
-var _rateLimitTimer = null;
-
-async function loadRateLimits() {
-  var container = document.getElementById('rate-limits-content');
-  var hourlyEl = document.getElementById('rate-limits-hourly');
-  if (!container) return;
-  try {
-    var data = await fetch('/api/rate-limits').then(function(r) { return r.json(); });
-    var providers = data.providers || [];
-
-    if (providers.length === 0) {
-      container.innerHTML = '<div class="card" style="padding:24px;text-align:center;color:var(--text-muted);">No API usage data yet. Rate limits will appear once OTLP metrics flow from the OpenClaw gateway.</div>';
-      if (hourlyEl) hourlyEl.innerHTML = '';
-      return;
-    }
-
-    var html = '<div class="grid">';
-    providers.forEach(function(p) {
-      var statusColor = p.status === 'red' ? '#ef4444' : (p.status === 'amber' ? '#f59e0b' : '#22c55e');
-      var statusBg = p.status === 'red' ? 'rgba(239,68,68,0.1)' : (p.status === 'amber' ? 'rgba(245,158,11,0.1)' : 'rgba(34,197,94,0.1)');
-      var statusBorder = p.status === 'red' ? 'rgba(239,68,68,0.3)' : (p.status === 'amber' ? 'rgba(245,158,11,0.3)' : 'rgba(34,197,94,0.15)');
-      var statusLabel = p.status === 'red' ? '\uD83D\uDD34 HIGH' : (p.status === 'amber' ? '\uD83D\uDFE1 MODERATE' : '\uD83D\uDFE2 OK');
-      html += '<div class="card" style="border:1px solid ' + statusBorder + ';background:' + statusBg + ';">';
-      html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">';
-      html += '<div class="card-title" style="margin:0;">' + escHtml(p.label) + '</div>';
-      html += '<span style="font-size:11px;font-weight:700;color:' + statusColor + ';">' + statusLabel + '</span>';
-      html += '</div>';
-      html += _rateLimitBar('RPM (1 min)', p.rpm.current, p.rpm.limit, p.rpm.pct);
-      html += _rateLimitBar('Input TPM (1 min)', p.tpm_input.current, p.tpm_input.limit, p.tpm_input.pct);
-      html += _rateLimitBar('Output TPM (1 min)', p.tpm_output.current, p.tpm_output.limit, p.tpm_output.pct);
-      if (p.models && p.models.length > 0) {
-        html += '<div style="margin-top:8px;font-size:11px;color:var(--text-muted);">Models: ';
-        p.models.forEach(function(m) {
-          html += '<span style="display:inline-block;padding:2px 6px;margin:2px;background:var(--bg-secondary);border-radius:4px;font-size:10px;">' + escHtml(m) + '</span>';
-        });
-        html += '</div>';
-      }
-      html += '</div>';
-    });
-    html += '</div>';
-    container.innerHTML = html;
-
-    // Hourly summary
-    var hourlyHtml = '<div class="section-title">&#128202; Last Hour Summary</div><div class="grid">';
-    var totalReqs = 0, totalCost = 0;
-    providers.forEach(function(p) { totalReqs += p.hour.requests; totalCost += p.hour.cost_usd; });
-    hourlyHtml += '<div class="card"><div class="card-title"><span class="icon">&#128232;</span> Requests (1h)</div><div class="card-value">' + totalReqs.toLocaleString() + '</div></div>';
-    hourlyHtml += '<div class="card"><div class="card-title"><span class="icon">&#128176;</span> Cost (1h)</div><div class="card-value">$' + totalCost.toFixed(4) + '</div></div>';
-    providers.forEach(function(p) {
-      hourlyHtml += '<div class="card"><div class="card-title"><span class="icon">&#128279;</span> ' + escHtml(p.label) + '</div>';
-      hourlyHtml += '<div class="card-value">' + p.hour.requests + ' reqs</div>';
-      hourlyHtml += '<div class="card-sub">' + p.hour.tokens_in.toLocaleString() + ' in / ' + p.hour.tokens_out.toLocaleString() + ' out &middot; $' + p.hour.cost_usd.toFixed(4) + '</div></div>';
-    });
-    hourlyHtml += '</div>';
-    if (hourlyEl) hourlyEl.innerHTML = hourlyHtml;
-
-    // Auto-refresh every 30s while tab is active
-    if (_rateLimitTimer) clearInterval(_rateLimitTimer);
-    _rateLimitTimer = visibilitySetInterval(function() {
-      var limitsPage = document.getElementById('page-limits');
-      if (limitsPage && limitsPage.classList.contains('active')) loadRateLimits();
-      else { clearInterval(_rateLimitTimer); _rateLimitTimer = null; }
-    }, 30000);
-  } catch(e) {
-    if (container) container.innerHTML = '<div class="card" style="padding:16px;color:#ef4444;">Failed to load rate limits: ' + escHtml(String(e)) + '</div>';
-  }
-}
-
-function _rateLimitBar(label, current, limit, pct) {
-  var barColor = pct >= 90 ? '#ef4444' : (pct >= 70 ? '#f59e0b' : '#22c55e');
-  var w = Math.min(pct, 100);
-  var fmt = typeof current === 'number' ? (current >= 1000 ? (current/1000).toFixed(1) + 'k' : String(current)) : String(current);
-  var limFmt = typeof limit === 'number' ? (limit >= 1000 ? (limit/1000).toFixed(0) + 'k' : String(limit)) : String(limit);
-  var html = '<div style="margin-bottom:8px;">';
-  html += '<div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted);margin-bottom:3px;">';
-  html += '<span>' + escHtml(label) + '</span><span style="color:' + barColor + ';font-weight:600;">' + fmt + ' / ' + limFmt + ' (' + pct + '%)</span>';
-  html += '</div>';
-  html += '<div style="background:var(--bg-secondary);border-radius:4px;height:6px;overflow:hidden;">';
-  html += '<div style="width:' + w + '%;height:100%;background:' + barColor + ';border-radius:4px;transition:width 0.4s;"></div>';
-  html += '</div></div>';
-  return html;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 async function loadClusters() {
   var el = document.getElementById('clusters-content');
   if (!el) return;
-  el.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;">Analyzing session patterns...</div>';
+  el.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:16px;">' + t("app.analyzing_session_patterns", null, "Analyzing session patterns...") + '</div>';
   try {
-    var data = await fetch('/api/clusters').then(r => r.json());
+    var data = await fetch('/api/sessions/clusters').then(r => r.json());
     if (!data.clusters || data.clusters.length === 0) {
-      el.innerHTML = '<div class="card" style="padding:20px;text-align:center;"><div style="font-size:13px;color:var(--text-muted);">No sessions found to cluster.</div></div>';
+      el.innerHTML = '<div class="card" style="padding:20px;text-align:center;"><div style="font-size:13px;color:var(--text-muted);">' + t("app.no_sessions_found_to_cluster", null, "No sessions found to cluster.") + '</div></div>';
       return;
     }
     var clusterColors = {'browsing-heavy':'#60a5fa','code-heavy':'#34d399','messaging':'#f472b6','doc-analysis':'#a78bfa','mixed-research':'#fbbf24','cron-light':'#94a3b8','expensive-outlier':'#ef4444','general':'#6b7280'};
@@ -8208,7 +16331,7 @@ async function loadClusters() {
     html += '<div class="card" style="padding:12px 16px;font-size:12px;color:var(--text-muted);">Total: <strong style="color:var(--text-primary);">' + total + ' sessions</strong> across <strong style="color:var(--text-primary);">' + data.clusters.length + ' clusters</strong></div>';
     el.innerHTML = html;
   } catch(e) {
-    el.innerHTML = '<div style="padding:16px;color:var(--text-error);">Failed to load clusters</div>';
+    el.innerHTML = '<div style="padding:16px;color:var(--text-error);">' + t("app.failed_to_load_clusters", null, "Failed to load clusters") + '</div>';
   }
 }
 
@@ -8217,13 +16340,22 @@ function startOverviewRefresh() {
   // Don't fire loadAll() immediately -- bootDashboard already called it
   if (window._overviewTimer) clearInterval(window._overviewTimer);
   window._overviewTimer = visibilitySetInterval(async function() {
+    // Tab-scoped: loadAll() refreshes the whole Overview (health, heartbeat,
+    // diagnostics, skills, reliability, …). Only poll it while the user is
+    // actually on Overview — otherwise these dozen requests fire on every
+    // other tab too (the "ton of requests on the LLM Context screen" report).
+    // _cmCurrentTab is unset on first boot, where Overview is the default.
+    if (!_cmIsOverviewTab()) return;
     if (_overviewRefreshRunning) return;
     _overviewRefreshRunning = true;
     try { await loadAll(); } finally { _overviewRefreshRunning = false; }
   }, 10000);
   loadMainActivity();
   if (window._mainActivityTimer) clearInterval(window._mainActivityTimer);
-  window._mainActivityTimer = visibilitySetInterval(loadMainActivity, 5000);
+  window._mainActivityTimer = visibilitySetInterval(function() {
+    if (!_cmIsOverviewTab()) return;
+    loadMainActivity();
+  }, 5000);
 }
 
 // Overview right-panel Brain stream: reuses /api/brain-history (same source as
@@ -8246,11 +16378,20 @@ async function loadMainActivity() {
     events.sort(function(a, b) {
       return (b.time || '').localeCompare(a.time || '');
     });
+    // Scope to the selected runtime — same per-event derivation as the Brain
+    // tab (event sessionId prefix = runtime). Previously this Overview panel
+    // showed every runtime's events regardless of the switcher, so picking
+    // "Qwen Code" still surfaced Claude Code / OpenClaw cron chatter.
+    var _maRt = (typeof _cmRuntimeFilter === 'function') ? _cmClientFilterRt(_cmRuntimeFilter()) : 'all';
+    if (_maRt !== 'all') events = events.filter(function(ev) { return _cmRuntimeOf(ev) === _maRt; });
 
     if (!events.length) {
-      el.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">No recent activity</div>';
+      var _maEmpty = _maRt !== 'all'
+        ? 'No recent <strong>' + escHtml(_cmRuntimeLabel(_maRt)) + '</strong> activity'
+        : 'No recent activity';
+      el.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);">' + _maEmpty + '</div>';
       if (dot) dot.style.background = '#888';
-      if (label) { label.textContent = 'No data'; label.style.color = 'var(--text-muted)'; }
+      if (label) { label.textContent = t("app.no_data", null, "No data"); label.style.color = 'var(--text-muted)'; }
       return;
     }
 
@@ -8320,17 +16461,117 @@ async function loadMainActivity() {
 var logStream = null;
 var streamBuffer = [];
 var MAX_STREAM_LINES = 500;
+// Class bug drain (sibling of #1596 / PR #1610) - exponential backoff
+// state for the log SSE reconnect. Before this fix the onerror handler
+// scheduled a single startLogStream() 5s later and went silent forever
+// if that also failed. Same shape as the Brain SSE state: single retry
+// chain, banner-after-30s, visibility-aware.
+var _logSSERetryTimer = null;
+var _logSSERetryAttempt = 0;
+var _logSSEFirstFailMs = 0;
+// Caps: 1s, 2s, 4s, 8s, 16s, then 30s forever. Matches the issue spec.
+var _LOG_SSE_BACKOFF_MS = [1000, 2000, 4000, 8000, 16000];
+var _LOG_SSE_BACKOFF_MAX_MS = 30000;
+var _LOG_SSE_BANNER_THRESHOLD_MS = 30000;
+
+// Sibling of #1610 - pure backoff math, extracted so the unit test can
+// exercise it without a real EventSource.
+function _logSSEBackoffMs(attempt) {
+  if (attempt < 0) attempt = 0;
+  if (attempt < _LOG_SSE_BACKOFF_MS.length) {
+    return _LOG_SSE_BACKOFF_MS[attempt];
+  }
+  return _LOG_SSE_BACKOFF_MAX_MS;
+}
+
+// Sibling of #1610 - show/hide the "Log connection lost" banner above
+// the logs viewport. Plain-English copy per
+// feedback_no_em_dashes_in_user_facing_copy.md and
+// feedback_simple_ui_for_nontechnical.md.
+function _showLogConnectionLostBanner() {
+  var host = document.getElementById('log-connection-lost-banner');
+  if (!host) {
+    // Prefer the full logs tab host; fall back to the overview log host
+    // so a user watching either surface sees the banner.
+    var streamEl = document.getElementById('logs-full') || document.getElementById('ov-logs');
+    if (!streamEl || !streamEl.parentElement) return;
+    host = document.createElement('div');
+    host.id = 'log-connection-lost-banner';
+    host.style.cssText = 'padding:10px 14px;margin-bottom:8px;font-size:13px;color:#f59e0b;border:1px solid rgba(245,158,11,0.35);border-radius:6px;background:rgba(245,158,11,0.08);display:flex;align-items:center;gap:10px;';
+    streamEl.parentElement.insertBefore(host, streamEl);
+  }
+  host.style.display = 'flex';
+  host.innerHTML =
+    '<span style="width:8px;height:8px;border-radius:50%;background:#f59e0b;animation:livePulse 1.5s ease-in-out infinite;"></span>' +
+    '<span><strong>Log connection lost.</strong> Reconnecting\u2026</span>';
+}
+function _hideLogConnectionLostBanner() {
+  var host = document.getElementById('log-connection-lost-banner');
+  if (host) host.style.display = 'none';
+}
+
+// Sibling of #1610 - schedule the next log SSE reconnect attempt.
+// Single-chain (clears any pending timer first) so back-to-back errors
+// never spawn parallel reconnect storms. Visibility-aware: the global
+// SSE visibility guard closes the EventSource on hidden tabs; we should
+// not burn cycles retrying until the tab regains focus.
+function _scheduleLogSSEReconnect() {
+  if (_logSSERetryTimer) {
+    clearTimeout(_logSSERetryTimer);
+    _logSSERetryTimer = null;
+  }
+  if (typeof document !== 'undefined' && document.hidden) return;
+  if (_logSSEFirstFailMs && (Date.now() - _logSSEFirstFailMs) >= _LOG_SSE_BANNER_THRESHOLD_MS) {
+    _showLogConnectionLostBanner();
+  }
+  var delay = _logSSEBackoffMs(_logSSERetryAttempt);
+  _logSSERetryAttempt += 1;
+  _logSSERetryTimer = setTimeout(function() {
+    _logSSERetryTimer = null;
+    startLogStream();
+  }, delay);
+}
+
+// Sibling of #1610 - called from the SSE onopen event. Resets backoff
+// state and clears the banner. Idempotent.
+function _resetLogSSEReconnectState() {
+  if (_logSSERetryTimer) {
+    clearTimeout(_logSSERetryTimer);
+    _logSSERetryTimer = null;
+  }
+  _logSSERetryAttempt = 0;
+  _logSSEFirstFailMs = 0;
+  _hideLogConnectionLostBanner();
+}
+
+// Sibling of #1610 - full teardown. Closes the EventSource, cancels any
+// pending retry, and hides the banner so a stale timer cannot reopen a
+// connection the user no longer wants. No location.reload() anywhere in
+// the retry path (memory: feedback_no_reload_in_bootstrap_e2e).
+function _stopLogStream() {
+  if (logStream) { try { logStream.close(); } catch(e){} }
+  logStream = null;
+  if (_logSSERetryTimer) {
+    clearTimeout(_logSSERetryTimer);
+    _logSSERetryTimer = null;
+  }
+  _logSSERetryAttempt = 0;
+  _logSSEFirstFailMs = 0;
+  _hideLogConnectionLostBanner();
+}
 
 function startLogStream() {
   if (window.CLOUD_MODE) return;
   if (logStream) logStream.close();
   streamBuffer = [];
   var statusEl = document.getElementById('log-stream-status');
-  if (statusEl) statusEl.textContent = '\u25cf Connecting\u2026';
+  if (statusEl) statusEl.textContent = t("app.dot_connecting", null, "\u25cf Connecting\u2026");
   logStream = new EventSource('/api/logs-stream' + (localStorage.getItem('clawmetry-token') ? '?token=' + encodeURIComponent(localStorage.getItem('clawmetry-token')) : ''));
   logStream.onopen = function() {
     var s = document.getElementById('log-stream-status');
-    if (s) { s.textContent = '\u25cf Live'; s.style.color = '#22c55e'; }
+    if (s) { s.textContent = t("app.dot_live", null, "\u25cf Live"); s.style.color = '#22c55e'; }
+    // Sibling of #1610 - successful (re)open clears backoff + banner.
+    _resetLogSSEReconnectState();
   };
   logStream.onmessage = function(e) {
     var data = JSON.parse(e.data);
@@ -8343,8 +16584,12 @@ function startLogStream() {
   };
   logStream.onerror = function() {
     var s = document.getElementById('log-stream-status');
-    if (s) { s.textContent = '\u25cf Reconnecting\u2026'; s.style.color = '#f59e0b'; }
-    setTimeout(startLogStream, 5000);
+    if (s) { s.textContent = t("app.dot_reconnecting", null, "\u25cf Reconnecting\u2026"); s.style.color = '#f59e0b'; }
+    // Sibling of #1610 - replace one-shot reconnect with exponential
+    // backoff chain so a sustained outage keeps trying, and surfaces an
+    // explicit banner after 30s instead of staying silently broken.
+    if (!_logSSEFirstFailMs) _logSSEFirstFailMs = Date.now();
+    _scheduleLogSSEReconnect();
   };
 }
 
@@ -8518,6 +16763,103 @@ function hideUnconfiguredChannels(svgRoot) {
   }).catch(function(){});
 }
 
+// Class bug drain (sibling of #1596 / PR #1610) - exponential backoff
+// state for the Flow SSE reconnect. Before this fix _flowSse.onerror
+// scheduled a single _startFlowSse() 5s later and went silent forever
+// if that also failed. Same shape as the Brain SSE state: single retry
+// chain, banner-after-30s, visibility-aware.
+var _flowSSERetryTimer = null;
+var _flowSSERetryAttempt = 0;
+var _flowSSEFirstFailMs = 0;
+// Caps: 1s, 2s, 4s, 8s, 16s, then 30s forever. Matches the issue spec.
+var _FLOW_SSE_BACKOFF_MS = [1000, 2000, 4000, 8000, 16000];
+var _FLOW_SSE_BACKOFF_MAX_MS = 30000;
+var _FLOW_SSE_BANNER_THRESHOLD_MS = 30000;
+
+// Sibling of #1610 - pure backoff math, extracted so the unit test can
+// exercise it without a real EventSource.
+function _flowSSEBackoffMs(attempt) {
+  if (attempt < 0) attempt = 0;
+  if (attempt < _FLOW_SSE_BACKOFF_MS.length) {
+    return _FLOW_SSE_BACKOFF_MS[attempt];
+  }
+  return _FLOW_SSE_BACKOFF_MAX_MS;
+}
+
+// Sibling of #1610 - show/hide the "Flow connection lost" banner above
+// the flow live pane. Plain-English copy per
+// feedback_no_em_dashes_in_user_facing_copy.md and
+// feedback_simple_ui_for_nontechnical.md.
+function _showFlowConnectionLostBanner() {
+  var host = document.getElementById('flow-connection-lost-banner');
+  if (!host) {
+    var streamEl = document.getElementById('flow-live-pane');
+    if (!streamEl || !streamEl.parentElement) return;
+    host = document.createElement('div');
+    host.id = 'flow-connection-lost-banner';
+    host.style.cssText = 'padding:10px 14px;margin-bottom:8px;font-size:13px;color:#f59e0b;border:1px solid rgba(245,158,11,0.35);border-radius:6px;background:rgba(245,158,11,0.08);display:flex;align-items:center;gap:10px;';
+    streamEl.parentElement.insertBefore(host, streamEl);
+  }
+  host.style.display = 'flex';
+  host.innerHTML =
+    '<span style="width:8px;height:8px;border-radius:50%;background:#f59e0b;animation:livePulse 1.5s ease-in-out infinite;"></span>' +
+    '<span><strong>Flow connection lost.</strong> Reconnecting\u2026</span>';
+}
+function _hideFlowConnectionLostBanner() {
+  var host = document.getElementById('flow-connection-lost-banner');
+  if (host) host.style.display = 'none';
+}
+
+// Sibling of #1610 - schedule the next Flow SSE reconnect attempt.
+// Single-chain (clears any pending timer first) so back-to-back errors
+// never spawn parallel reconnect storms. Visibility-aware: the global
+// SSE visibility guard closes the EventSource on hidden tabs; we should
+// not burn cycles retrying until the tab regains focus.
+function _scheduleFlowSSEReconnect() {
+  if (_flowSSERetryTimer) {
+    clearTimeout(_flowSSERetryTimer);
+    _flowSSERetryTimer = null;
+  }
+  if (typeof document !== 'undefined' && document.hidden) return;
+  if (_flowSSEFirstFailMs && (Date.now() - _flowSSEFirstFailMs) >= _FLOW_SSE_BANNER_THRESHOLD_MS) {
+    _showFlowConnectionLostBanner();
+  }
+  var delay = _flowSSEBackoffMs(_flowSSERetryAttempt);
+  _flowSSERetryAttempt += 1;
+  _flowSSERetryTimer = setTimeout(function() {
+    _flowSSERetryTimer = null;
+    _startFlowSse();
+  }, delay);
+}
+
+// Sibling of #1610 - called from the SSE onopen event. Resets backoff
+// state and clears the banner. Idempotent.
+function _resetFlowSSEReconnectState() {
+  if (_flowSSERetryTimer) {
+    clearTimeout(_flowSSERetryTimer);
+    _flowSSERetryTimer = null;
+  }
+  _flowSSERetryAttempt = 0;
+  _flowSSEFirstFailMs = 0;
+  _hideFlowConnectionLostBanner();
+}
+
+// Sibling of #1610 - full teardown. Closes the EventSource, cancels any
+// pending retry, and hides the banner so a stale timer cannot reopen a
+// connection the user no longer wants. No location.reload() anywhere in
+// the retry path (memory: feedback_no_reload_in_bootstrap_e2e).
+function _stopFlowSse() {
+  if (_flowSse) { try { _flowSse.close(); } catch(e){} }
+  _flowSse = null;
+  if (_flowSSERetryTimer) {
+    clearTimeout(_flowSSERetryTimer);
+    _flowSSERetryTimer = null;
+  }
+  _flowSSERetryAttempt = 0;
+  _flowSSEFirstFailMs = 0;
+  _hideFlowConnectionLostBanner();
+}
+
 var _flowSse = null;
 var _flowSseDebounce = {};
 function _startFlowSse() {
@@ -8525,6 +16867,10 @@ function _startFlowSse() {
   if (_flowSse && _flowSse.readyState !== EventSource.CLOSED) return;
   var _fTok = localStorage.getItem('clawmetry-token') || '';
   _flowSse = new EventSource('/api/flow-events' + (_fTok ? '?token=' + encodeURIComponent(_fTok) : ''));
+  _flowSse.onopen = function() {
+    // Sibling of #1610 - successful (re)open clears backoff + banner.
+    _resetFlowSSEReconnectState();
+  };
   _flowSse.onmessage = function(e) {
     try {
       var evt = JSON.parse(e.data);
@@ -8534,14 +16880,23 @@ function _startFlowSse() {
       _flowSseDebounce[dk] = now;
       if (type === 'msg_in') {
         triggerInbound(evt.channel || 'tg');
+        // Layer 2: send the live packet You → channel → gateway → brain and
+        // walk the journey rail accent through the same stages.
+        _flowPulseInbound(evt.channel || 'tg');
         addFlowFeedItem('📨 Message via ' + (evt.channel || 'telegram'), '#c0a0ff', 'inbound');
         flowStats.msgTimestamps.push(now);
       } else if (type === 'msg_out') {
         triggerOutbound(evt.channel || 'tg');
+        // Layer 2: the reply travels brain → You along the low return loop.
+        _flowPulseEdge('path-brain-reply');
+        _flowRailSetStage('reply');
         addFlowFeedItem('📤 Replied via ' + (evt.channel || 'telegram'), '#50e080', 'reply');
       } else if (type === 'tool_call') {
         var toolName = evt.tool || 'exec';
         triggerToolCall(toolName);
+        // Layer 2: pulse the brain→tool edge for this bucket + accent Tools.
+        _flowPulseEdge('path-brain-' + toolName);
+        _flowRailSetStage('tools');
         var toolNames = {exec:'running a command',browser:'browsing the web',search:'searching the web',cron:'scheduling',tts:'generating speech',memory:'accessing memory'};
         addFlowFeedItem('⚡ ' + (toolName || 'tool') + ': ' + (toolNames[toolName] || 'using ' + toolName), '#f0c040', 'tool');
         flowStats.events++;
@@ -8562,7 +16917,13 @@ function _startFlowSse() {
       }
     } catch(e2) {}
   };
-  _flowSse.onerror = function() { setTimeout(_startFlowSse, 5000); };
+  _flowSse.onerror = function() {
+    // Sibling of #1610 - replace one-shot reconnect with exponential
+    // backoff chain so a sustained outage keeps trying, and surfaces an
+    // explicit banner after 30s instead of staying silently broken.
+    if (!_flowSSEFirstFailMs) _flowSSEFirstFailMs = Date.now();
+    _scheduleFlowSSEReconnect();
+  };
 }
 
 // ── Flow sub-tabs (Live | Runs) — issue #611 ────────────────────────────
@@ -8621,14 +16982,16 @@ function loadFlowRuns() {
   var countEl = document.getElementById('flow-runs-count');
   if (!tbody) return;
   var lim = sel ? parseInt(sel.value, 10) || 30 : 30;
-  tbody.innerHTML = '<tr><td colspan="8" style="padding:24px;text-align:center;color:var(--text-muted);font-size:12px;">Loading flow runs&hellip;</td></tr>';
+  tbody.innerHTML = '<tr><td colspan="8" style="padding:24px;text-align:center;color:var(--text-muted);font-size:12px;">' + t("app.loading_flow_runs_hellip", null, "Loading flow runs&hellip;") + '</td></tr>';
   fetch('/api/flow/runs?limit=' + lim)
     .then(function(r) { return r.json(); })
     .then(function(d) {
       var runs = (d && d.runs) || [];
+      var cappedAt24h = !!(d && d.capped_at_24h);
       if (countEl) countEl.textContent = runs.length + ' run' + (runs.length === 1 ? '' : 's');
       if (!runs.length) {
-        tbody.innerHTML = '<tr><td colspan="8" style="padding:24px;text-align:center;color:var(--text-muted);font-size:12px;">No historical flow runs yet — the live Flow view will populate this once a session completes.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="8" style="padding:24px;text-align:center;color:var(--text-muted);font-size:12px;">' + t("app.no_historical_flow_runs_yet_the_live_flow_view_wil", null, "No historical flow runs yet. The live Flow view will populate this once a session completes.") + '</td></tr>';
+        _renderFlowRunsCap(cappedAt24h);
         return;
       }
       var rows = runs.map(function(r) {
@@ -8654,10 +17017,106 @@ function loadFlowRuns() {
           + '</tr>';
       }).join('');
       tbody.innerHTML = rows;
+      _renderFlowRunsCap(cappedAt24h);
     })
     .catch(function() {
-      tbody.innerHTML = '<tr><td colspan="8" style="padding:24px;text-align:center;color:#ef4444;font-size:12px;">Failed to load flow runs.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="8" style="padding:24px;text-align:center;color:#ef4444;font-size:12px;">' + t("app.failed_to_load_flow_runs", null, "Failed to load flow runs.") + '</td></tr>';
     });
+}
+
+// Issue #721: per-session channel lanes panel in the Flow tab.
+// Fetches /api/flow/lanes (sessions active in the last 30 min) and renders
+// color-coded pill badges — one per session, colored by channel type.
+function loadFlowLanes() {
+  var container = document.getElementById('flow-lanes-list');
+  var countEl   = document.getElementById('flow-lanes-count');
+  if (!container) return;
+  var _CH_COLORS = {
+    telegram: '#2196F3', signal: '#2E8B7A', whatsapp: '#43A047',
+    discord:  '#5865F2', slack:  '#4A154B', webchat:  '#f59e0b',
+    tui:      '#8b5cf6', irc:    '#10b981', imessage: '#34C759',
+    cli:      '#6366f1',
+  };
+  fetch('/api/flow/lanes')
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      var lanes = (d && d.lanes) || [];
+      if (countEl) countEl.textContent = lanes.length ? lanes.length + ' active' : '';
+      if (!lanes.length) {
+        container.innerHTML = '<span style="color:#555;font-size:11px;">' + t("app.no_active_sessions_in_the_last_30_min", null, "No active sessions in the last 30 min") + '</span>';
+        return;
+      }
+      container.innerHTML = lanes.map(function(lane) {
+        var color = _CH_COLORS[lane.channel] || '#6b7280';
+        var dot   = lane.status === 'failed' ? '#ef4444' : '#22c55e';
+        var ch    = (lane.channel || 'cli').toUpperCase();
+        var sid   = lane.session_short || '';
+        var evts  = lane.event_count || 0;
+        return '<div style="display:inline-flex;align-items:center;gap:5px;'
+          + 'background:' + color + '22;border:1px solid ' + color + '55;'
+          + 'border-radius:8px;padding:4px 10px;font-size:11px;">'
+          + '<span style="width:7px;height:7px;border-radius:50%;background:' + dot + ';display:inline-block;flex-shrink:0;"></span>'
+          + '<span style="color:' + color + ';font-weight:600;">' + ch + '</span>'
+          + '<span style="color:#aaa;font-family:monospace;">' + sid + '</span>'
+          + '<span style="color:#666;">' + evts + '&nbsp;events</span>'
+          + '</div>';
+      }).join('');
+    })
+    .catch(function() {
+      if (container) container.innerHTML = '<span style="color:#555;font-size:11px;">' + t("app.could_not_load_lanes", null, "Could not load lanes") + '</span>';
+    });
+}
+
+// Render a small CTA row below the Flow Runs table when the OSS retention
+// cap kicked in (issue #1173). Lives in its own footer container so the
+// table tbody stays purely tabular.
+function _renderFlowRunsCap(capped) {
+  var foot = document.getElementById('flow-runs-cap-cta');
+  if (!foot) {
+    var tbl = document.getElementById('flow-runs-tbody');
+    if (!tbl || !tbl.parentElement) return;
+    foot = document.createElement('div');
+    foot.id = 'flow-runs-cap-cta';
+    foot.style.cssText = 'padding:10px 14px;font-size:12px;color:var(--text-muted);border-top:1px solid var(--border-secondary,#2a2a4a);display:none;';
+    var host = tbl.closest('table');
+    if (host && host.parentElement) {
+      host.parentElement.appendChild(foot);
+    } else {
+      tbl.parentElement.appendChild(foot);
+    }
+  }
+  if (capped) {
+    foot.style.display = '';
+    foot.innerHTML = 'Showing the last 24 hours. <a href="https://app.clawmetry.com/upgrade" target="_blank" rel="noopener" style="color:var(--accent,#7c5cff);font-weight:600;">Upgrade to Cloud-Pro for unlimited history</a>';
+  } else {
+    foot.style.display = 'none';
+    foot.innerHTML = '';
+  }
+}
+
+// Issue #1448 surface 4 — OSS / Cloud-Free retention CTA for any UI
+// pane that consumes /api/local/events. Pass the response body and a
+// mount element (any container above the events list/feed); we render a
+// one-line upgrade CTA when ``capped_at_24h`` is truthy. Used by future
+// raw-event panes in the dashboard.
+function _renderLocalEventsCap(respBody, mountEl) {
+  if (!mountEl) return;
+  var capped = !!(respBody && respBody.capped_at_24h);
+  var host = mountEl.querySelector(':scope > .local-events-cap-cta');
+  if (!host) {
+    if (!capped) return;
+    host = document.createElement('div');
+    host.className = 'local-events-cap-cta';
+    host.style.cssText = 'padding:10px 14px;margin-bottom:8px;font-size:12px;color:var(--text-muted);border:1px solid var(--border-secondary,#2a2a4a);border-radius:6px;background:var(--bg-secondary,rgba(124,92,255,0.06));';
+    mountEl.insertBefore(host, mountEl.firstChild);
+  }
+  if (capped) {
+    host.style.display = '';
+    host.innerHTML = 'Raw events older than 24 hours are on Cloud-Pro. <a href="https://app.clawmetry.com/upgrade" target="_blank" rel="noopener" style="color:var(--accent,#7c5cff);font-weight:600;">Upgrade for full history.</a>';
+  } else {
+    host.style.display = 'none';
+    host.innerHTML = '';
+  }
 }
 
 function showFlowRunDetail(sid) {
@@ -8665,8 +17124,8 @@ function showFlowRunDetail(sid) {
   var title = document.getElementById('flow-runs-detail-title');
   var body = document.getElementById('flow-runs-detail-body');
   if (!box || !body) return;
-  if (title) title.textContent = 'Run · ' + sid;
-  body.innerHTML = '<div style="color:var(--text-muted);">Loading transcript&hellip;</div>';
+  if (title) title.textContent = t("app.run", null, "Run · ") + sid;
+  body.innerHTML = '<div style="color:var(--text-muted);">' + t("app.loading_transcript_hellip", null, "Loading transcript&hellip;") + '</div>';
   box.style.display = 'block';
   // Re-fetch /api/flow/runs to find this row (cheap; ≤200 rows). Then
   // render a compact summary. The live Flow diagram is intentionally not
@@ -8676,7 +17135,7 @@ function showFlowRunDetail(sid) {
     .then(function(r) { return r.json(); })
     .then(function(d) {
       var run = ((d && d.runs) || []).find(function(x) { return String(x.session_id) === String(sid); });
-      if (!run) { body.innerHTML = '<div style="color:#ef4444;">Run not found.</div>'; return; }
+      if (!run) { body.innerHTML = '<div style="color:#ef4444;">' + t("app.run_not_found", null, "Run not found.") + '</div>'; return; }
       var models = (run.models || []).map(function(m) {
         return '<span style="display:inline-block;background:var(--bg-tertiary,#0d0d1f);border:1px solid var(--border-secondary,#2a2a4a);border-radius:6px;padding:2px 8px;margin:2px 4px 2px 0;font-family:monospace;font-size:11px;">' + m + '</span>';
       }).join('') || '<span style="color:var(--text-muted);">(none)</span>';
@@ -8696,7 +17155,7 @@ function showFlowRunDetail(sid) {
         + '<div style="margin-top:14px;"><a href="/api/transcript/' + encodeURIComponent(sid) + '" target="_blank" style="font-size:12px;color:var(--accent-primary,#3b82f6);text-decoration:none;">View full transcript &rarr;</a></div>';
     })
     .catch(function() {
-      body.innerHTML = '<div style="color:#ef4444;">Failed to load run detail.</div>';
+      body.innerHTML = '<div style="color:#ef4444;">' + t("app.failed_to_load_run_detail", null, "Failed to load run detail.") + '</div>';
     });
 }
 
@@ -8733,6 +17192,17 @@ function initFlow() {
   // Populate skills in Flow diagram
   _populateFlowSkills();
 
+  // Issue #1804: probe the JSON snapshot path of flow-events before starting
+  // SSE. On 503+outage, inject a banner into the live feed. Fire-and-forget
+  // so SSE startup is not blocked.
+  fetch('/api/flow-events').then(async function(r) {
+    if (r.status !== 503) return;
+    var _ffBody = await r.json().catch(function(){return {};});
+    if (_ffBody && _ffBody.error === 'local_store ingest is offline') {
+      var _ffEl = document.getElementById('flow-live-feed');
+      if (_ffEl) _ffEl.innerHTML = '<div style="background:#fff7ed;border:1px solid #f59e0b;color:#92400e;padding:12px 16px;border-radius:6px;"><strong>' + t("app.ingest_temporarily_offline", null, "Ingest temporarily offline.") + '</strong> Live flow events unavailable; the local_store writer is not responding.</div>';
+    }
+  }).catch(function(){});
   // Connect to the typed flow-events SSE (tails gateway.log + session JSONL)
   _startFlowSse();
   // Active Tools + Live Tool Call Stream — DuckDB-backed (issue #1127).
@@ -8742,6 +17212,7 @@ function initFlow() {
   // DuckDB store that drives the rest of the Brain tab, so we backfill
   // recent tool events and subscribe to the live stream from there.
   _backfillFlowFromBrain();
+  _backfillFlowEventCount();
   _startFlowBrainStream();
 
   // Lazy-load Phase 2 follow-up: this used to be a raw `setInterval(...)`
@@ -8752,6 +17223,109 @@ function initFlow() {
   // the browser tab is hidden — completes Phase 2 coverage.
   if (window._flowStatsTimer) { try { clearInterval(window._flowStatsTimer); } catch(e){} }
   window._flowStatsTimer = visibilitySetInterval(updateFlowStats, updateInterval);
+  // Issue #721: session lanes panel — initial load + 30 s refresh.
+  loadFlowLanes();
+  if (window._flowLanesTimer) { try { clearInterval(window._flowLanesTimer); } catch(e){} }
+  window._flowLanesTimer = visibilitySetInterval(loadFlowLanes, 30000);
+  // Per-adapter Flow diagram: reflect the runtime currently selected in the
+  // global switcher (OpenClaw/Hermes keep the rich channel→gateway SVG;
+  // coding-CLI + pico/nano get their own generated topology).
+  try { _applyRuntimeFlowDiagram((typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all'); } catch (e) {}
+}
+
+// ── Per-adapter Flow diagram (goal: distinct topology per runtime) ──────────
+// OpenClaw / Hermes keep the hand-built channel→gateway→agent→tools SVG. The
+// coding-CLI runtimes (Claude Code, Codex, Cursor, Aider, Goose, opencode,
+// Qwen) and the minimal PicoClaw/NanoClaw don't have channels or a chat
+// gateway, so showing them the OpenClaw topology was misleading. We swap
+// #flow-svg's content for a generated, runtime-correct diagram and re-mirror
+// the Overview pane. Driven by the global runtime switcher.
+var _origFlowSvgInner = null;
+var _RT_FLOW = {
+  claude_code: { label:'Claude Code', src:['⌨️','Terminal'], accent:'#d97706', stroke:'#b45309', tools:[['📝','Edit/Write'],['📖','Read'],['⚡','Bash'],['🔍','Grep/Glob'],['🐝','Subagents'],['🧩','MCP']] },
+  codex:       { label:'Codex',       src:['⌨️','Terminal'], accent:'#10a37f', stroke:'#0d8a6a', tools:[['📝','Apply patch'],['📖','Read'],['⚡','Shell'],['🔍','Search'],['🧩','MCP']] },
+  cursor:      { label:'Cursor',      src:['🖥️','Editor'], accent:'#6366f1', stroke:'#4f46e5', tools:[['📝','Edit'],['📖','Read'],['⚡','Terminal'],['🔍','Codebase'],['🧩','MCP']] },
+  aider:       { label:'Aider',       src:['⌨️','Terminal'], accent:'#22a559', stroke:'#1a8045', tools:[['📝','Edit'],['📖','Read'],['⚡','Shell'],['🔀','Git commit']] },
+  goose:       { label:'Goose',       src:['⌨️','Terminal'], accent:'#0ea5e9', stroke:'#0284c7', tools:[['📝','Edit'],['⚡','Shell'],['🔍','Search'],['🧩','Extensions']] },
+  opencode:    { label:'opencode',    src:['⌨️','Terminal'], accent:'#f59e0b', stroke:'#d97706', tools:[['📝','Edit'],['📖','Read'],['⚡','Bash'],['🔍','Grep']] },
+  qwen_code:   { label:'Qwen Code',   src:['⌨️','Terminal'], accent:'#7c3aed', stroke:'#6d28d9', tools:[['📝','Edit'],['📖','Read'],['⚡','Shell'],['🔍','Search']] },
+  pi:          { label:'Pi',          src:['⌨️','Terminal'], accent:'#4f8ef7', stroke:'#3b74d9', tools:[['📝','Edit'],['📖','Read'],['⚡','Bash'],['🔍','Grep']] },
+  deepagents:  { label:'Deep Agents', src:['⌨️','Terminal'], accent:'#2fa87c', stroke:'#238a64', tools:[['📝','Edit'],['📖','Read'],['⚡','Shell'],['📋','Todos']] },
+  picoclaw:    { label:'PicoClaw',    src:['👤','You'],      accent:'#ec4899', stroke:'#db2777', tools:[['⚡','Exec'],['🧠','Memory'],['📋','Sessions']], minimal:true },
+  nanoclaw:    { label:'NanoClaw',    src:['👤','You'],      accent:'#14b8a6', stroke:'#0d9488', tools:[['⚡','Exec'],['🧠','Memory']], minimal:true },
+};
+
+function _flowEdge(x1, y1, x2, y2, color, delay) {
+  var mx = (x1 + x2) / 2;
+  var d = 'M' + x1 + ' ' + y1 + ' C ' + mx + ' ' + y1 + ' ' + mx + ' ' + y2 + ' ' + x2 + ' ' + y2;
+  return '<path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="2" stroke-opacity="0.55" stroke-dasharray="6 6">'
+    + '<animate attributeName="stroke-dashoffset" from="24" to="0" dur="1.1s" begin="' + delay + 's" repeatCount="indefinite"/></path>';
+}
+
+function _buildRuntimeFlowInner(rt, model) {
+  var s = _RT_FLOW[rt];
+  if (!s) return null;
+  var tools = s.tools, n = tools.length;
+  var th = 40, gap = 14, colX = 715, colW = 160;
+  var totalH = n * th + (n - 1) * gap;
+  var y0 = 275 - totalH / 2;
+  var agentW = 210, agentH = 96, agentCx = 460, agentCy = 275;
+  var agentX = agentCx - agentW / 2, agentY = agentCy - agentH / 2;
+  var srcX = 45, srcY = 247, srcW = 150, srcH = 56, srcCx = srcX + srcW / 2, srcCy = srcY + srcH / 2;
+  var h = '<defs><filter id="rtShadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-opacity="0.35"/></filter></defs>';
+  // Edges first (under nodes): source→agent, agent→each tool.
+  h += _flowEdge(srcX + srcW, srcCy, agentX, agentCy, s.accent, 0);
+  for (var i = 0; i < n; i++) { var ty = y0 + i * (th + gap) + th / 2; h += _flowEdge(agentX + agentW, agentCy, colX, ty, s.accent, 0.12 + i * 0.1); }
+  // Source node.
+  h += '<g class="flow-node"><rect x="' + srcX + '" y="' + srcY + '" width="' + srcW + '" height="' + srcH + '" rx="12" fill="#1e293b" stroke="#334155" stroke-width="2" filter="url(#rtShadow)"/>'
+    + '<text x="' + srcCx + '" y="' + (srcCy - 3) + '" style="font-size:22px;text-anchor:middle;">' + s.src[0] + '</text>'
+    + '<text x="' + srcCx + '" y="' + (srcCy + 19) + '" style="font-size:12px;font-weight:700;fill:#cbd5e1;text-anchor:middle;">' + escHtml(s.src[1]) + '</text></g>';
+  // Agent node (runtime).
+  h += '<g class="flow-node flow-node-brain"><rect x="' + agentX + '" y="' + agentY + '" width="' + agentW + '" height="' + agentH + '" rx="14" fill="' + s.accent + '" stroke="' + s.stroke + '" stroke-width="3" filter="url(#rtShadow)"/>'
+    + '<text x="' + agentCx + '" y="' + (agentY + 31) + '" style="font-size:22px;text-anchor:middle;">🧠</text>'
+    + '<text x="' + agentCx + '" y="' + (agentY + 55) + '" style="font-size:17px;font-weight:800;fill:#fff;text-anchor:middle;">' + escHtml(s.label) + '</text>'
+    + '<text x="' + agentCx + '" y="' + (agentY + 73) + '" style="font-size:10px;fill:rgba(255,255,255,0.85);text-anchor:middle;">' + escHtml(model || (s.minimal ? 'OpenClaw-family' : 'coding agent')) + '</text>'
+    + '<circle cx="' + agentCx + '" cy="' + (agentY + agentH - 9) + '" r="4" fill="#fff"><animate attributeName="opacity" values="0.4;1;0.4" dur="1.4s" repeatCount="indefinite"/></circle></g>';
+  // Tool column (right).
+  for (var j = 0; j < n; j++) { var y = y0 + j * (th + gap), cy = y + th / 2;
+    h += '<g class="flow-node flow-node-tool"><rect x="' + colX + '" y="' + y + '" width="' + colW + '" height="' + th + '" rx="10" fill="#0f172a" stroke="' + s.accent + '" stroke-width="1.6" filter="url(#rtShadow)"/>'
+      + '<text x="' + (colX + colW / 2) + '" y="' + (cy + 1) + '" style="font-size:12px;font-weight:700;fill:#e2e8f0;text-anchor:middle;">' + tools[j][0] + ' ' + escHtml(tools[j][1]) + '</text></g>';
+  }
+  // Workspace sink for coding agents.
+  if (!s.minimal) {
+    var wy = y0 + totalH + 20;
+    h += '<g class="flow-node"><rect x="' + colX + '" y="' + wy + '" width="' + colW + '" height="38" rx="10" fill="#1e293b" stroke="#334155" stroke-width="1.6"/>'
+      + '<text x="' + (colX + colW / 2) + '" y="' + (wy + 23) + '" style="font-size:12px;font-weight:700;fill:#94a3b8;text-anchor:middle;">📂 Workspace</text></g>';
+  }
+  return h;
+}
+
+function _applyRuntimeFlowDiagram(rt) {
+  var svg = document.getElementById('flow-svg');
+  if (!svg) return;
+  if (_origFlowSvgInner === null) _origFlowSvgInner = svg.innerHTML;
+  var model = '';
+  try { var ml = document.getElementById('brain-model-text'); model = ml ? (ml.textContent || '') : ''; } catch (e) {}
+  if (model === 'unknown') model = '';
+  // Never render a LOCKED runtime (e.g. Claude Code on the free plan) as an
+  // active Flow topology — that contradicts the "install OpenClaw" empty-state
+  // and reads as if a Pro runtime is live. Fall back to the default OpenClaw
+  // diagram; the switcher carries the lock + upgrade affordance instead.
+  var inner = (typeof _cmLockedRuntimes !== 'undefined' && _cmLockedRuntimes && _cmLockedRuntimes[rt])
+    ? null
+    : _buildRuntimeFlowInner(rt, model);
+  if (inner) {
+    svg.innerHTML = inner;
+  } else if (svg.innerHTML.indexOf('rtShadow') !== -1) {
+    // Currently showing a generated diagram → restore the original OpenClaw SVG.
+    svg.innerHTML = _origFlowSvgInner;
+    try { hideUnconfiguredChannels(document); } catch (e) {}
+  }
+  // Re-mirror the Overview pane from whatever #flow-svg now holds.
+  try {
+    var c = document.getElementById('overview-flow-container');
+    if (c) { c.innerHTML = ''; if (typeof initOverviewFlow === 'function') initOverviewFlow(); }
+  } catch (e) {}
 }
 
 // Map brain-history event types → Flow's active-tool buckets (exec/browser/
@@ -8775,12 +17349,141 @@ function _flowFeedLabelForTool(toolName) {
   return toolNames[toolName] || 'using ' + toolName;
 }
 
+// ── Layer 2: live "what's firing right now" packet view ─────────────────────
+// Flow STAYS a live view (turn-replay lives on the Tracing screen). These two
+// helpers make the diagram + rail visibly track real events as they fire:
+//   _flowPulseEdge(pathId) — one bright dot travels that exact connector once
+//   _flowRailSetStage(s)   — accents the matching journey-rail station
+// NOTE: the canvas nodes are harness component CLASSES (the bucket map collapses
+// many real tools into ~6); #flow-live-feed is the exact per-call truth. Deeper
+// per-component fidelity comes with the Tracing wiring.
+function _flowPulseEdge(pathId) {
+  try {
+    if (!pathId) return;
+    var svg = document.getElementById('flow-svg');
+    if (!svg) return;
+    var path = document.getElementById(pathId);
+    if (!path) return; // unknown connector → no-op (e.g. runtime-variant SVG)
+    var ns = 'http://www.w3.org/2000/svg';
+    // Reduced motion: skip the travelling dot, just briefly brighten the path.
+    var reduce = false;
+    try { reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) {}
+    if (reduce) {
+      path.classList.add('flow-pulse-glow');
+      setTimeout(function() { try { path.classList.remove('flow-pulse-glow'); } catch (e2) {} }, 500);
+      return;
+    }
+    var dot = document.createElementNS(ns, 'circle');
+    dot.setAttribute('r', '5');
+    dot.setAttribute('fill', '#f0c040');
+    dot.setAttribute('class', 'flow-pulse-dot');
+    dot.style.filter = 'drop-shadow(0 0 8px rgba(240,192,64,0.85))';
+    var anim = document.createElementNS(ns, 'animateMotion');
+    anim.setAttribute('dur', '0.7s');
+    anim.setAttribute('fill', 'remove');
+    anim.setAttribute('begin', 'indefinite');
+    var mpath = document.createElementNS(ns, 'mpath');
+    // Set BOTH href and the namespaced xlink:href for cross-browser support.
+    try { mpath.setAttribute('href', '#' + pathId); } catch (e3) {}
+    try { mpath.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', '#' + pathId); } catch (e4) {}
+    anim.appendChild(mpath);
+    dot.appendChild(anim);
+    svg.appendChild(dot);
+    var removed = false;
+    var remove = function() {
+      if (removed) return; removed = true;
+      try { if (dot.parentNode) dot.parentNode.removeChild(dot); } catch (e5) {}
+    };
+    try { anim.addEventListener('endEvent', remove); } catch (e6) {}
+    // Fallback in case endEvent never fires (older engines).
+    setTimeout(remove, 900);
+    try { anim.beginElement(); } catch (e7) { /* if begin fails, the fallback timeout still cleans up */ }
+  } catch (e) {}
+}
+
+// Module-level idle-decay timer: after ~4s of no events the rail returns to
+// its resting state (Brain accented), matching the default look.
+var _flowRailStageTimer = null;
+function _flowRailSetStage(stage) {
+  try {
+    var stations = document.querySelectorAll('#page-flow .fj-station[data-stage]');
+    if (stations && stations.length) {
+      for (var i = 0; i < stations.length; i++) {
+        var on = stations[i].getAttribute('data-stage') === stage;
+        stations[i].classList.toggle('fj-station-active', on);
+      }
+    }
+  } catch (e) {}
+  // Reset the idle-decay timer on every call; resting state = Brain.
+  try {
+    if (_flowRailStageTimer) { clearTimeout(_flowRailStageTimer); }
+    if (stage !== 'brain') {
+      _flowRailStageTimer = setTimeout(function() { _flowRailSetStage('brain'); }, 4000);
+    } else {
+      _flowRailStageTimer = null;
+    }
+  } catch (e2) {}
+}
+// Expose for manual testing + the live handlers below.
+try { window._flowPulseEdge = _flowPulseEdge; window._flowRailSetStage = _flowRailSetStage; } catch (e) {}
+
+// Drive the inbound packet: You → channel → gateway → brain, with a small
+// stagger so the dot visibly hops node to node. ``ch`` is a full channel name
+// (telegram/signal/...) or already-short code; _chPathKey maps it to the path
+// id suffix used by path-human-<ch> / path-<ch>-gw.
+function _flowPulseInbound(ch) {
+  try {
+    var key = (typeof _chPathKey === 'function') ? _chPathKey(ch) : 'tg';
+    setTimeout(function() { _flowPulseEdge('path-human-' + key); _flowRailSetStage('channels'); }, 0);
+    setTimeout(function() { _flowPulseEdge('path-' + key + '-gw'); _flowRailSetStage('gateway'); }, 180);
+    setTimeout(function() { _flowPulseEdge('path-gw-brain'); _flowRailSetStage('brain'); }, 360);
+  } catch (e) {
+    try { _flowPulseEdge('path-gw-brain'); } catch (e2) {}
+  }
+}
+
+function _backfillFlowEventCount() {
+  // Seed ACTIONS TAKEN (#flow-event-count / flowStats.events) from DuckDB so it
+  // reflects real recent activity instead of 0 on page load. Previously this
+  // counter was incremented ONLY by the live flow SSE, so a turn that already
+  // happened (e.g. an earlier deep-research session) showed "0 actions" while
+  // TOKENS USED correctly showed the real total (it comes from /api/overview).
+  //
+  // BACKFILLED (this fn): ACTIONS TAKEN <- today's gateway messages
+  //   (/api/component/gateway stats.today_messages), the most honest DuckDB
+  //   value matching "actions taken today". The live SSE then ADDS to this as
+  //   new events arrive.
+  // NOT backfilled (intentionally, honest-0-when-idle):
+  //   - MESSAGES/MIN (#flow-msg-rate): a rolling 60s rate. 0/min is correct for
+  //     an idle agent; faking it would be dishonest.
+  //   - ACTIVE TOOLS (#flow-active-tools): "active" = firing right now (5-min
+  //     window, seeded by _backfillFlowFromBrain). 0 is correct when idle.
+  fetch('/api/component/gateway').then(function(r){return r.json();}).then(function(d) {
+    var st = (d && d.stats) || d || {};
+    var today = Number(st.today_messages);
+    // Only seed when DuckDB reports a real positive count AND we haven't already
+    // counted more live events than the backfill (don't shrink a live counter).
+    if (isFinite(today) && today > 0 && today > flowStats.events) {
+      flowStats.events = today;
+      updateFlowStats();
+    }
+  }).catch(function(){});
+}
+
 function _backfillFlowFromBrain() {
   // One-shot historical backfill from /api/brain-history (DuckDB-backed).
   // Populates Active Tools with the most recent tool calls so the panel is
   // never empty after a page reload, even if /api/flow-events has been quiet.
   fetch('/api/brain-history?limit=40').then(function(r){return r.json();}).then(function(d) {
     var events = (d && d.events) || [];
+    // Scope Active Tools to the selected runtime (#3004): brain-history is
+    // node-wide, so without this filter a single-runtime switcher still lit up
+    // from other runtimes' tool events. Same client-side prefix filter the
+    // Brain tab's native renderers use (_cmRuntimeOf on the session-id prefix).
+    var _r = (typeof _cmRuntimeFilter === 'function') ? _cmClientFilterRt(_cmRuntimeFilter()) : 'all';
+    if (_r !== 'all') {
+      events = events.filter(function(ev) { return _cmRuntimeOf(ev) === _r; });
+    }
     var now = Date.now();
     var seen = 0;
     // events are most-recent-first; scan up to 8 tool-typed events.
@@ -8824,12 +17527,25 @@ function _startFlowBrainStream() {
         var ev = JSON.parse(e.data);
         if (!ev || !ev.type) return;
         var tool = _brainTypeToFlowTool(ev.type);
-        if (!tool) return;
-        // Drive Active Tools + the existing tool-call animation off the same
-        // DuckDB-backed event. triggerToolCall already handles the 5s expiry.
-        triggerToolCall(tool);
-        var label = '⚡ ' + tool + ': ' + _flowFeedLabelForTool(tool);
-        addFlowFeedItem(label, '#f0c040', 'tool');
+        // Accuracy: a type that maps to a real bucket lights that component +
+        // pulses its edge; an UNMAPPED type must NOT falsely light "Exec" — we
+        // pulse the neutral Skills edge and still record the REAL name in the
+        // feed (#flow-live-feed is the exact per-call truth).
+        if (tool) {
+          // Drive Active Tools + the existing tool-call animation off the same
+          // DuckDB-backed event. triggerToolCall already handles the 5s expiry.
+          triggerToolCall(tool);
+          _flowPulseEdge('path-brain-' + tool);
+          _flowRailSetStage('tools');
+          var label = '⚡ ' + tool + ': ' + _flowFeedLabelForTool(tool);
+          addFlowFeedItem(label, '#f0c040', 'tool');
+        } else {
+          // Unknown tool class — neutral pulse, honest label with the raw type.
+          _flowPulseEdge('path-brain-skills');
+          _flowRailSetStage('tools');
+          var rawName = String(ev.tool || ev.type || 'tool');
+          addFlowFeedItem('⚡ ' + rawName, '#f0c040', 'tool');
+        }
         flowStats.events++;
       } catch(e2) {}
     };
@@ -8908,7 +17624,21 @@ function enhanceArchitectureClarity() {
   });
 }
 
+// Format a token count for the Flow stat cards / rail. Never emits "0K"
+// (which read like "OK"): show the raw number under 1k, "12K" up to a
+// million, and "1.2M" above. Returns "-" for missing/NaN input so the
+// card keeps its neutral placeholder instead of "0".
+function _fmtFlowTokens(tokens) {
+  var n = Number(tokens);
+  if (!isFinite(n) || n <= 0) return ' - ';
+  return n < 1000 ? String(n) : n < 1e6 ? Math.round(n / 1000) + 'K' : (n / 1e6).toFixed(1) + 'M';
+}
+
 function updateFlowStats() {
+  // Tab-scoped: this polls /api/overview for the Flow tab's live stats. It
+  // must NOT fire on every other screen — it was hitting /api/overview ~9x/15s
+  // on unrelated tabs (e.g. Memory). Pause off Flow/Overview; resume on return.
+  if (window._cmCurrentTab && window._cmCurrentTab !== 'flow' && window._cmCurrentTab !== 'overview') return;
   var now = Date.now();
   flowStats.msgTimestamps = flowStats.msgTimestamps.filter(function(t){return now - t < 60000;});
   var el1 = document.getElementById('flow-msg-rate');
@@ -8917,11 +17647,43 @@ function updateFlowStats() {
   if (el2) el2.textContent = flowStats.events;
   var names = Object.keys(flowStats.activeTools).filter(function(k){return flowStats.activeTools[k];});
   var el3 = document.getElementById('flow-active-tools');
-  if (el3) el3.textContent = names.length > 0 ? names.join(', ') : '\u2014';
+  if (el3) {
+    // Show the COUNT (numeric, matches the other stat cards) rather than the
+    // comma-joined list, which overflowed the small card. The full list stays
+    // available as a hover tooltip.
+    el3.textContent = names.length > 0 ? String(names.length) : '0';
+    try { el3.title = names.length > 0 ? names.join(', ') : ''; } catch (e) {}
+  }
+  // Journey rail sub-stats \u2014 wired to the same live data every tick. Each is
+  // guarded so a missing node (e.g. runtime-variant SVG) never throws.
+  try {
+    var railCh = document.getElementById('rail-channels-stat');
+    if (railCh) railCh.textContent = flowStats.msgTimestamps.length + '/min';
+  } catch (e) {}
+  try {
+    var railBr = document.getElementById('rail-brain-stat');
+    if (railBr) {
+      var bm = document.getElementById('brain-model-text');
+      var mtxt = (bm && bm.textContent ? bm.textContent : '').trim();
+      railBr.textContent = (mtxt && mtxt !== 'unknown') ? mtxt
+        : (typeof t === 'function' ? t('app.model', null, 'model') : 'model');
+    }
+  } catch (e) {}
+  try {
+    var railTl = document.getElementById('rail-tools-stat');
+    if (railTl) {
+      if (names.length > 0) {
+        var aw = (typeof t === 'function') ? t('flow.active_word', null, 'active') : 'active';
+        railTl.textContent = names.length + ' ' + aw;
+      } else {
+        railTl.textContent = (typeof t === 'function') ? t('flow.idle', null, 'idle') : 'idle';
+      }
+    }
+  } catch (e) {}
   if (flowStats.events % 15 === 0) {
     fetchJsonWithTimeout('/api/overview', 5000).then(function(d) {
       var tok = document.getElementById('flow-tokens');
-      if (tok) tok.textContent = (d.mainTokens / 1000).toFixed(0) + 'K';
+      if (tok) tok.textContent = _fmtFlowTokens(d.mainTokens);
     }).catch(function(){});
   }
 }
@@ -9125,19 +17887,19 @@ function triggerError() {
 }
 
 function triggerInfraNetwork() {
-  animateParticle('path-gw-network', '#40a0b0', 1200, false);
+  animateParticle('path-brain-infra', '#40a0b0', 1200, false);
   highlightNode('node-network', 2500);
 }
 function triggerInfraRuntime() {
-  animateParticle('path-brain-runtime', '#40a0b0', 1000, false);
+  animateParticle('path-brain-infra', '#40a0b0', 1000, false);
   highlightNode('node-runtime', 2200);
 }
 function triggerInfraMachine() {
-  animateParticle('path-brain-machine', '#40a0b0', 1000, false);
+  animateParticle('path-brain-infra', '#40a0b0', 1050, false);
   highlightNode('node-machine', 2200);
 }
 function triggerInfraStorage() {
-  animateParticle('path-memory-storage', '#40a0b0', 700, false);
+  animateParticle('path-brain-infra', '#40a0b0', 700, false);
   highlightNode('node-storage', 2000);
 }
 
@@ -9157,9 +17919,9 @@ function clearToolStream() {
   _flowFeedItems = [];
   flowStats.events = 0;
   var el = document.getElementById('flow-live-feed');
-  if (el) el.innerHTML = '<div style="color:#555;">Stream cleared.</div>';
+  if (el) el.innerHTML = '<div style="color:#555;">' + t("app.stream_cleared", null, "Stream cleared.") + '</div>';
   var countEl = document.getElementById('flow-feed-count');
-  if (countEl) countEl.textContent = '0 events';
+  if (countEl) countEl.textContent = t("app.0_events", null, "0 events");
 }
 
 function applyToolStreamFilter() {
@@ -9464,7 +18226,7 @@ function _showStuckBanner(sessionId, ageSec) {
   var label = sessionId ? sessionId.substring(0, 20) : 'unknown session';
   var ageStr = ageSec > 0 ? ' (' + ageSec + 's)' : '';
   var msg = document.getElementById('stuck-session-banner-msg');
-  if (msg) msg.textContent = '⚠️ Session stuck' + ageStr + ': ' + label + ' — agent may be looping';
+  if (msg) msg.textContent = t("app.session_stuck", null, "⚠️ Session stuck") + ageStr + ': ' + label + ' — agent may be looping';
   var link = document.getElementById('stuck-session-banner-link');
   if (link && sessionId) link.href = '#';
   banner.style.display = 'flex';
@@ -9602,10 +18364,22 @@ function _ovTimeLabel(agent) {
     if (min < 60) return 'Running (' + min + ' min)';
     return 'Running (' + hr + 'h ' + (min % 60) + 'm)';
   }
-  if (sec < 60) return 'Finished ' + sec + 's ago';
-  if (min < 60) return 'Finished ' + min + ' min ago';
-  if (hr < 24) return 'Finished ' + hr + 'h ago';
-  return 'Finished ' + Math.floor(hr / 24) + 'd ago';
+  // "Finished N ago" is time since the spawn ENDED — not the run duration.
+  // Using runtimeMs here made stale spawns whose runtime was frozen to 0
+  // (the dead-subagent freeze) read "Finished 0s ago" even when they ended
+  // days ago. Prefer completionTs, then updatedAt (last activity), then
+  // startedAt+runtime; blank if the end time is genuinely unknown.
+  var endedMs = 0;
+  if (agent.completionTs) { var ct = Date.parse(agent.completionTs); if (!isNaN(ct)) endedMs = ct; }
+  if (!endedMs && agent.updatedAt) endedMs = agent.updatedAt;
+  if (!endedMs && agent.startedAt && ms) endedMs = agent.startedAt + ms;
+  if (!endedMs) return '';
+  var ago = Math.max(0, Date.now() - endedMs);
+  var asec = Math.floor(ago / 1000), amin = Math.floor(asec / 60), ahr = Math.floor(amin / 60);
+  if (asec < 60) return 'Finished ' + asec + 's ago';
+  if (amin < 60) return 'Finished ' + amin + ' min ago';
+  if (ahr < 24) return 'Finished ' + ahr + 'h ago';
+  return 'Finished ' + Math.floor(ahr / 24) + 'd ago';
 }
 
 function _ovRenderCard(agent, idx) {
@@ -9684,14 +18458,39 @@ async function loadOverviewTasks() {
       else if (isRealFailure) failed.push(a);
       else done.push(a);
     });
-    // Filter old completed/failed (2h)
-    done = done.filter(function(a) { return a.runtimeMs < 2 * 60 * 60 * 1000; });
-    failed = failed.filter(function(a) { return a.runtimeMs < 2 * 60 * 60 * 1000; });
+    // Alive-state for the Overview hero: working when something is actively
+    // running, otherwise idle. Re-render the hero so it reflects the change.
+    window._cmAgentBusy = running.length > 0;
+    try { if (typeof _renderOverviewHero === 'function') _renderOverviewHero(); } catch (_e_hero) {}
+          try { if (typeof _renderWasteSummary === 'function') _renderWasteSummary(); } catch (_e) {}
+          try { if (typeof _renderOutLoopSources === 'function') _renderOutLoopSources(); } catch (_e4) {}
+    // "Recently Completed/Failed" must mean RECENT — bound by how long ago the
+    // task FINISHED, not its run duration. The old `runtimeMs < 2h` check used
+    // duration, so a 5-minute task that finished 6 days ago still passed and
+    // showed as "recent" (an idle node looked busy). Derive the end time the
+    // same way _ovRenderCard's "Finished N ago" does (completionTs → updatedAt
+    // → startedAt+runtime); unknown end time → not recent.
+    var RECENT_DONE_MS = 60 * 60 * 1000; // 1h
+    var _nowMs = Date.now();
+    function _ovEndedMs(a) {
+      var e = 0;
+      if (a.completionTs) { var ct = Date.parse(a.completionTs); if (!isNaN(ct)) e = ct; }
+      if (!e && a.updatedAt) e = a.updatedAt;
+      if (!e && a.startedAt && a.runtimeMs) e = a.startedAt + a.runtimeMs;
+      return e;
+    }
+    function _ovRecentlyFinished(a) {
+      var e = _ovEndedMs(a);
+      return e > 0 && (_nowMs - e) < RECENT_DONE_MS;
+    }
+    done = done.filter(_ovRecentlyFinished);
+    failed = failed.filter(_ovRecentlyFinished);
 
     if (countBadge) countBadge.textContent = running.length > 0 ? '(' + running.length + ' running)' : '(' + (done.length + failed.length) + ' recent)';
 
     var totalShown = running.length + done.length + failed.length;
     if (totalShown === 0) {
+      if (countBadge) countBadge.textContent = '';
       el.innerHTML = '<div style="text-align:center;padding:40px 20px;color:var(--text-muted);">'
         + '<div style="font-size:32px;margin-bottom:12px;" class="tasks-empty-icon">😴</div>'
         + '<div style="font-size:14px;font-weight:600;color:var(--text-tertiary);margin-bottom:4px;">No active tasks</div>'
@@ -9727,7 +18526,10 @@ async function loadOverviewTasks() {
 function startOverviewTasksRefresh() {
   loadOverviewTasks();
   if (_ovTasksTimer) clearInterval(_ovTasksTimer);
-  _ovTasksTimer = visibilitySetInterval(loadOverviewTasks, 10000);
+  _ovTasksTimer = visibilitySetInterval(function() {
+    if (!_cmIsOverviewTab()) return;
+    loadOverviewTasks();
+  }, 10000);
 }
 
 // === Task Detail Modal ===
@@ -9972,7 +18774,7 @@ function openCompModal(nodeId) {
   }
 
   if (nodeId === 'node-irc') {
-    document.getElementById('comp-modal-body').innerHTML = '<div class="irc-loading">*** Connecting to IRC log... ***</div>';
+    document.getElementById('comp-modal-body').innerHTML = '<div class="irc-loading">' + t("app.connecting_to_irc_log", null, "*** Connecting to IRC log... ***") + '</div>';
     document.getElementById('comp-modal-overlay').classList.add('open');
     loadIRCMessages(false);
     _ircRefreshTimer = visibilitySetInterval(function() { loadIRCMessages(true); }, 15000);
@@ -10093,10 +18895,10 @@ function openCompModal(nodeId) {
         html += '<div style="margin-top:12px;font-size:10px;color:var(--text-muted);font-style:italic;text-align:center;">' + escapeHtml(data.note) + '</div>';
       }
       sBody.innerHTML = html;
-      document.getElementById('comp-modal-footer').textContent = 'Auto-refreshing - Last updated: ' + new Date().toLocaleTimeString() + ' - ' + skills.length + ' skills';
+      document.getElementById('comp-modal-footer').textContent = t("app.auto_refreshing_last_updated", null, "Auto-refreshing - Last updated: ") + new Date().toLocaleTimeString() + ' - ' + skills.length + ' skills';
     }).catch(function(e) {
       if (!isCompModalActive('node-skills')) return;
-      sBody.innerHTML = '<div style="padding:20px;color:var(--text-error);">Failed to load skills: ' + escapeHtml(e.message) + '</div>';
+      sBody.innerHTML = '<div style="padding:20px;color:var(--text-error);">' + t("app.failed_to_load_skills", null, "Failed to load skills") + ': ' + escapeHtml(e.message) + '</div>';
     });
     return;
   }
@@ -10134,7 +18936,7 @@ function openCompModal(nodeId) {
       });
       html += '</div>';
       body.innerHTML = html;
-      document.getElementById('comp-modal-footer').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+      document.getElementById('comp-modal-footer').textContent = t("app.last_updated", null, "Last updated: ") + new Date().toLocaleTimeString();
     }).catch(function(e) {
       if (!isCompModalActive(nodeId)) return;
       document.getElementById('comp-modal-body').innerHTML = _compModalError('loadComponentWithTimeContext(\'' + nodeId + '\')', c.name, e);
@@ -10143,7 +18945,7 @@ function openCompModal(nodeId) {
   }
 
   document.getElementById('comp-modal-body').innerHTML = '<div style="text-align:center;padding:20px;"><div style="font-size:48px;margin-bottom:16px;">' + c.icon + '</div><div style="font-size:16px;font-weight:600;margin-bottom:8px;">' + c.name + '</div><div style="color:var(--text-muted);">Live view coming soon</div><div style="margin-top:8px;font-size:12px;color:var(--text-muted);text-transform:uppercase;">' + c.type + '</div></div>';
-  document.getElementById('comp-modal-footer').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+  document.getElementById('comp-modal-footer').textContent = t("app.last_updated", null, "Last updated: ") + new Date().toLocaleTimeString();
   document.getElementById('comp-modal-overlay').classList.add('open');
 }
 
@@ -10192,7 +18994,7 @@ function loadTelegramMessages(isRefresh) {
     }
     html += '</div>';
     body.innerHTML = html;
-    document.getElementById('comp-modal-footer').textContent = 'Last updated: ' + new Date().toLocaleTimeString() + ' - ' + data.total + ' total messages';
+    document.getElementById('comp-modal-footer').textContent = t("app.last_updated", null, "Last updated: ") + new Date().toLocaleTimeString() + ' - ' + data.total + ' total messages';
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
     if (!isRefresh) {
@@ -10261,7 +19063,7 @@ function loadTuiMessages(isRefresh) {
     var scroll = body.querySelector('.tg-chat');
     if (scroll) scroll.scrollTop = scroll.scrollHeight;
     var f = document.getElementById('comp-modal-footer');
-    if (f) f.textContent = 'Last updated: ' + new Date().toLocaleTimeString() +
+    if (f) f.textContent = t("app.last_updated", null, "Last updated: ") + new Date().toLocaleTimeString() +
       ' - ' + (data.total || msgs.length) + ' total TUI messages';
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
@@ -10293,7 +19095,7 @@ function loadMoreTelegram() {
     });
     html += '</div>';
     body.innerHTML = html;
-    document.getElementById('comp-modal-footer').textContent = 'Last updated: ' + new Date().toLocaleTimeString() + ' - ' + data.total + ' total messages';
+    document.getElementById('comp-modal-footer').textContent = t("app.last_updated", null, "Last updated: ") + new Date().toLocaleTimeString() + ' - ' + data.total + ' total messages';
   });
 }
 
@@ -10322,7 +19124,7 @@ function loadIMessageMessages(isRefresh) {
     });
     html += '</div>';
     body.innerHTML = html;
-    document.getElementById('comp-modal-footer').textContent = 'Last updated: ' + new Date().toLocaleTimeString() + ' - ' + (data.total || msgs.length) + ' total messages';
+    document.getElementById('comp-modal-footer').textContent = t("app.last_updated", null, "Last updated: ") + new Date().toLocaleTimeString() + ' - ' + (data.total || msgs.length) + ' total messages';
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
     if (!isRefresh) {
@@ -10356,7 +19158,7 @@ function loadWhatsAppMessages(isRefresh) {
     });
     html += '</div>';
     body.innerHTML = html;
-    document.getElementById('comp-modal-footer').textContent = 'Last updated: ' + new Date().toLocaleTimeString() + ' - ' + (data.total || msgs.length) + ' total messages';
+    document.getElementById('comp-modal-footer').textContent = t("app.last_updated", null, "Last updated: ") + new Date().toLocaleTimeString() + ' - ' + (data.total || msgs.length) + ' total messages';
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
     if (!isRefresh) {
@@ -10390,7 +19192,7 @@ function loadSignalMessages(isRefresh) {
     });
     html += '</div>';
     body.innerHTML = html;
-    document.getElementById('comp-modal-footer').textContent = 'Last updated: ' + new Date().toLocaleTimeString() + ' - ' + (data.total || msgs.length) + ' total messages';
+    document.getElementById('comp-modal-footer').textContent = t("app.last_updated", null, "Last updated: ") + new Date().toLocaleTimeString() + ' - ' + (data.total || msgs.length) + ' total messages';
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
     if (!isRefresh) {
@@ -10481,7 +19283,7 @@ function loadDiscordMessages(isRefresh) {
     });
     html += '</div>';
     body.innerHTML = html;
-    document.getElementById('comp-modal-footer').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+    document.getElementById('comp-modal-footer').textContent = t("app.last_updated", null, "Last updated: ") + new Date().toLocaleTimeString();
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
     document.getElementById('comp-modal-body').innerHTML = _compModalError('loadDiscordMessages', 'Discord', e);
@@ -10524,7 +19326,7 @@ function loadSlackMessages(isRefresh) {
     });
     html += '</div>';
     body.innerHTML = html;
-    document.getElementById('comp-modal-footer').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+    document.getElementById('comp-modal-footer').textContent = t("app.last_updated", null, "Last updated: ") + new Date().toLocaleTimeString();
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
     document.getElementById('comp-modal-body').innerHTML = _compModalError('loadSlackMessages', 'Slack', e);
@@ -10568,7 +19370,7 @@ function loadGenericChannelData(nodeId, chKey, comp, isRefresh) {
       html += '</div>';
     }
     body.innerHTML = html;
-    document.getElementById('comp-modal-footer').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+    document.getElementById('comp-modal-footer').textContent = t("app.last_updated", null, "Last updated: ") + new Date().toLocaleTimeString();
   }).catch(function(e) {
     if (!isCompModalActive(nodeId)) return;
     body.innerHTML = _compModalError(null, comp.name, e);
@@ -10617,7 +19419,7 @@ function loadWebchatMessages(isRefresh) {
       html += '</div>';
     }
     body.innerHTML = html;
-    document.getElementById('comp-modal-footer').textContent = 'WebChat - Last updated: ' + new Date().toLocaleTimeString();
+    document.getElementById('comp-modal-footer').textContent = t("app.webchat_last_updated", null, "WebChat - Last updated: ") + new Date().toLocaleTimeString();
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
     body.innerHTML = _compModalError('loadWebchatMessages', 'WebChat', e);
@@ -10666,7 +19468,7 @@ function loadIRCMessages(isRefresh) {
       html += '</div>';
     }
     body.innerHTML = html;
-    document.getElementById('comp-modal-footer').textContent = 'IRC - ' + (channels.join(', ') || 'no channels') + ' - ' + new Date().toLocaleTimeString();
+    document.getElementById('comp-modal-footer').textContent = t("app.irc", null, "IRC - ") + (channels.join(', ') || 'no channels') + ' - ' + new Date().toLocaleTimeString();
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
     body.innerHTML = _compModalError('loadIRCMessages', 'IRC', e);
@@ -10715,7 +19517,7 @@ function loadBlueBubblesMessages(isRefresh) {
       html += '</div>';
     }
     body.innerHTML = html;
-    document.getElementById('comp-modal-footer').textContent = 'BlueBubbles - ' + escapeHtml(status) + ' - ' + new Date().toLocaleTimeString();
+    document.getElementById('comp-modal-footer').textContent = t("app.bluebubbles", null, "BlueBubbles - ") + escapeHtml(status) + ' - ' + new Date().toLocaleTimeString();
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
     body.innerHTML = _compModalError('loadBlueBubblesMessages', 'BlueBubbles', e);
@@ -10760,7 +19562,7 @@ function loadGoogleChatMessages(isRefresh) {
       html += '</div>';
     }
     body.innerHTML = html;
-    document.getElementById('comp-modal-footer').textContent = 'Google Chat - Last updated: ' + new Date().toLocaleTimeString();
+    document.getElementById('comp-modal-footer').textContent = t("app.google_chat_last_updated", null, "Google Chat - Last updated: ") + new Date().toLocaleTimeString();
   }).catch(function(e) {
     if (!isCompModalActive(nodeId)) return;
     body.innerHTML = _compModalError('loadGoogleChatMessages', 'Google Chat', e);
@@ -10805,7 +19607,7 @@ function loadMSTeamsMessages(isRefresh) {
       html += '</div>';
     }
     body.innerHTML = html;
-    document.getElementById('comp-modal-footer').textContent = 'Microsoft Teams - Last updated: ' + new Date().toLocaleTimeString();
+    document.getElementById('comp-modal-footer').textContent = t("app.microsoft_teams_last_updated", null, "Microsoft Teams - Last updated: ") + new Date().toLocaleTimeString();
   }).catch(function(e) {
     if (!isCompModalActive(nodeId)) return;
     body.innerHTML = _compModalError('loadMSTeamsMessages', 'Microsoft Teams', e);
@@ -10850,7 +19652,7 @@ function loadMattermostMessages(isRefresh) {
       html += '</div>';
     }
     body.innerHTML = html;
-    document.getElementById('comp-modal-footer').textContent = 'Mattermost - Last updated: ' + new Date().toLocaleTimeString();
+    document.getElementById('comp-modal-footer').textContent = t("app.mattermost_last_updated", null, "Mattermost - Last updated: ") + new Date().toLocaleTimeString();
   }).catch(function(e) {
     if (!isCompModalActive(nodeId)) return;
     body.innerHTML = _compModalError('loadMattermostMessages', 'Mattermost', e);
@@ -10960,7 +19762,7 @@ function loadBrainData(isRefresh) {
     }
 
     body.innerHTML = html;
-    document.getElementById('comp-modal-footer').textContent = 'Auto-refreshing - Last updated: ' + new Date().toLocaleTimeString() + ' - ' + (data.total||0) + ' API call' + ((data.total||0) === 1 ? '' : 's') + ' synced today (each = one HTTP round-trip to the LLM provider)';
+    document.getElementById('comp-modal-footer').textContent = t("app.auto_refreshing_last_updated", null, "Auto-refreshing - Last updated: ") + new Date().toLocaleTimeString() + ' - ' + (data.total||0) + ' API call' + ((data.total||0) === 1 ? '' : 's') + ' synced today (each = one HTTP round-trip to the LLM provider)';
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
     var msg = String((e && e.message) || 'Unknown error');
@@ -11113,7 +19915,7 @@ function loadCostOptimizerData(isRefresh) {
     html += '</div>';
 
     body.innerHTML = html;
-    document.getElementById('comp-modal-footer').textContent = 'Auto-refreshing - Last updated: ' + new Date().toLocaleTimeString() + ' - ' + (data.llmfitAvailable ? 'llmfit ✓' : 'no llmfit') + ' - ' + _accelLabel + ' backend';
+    document.getElementById('comp-modal-footer').textContent = t("app.auto_refreshing_last_updated", null, "Auto-refreshing - Last updated: ") + new Date().toLocaleTimeString() + ' - ' + (data.llmfitAvailable ? 'llmfit ✓' : 'no llmfit') + ' - ' + _accelLabel + ' backend';
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
     if (!isRefresh) {
@@ -11202,7 +20004,7 @@ function updateTimeDisplay() {
   if (!display) return;
   
   if (!_currentTimeContext) {
-    display.textContent = 'Live (Now)';
+    display.textContent = t("app.live_now", null, "Live (Now)");
     display.style.color = 'var(--text-accent)';
   } else {
     var day = _timelineData.days.find(function(d) { return d.date === _currentTimeContext.date; });
@@ -11247,7 +20049,7 @@ function loadCostOptimizerDataWithTime() {
   var body = document.getElementById('comp-modal-body');
   var timeContext = _currentTimeContext ? ' (' + _currentTimeContext.date + ')' : '';
   body.innerHTML = '<div style="text-align:center;padding:20px;"><div style="font-size:48px;margin-bottom:16px;">💰</div><div style="font-size:16px;font-weight:600;margin-bottom:8px;">Cost Optimizer' + timeContext + '</div><div style="color:var(--text-muted);">Historical cost analysis coming soon</div><div style="margin-top:8px;font-size:12px;color:var(--text-muted);text-transform:uppercase;">optimizer</div></div>';
-  document.getElementById('comp-modal-footer').textContent = 'Time travel: ' + (_currentTimeContext ? _currentTimeContext.date : 'Live');
+  document.getElementById('comp-modal-footer').textContent = t("app.time_travel", null, "Time travel: ") + (_currentTimeContext ? _currentTimeContext.date : 'Live');
 }
 
 function loadAutomationAdvisorDataWithTime() {
@@ -11256,11 +20058,11 @@ function loadAutomationAdvisorDataWithTime() {
   
   if (_currentTimeContext) {
     body.innerHTML = '<div style="text-align:center;padding:20px;"><div style="font-size:48px;margin-bottom:16px;">🧠</div><div style="font-size:16px;font-weight:600;margin-bottom:8px;">Automation Advisor' + timeContext + '</div><div style="color:var(--text-muted);">Historical pattern analysis coming soon</div><div style="margin-top:8px;font-size:12px;color:var(--text-muted);text-transform:uppercase;">advisor</div></div>';
-    document.getElementById('comp-modal-footer').textContent = 'Time travel: ' + _currentTimeContext.date;
+    document.getElementById('comp-modal-footer').textContent = t("app.time_travel", null, "Time travel: ") + _currentTimeContext.date;
     return;
   }
   
-  body.innerHTML = '<div style="text-align:center;padding:40px;"><div style="font-size:24px;margin-bottom:20px;">🧠 Loading automation analysis...</div></div>';
+  body.innerHTML = '<div style="text-align:center;padding:40px;"><div style="font-size:24px;margin-bottom:20px;">' + t("app.loading_automation_analysis", null, "🧠 Loading automation analysis...") + '</div></div>';
   document.getElementById('comp-modal-footer').textContent = 'Live';
   
   fetch('/api/automation-analysis').then(function(r){return r.json();}).then(function(data) {
@@ -11349,7 +20151,7 @@ function loadComponentWithTimeContext(nodeId) {
     var body = document.getElementById('comp-modal-body');
     var timeContext = _currentTimeContext ? ' (' + _currentTimeContext.date + ')' : '';
     body.innerHTML = '<div style="text-align:center;padding:20px;"><div style="font-size:48px;margin-bottom:16px;">' + c.icon + '</div><div style="font-size:16px;font-weight:600;margin-bottom:8px;">' + c.name + timeContext + '</div><div style="color:var(--text-muted);">Historical view coming soon</div><div style="margin-top:8px;font-size:12px;color:var(--text-muted);text-transform:uppercase;">' + c.type + '</div></div>';
-    document.getElementById('comp-modal-footer').textContent = 'Time travel: ' + (_currentTimeContext ? _currentTimeContext.date : 'Live');
+    document.getElementById('comp-modal-footer').textContent = t("app.time_travel", null, "Time travel: ") + (_currentTimeContext ? _currentTimeContext.date : 'Live');
   }
 }
 
@@ -11448,7 +20250,7 @@ function loadGatewayData(isRefresh) {
     }
 
     body.innerHTML = html;
-    document.getElementById('comp-modal-footer').textContent = 'Auto-refreshing - Last updated: ' + new Date().toLocaleTimeString() + ' - ' + (data.total||0) + ' events today';
+    document.getElementById('comp-modal-footer').textContent = t("app.auto_refreshing_last_updated", null, "Auto-refreshing - Last updated: ") + new Date().toLocaleTimeString() + ' - ' + (data.total||0) + ' events today';
   }).catch(function(e) {
     if (!isCompModalActive(expectedNodeId)) return;
     if (!isRefresh) {
@@ -11787,7 +20589,7 @@ function loadToolData(toolKey, comp, isRefresh) {
     }
 
     body.innerHTML = html;
-    document.getElementById('comp-modal-footer').textContent = 'Auto-refreshing - Last updated: ' + new Date().toLocaleTimeString() + ' - ' + (data.total||0) + ' events today';
+    document.getElementById('comp-modal-footer').textContent = t("app.auto_refreshing_last_updated", null, "Auto-refreshing - Last updated: ") + new Date().toLocaleTimeString() + ' - ' + (data.total||0) + ' events today';
   }).catch(function(e) {
     if (!isCompModalActive(_expectedNodeId)) return;
     if (!isRefresh) {
@@ -11839,6 +20641,9 @@ function closeCompModal() {
 }
 document.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeCompModal(); });
 document.addEventListener('DOMContentLoaded', initCompClickHandlers);
+// Eagerly resolve harness template availability so the nav item appears
+// (or stays hidden) at first paint rather than waiting for the tab visit.
+document.addEventListener('DOMContentLoaded', function () { setTimeout(_cmInitHarnessNav, 300); });
 
 // Pre-fetch tool data so modals open instantly
 function _prefetchToolData() {
@@ -11856,7 +20661,14 @@ document.addEventListener('DOMContentLoaded', function() {
   // when the browser tab is hidden — completes the lazy-load Phase 2
   // sweep this PR is closing out. Page-load fires once so no-leak risk
   // (no per-visit re-arming), but the visibility-gate is still the win.
-  visibilitySetInterval(_prefetchToolData, 30000); // refresh cache every 30s
+  // Tab-scoped: this prefetches 12 /api/component/tool/<t> endpoints to make
+  // the Flow component modals open instantly. The modals only exist on the
+  // Flow / Overview diagrams, so only refresh there — it was firing 12
+  // requests/30s on every tab (Memory, Alerts, …) for nothing.
+  visibilitySetInterval(function() {
+    if (window._cmCurrentTab && window._cmCurrentTab !== 'flow' && window._cmCurrentTab !== 'overview') return;
+    _prefetchToolData();
+  }, 30000); // refresh cache every 30s
 });
 
 function openTaskModal(sessionId, taskName, sessionKey) {
@@ -11865,7 +20677,7 @@ function openTaskModal(sessionId, taskName, sessionKey) {
   document.getElementById('modal-title').textContent = taskName || sessionId || sessionKey;
   document.getElementById('modal-session-key').textContent = sessionKey || sessionId;
   document.getElementById('task-modal-overlay').classList.add('open');
-  document.getElementById('modal-content').innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted);">Loading transcript...</div>';
+  document.getElementById('modal-content').innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted);">' + t("app.loading_transcript", null, "Loading transcript...") + '</div>';
   _modalTab = 'summary';
   document.querySelectorAll('.modal-tab').forEach(function(t,i){t.classList.toggle('active',i===0);});
   loadModalTranscript();
@@ -11978,7 +20790,7 @@ async function _renderModalSpawnInfo(sessionIdOrKey, reason) {
   // modal hard to read through.
   var alreadyRendered = !!document.getElementById('fallback-pane-overview');
   if (!alreadyRendered) {
-    el.innerHTML = '<div style="padding:20px;color:var(--text-muted);">Loading subagent info...</div>';
+    el.innerHTML = '<div style="padding:20px;color:var(--text-muted);">' + t("app.loading_subagent_info", null, "Loading subagent info...") + '</div>';
   }
   try {
     var saData = await fetch('/api/subagents').then(function(r){return r.json();}).catch(function(){return {subagents:[]};});
@@ -12138,8 +20950,21 @@ async function _renderModalBrainEvents(match) {
     var events = await unwrapListAsync(data, 'events', 'events_blob');
     var filtered = events.filter(function(ev) {
       if ((ev.type || '').toUpperCase() === 'CONTEXT') return false;
-      var src = ev.source || '';
-      if (candidates.indexOf(src) < 0) return false;
+      // Brain events carry the session id under different keys depending on the
+      // feed: local routes/brain.py emits `source`, while the cloud/snapshot +
+      // family-runtime feed emits `src` (sometimes truncated) + `sessionId`.
+      // Reading only `ev.source` matched nothing on cloud-connected nodes, so
+      // the tab was always empty. Match against all of them, substring-tolerant.
+      var evSrc = String(ev.src || ev.source || '');
+      var evSession = String(ev.sessionId || '');
+      var hit = candidates.some(function(c) {
+        if (!c) return false;
+        if (c === evSrc || c === evSession) return true;
+        if (evSession && (evSession.indexOf(c) >= 0 || c.indexOf(evSession) >= 0)) return true;
+        if (evSrc.length >= 8 && (evSrc.indexOf(c) >= 0 || c.indexOf(evSrc) >= 0)) return true;
+        return false;
+      });
+      if (!hit) return false;
       var ts = Date.parse(ev.time || '');
       if (isNaN(ts)) return true;  // keep undated events
       return ts >= winStart && ts <= endMs;
@@ -12150,11 +20975,31 @@ async function _renderModalBrainEvents(match) {
     });
 
     if (!filtered.length) {
-      slot.innerHTML = '<div><div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:8px;">Brain events</div>'
+      // Explain *why* it's empty instead of a bare, date-less "not found".
+      // The most common case here is a stale spawn whose events have already
+      // aged out of the retained Brain history (which only keeps recent ones),
+      // so show the spawn's full date and the history's coverage range.
+      var evTimes = events.map(function(e){ return Date.parse(e.time || ''); })
+                          .filter(function(n){ return !isNaN(n); });
+      var minEv = evTimes.length ? Math.min.apply(null, evTimes) : null;
+      var maxEv = evTimes.length ? Math.max.apply(null, evTimes) : null;
+      var spawnWhen = new Date(startedMs);
+      var spawnStr = isNaN(spawnWhen.getTime()) ? '' : spawnWhen.toLocaleString();
+      var note;
+      if (minEv && endMs < minEv) {
+        note = 'This spawn' + (spawnStr ? ' (' + spawnStr + ')' : '')
+             + ' is older than the retained Brain history (kept from '
+             + new Date(minEv).toLocaleString() + '), so its events are no longer available.';
+      } else if (maxEv && winStart > maxEv) {
+        note = 'This spawn' + (spawnStr ? ' (' + spawnStr + ')' : '')
+             + ' is newer than the latest retained Brain event — nothing recorded yet.';
+      } else {
+        note = 'No Brain events recorded for this spawn'
+             + (spawnStr ? ' (' + spawnStr + ')' : '') + '.';
+      }
+      slot.innerHTML = '<div><div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:8px;">' + t("app.brain_events", null, "Brain events") + '</div>'
                      + '<div style="padding:10px 12px;background:var(--bg-secondary);border:1px solid var(--border-primary);border-radius:6px;font-size:12px;color:var(--text-muted);">'
-                     + 'No Brain events found in the window around this spawn ('
-                     + new Date(winStart).toLocaleTimeString() + ' – '
-                     + new Date(endMs).toLocaleTimeString() + ').</div></div>';
+                     + escHtml(note) + '</div></div>';
       return;
     }
 
@@ -12177,7 +21022,7 @@ async function _renderModalBrainEvents(match) {
         : '';
       var detail = escHtml(ev.detail || '');
       if (detail.length > 200) detail = detail.substring(0, 197) + '…';
-      var src = ev.sourceLabel || ev.source || '';
+      var src = ev.sourceLabel || ev.src || ev.source || ev.sessionId || '';
       if (src.length > 14) src = src.substring(0, 12) + '…';
       rows += '<div style="display:flex;gap:8px;align-items:flex-start;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.04);">'
            +  '<span style="color:var(--text-faint);min-width:62px;font-size:10.5px;font-variant-numeric:tabular-nums;">' + ts + '</span>'
@@ -12233,7 +21078,7 @@ function renderModalSummary(el) {
     }
   }
   var html = '';
-  var renderMd = (typeof marked !== 'undefined' && marked.parse) ? function(s){ return marked.parse(s); } : escHtml;
+  var renderMd = cmSafeMarkdown;
   html += '<div class="summary-section"><div class="summary-label">Task Description</div>';
   html += '<div class="summary-text md-rendered">' + renderMd(desc || 'No description found') + '</div></div>';
   html += '<div class="summary-section"><div class="summary-label">Final Result / Output</div>';
@@ -12337,7 +21182,7 @@ function renderEvtItem(evt, idx) {
   h += '<span class="evt-summary">' + summary + '</span>';
   h += '<span class="evt-ts">' + escHtml(ts) + '</span>';
   h += '</div>';
-  var bodyHtml = (typeof marked !== 'undefined' && marked.parse) ? marked.parse(body) : escHtml(body);
+  var bodyHtml = cmSafeMarkdown(body);
   var isOpen = _expandedEvts[idx] ? ' open' : '';
   h += '<div class="evt-body md-rendered' + isOpen + '" id="' + bodyId + '">' + bodyHtml + '</div>';
   h += '</div>';
@@ -12389,21 +21234,26 @@ function renderModalFull(el) {
 
 async function renderModalTools(el) {
   if (!_modalSessionId) {
-    el.innerHTML = '<div style="padding:24px;color:var(--text-muted)">No session loaded.</div>';
+    el.innerHTML = '<div style="padding:24px;color:var(--text-muted)">' + t("app.no_session_loaded", null, "No session loaded.") + '</div>';
     return;
   }
-  el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">Loading tool timeline…</div>';
+  el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">' + t("app.loading_tool_timeline", null, "Loading tool timeline…") + '</div>';
   var data;
   try {
     var r = await fetch('/api/session-tools?session_id=' + encodeURIComponent(_modalSessionId) + '&args_chars=200&result_chars=200&include_unpaired=1');
     data = await r.json();
+    // Issue #1804: show outage banner when ingest is offline (503 envelope).
+    if (r.status === 503 && data && data.error === 'local_store ingest is offline') {
+      el.innerHTML = '<div style="background:#fff7ed;border:1px solid #f59e0b;color:#92400e;padding:12px 16px;border-radius:6px;margin:12px;"><strong>' + t("app.ingest_temporarily_offline", null, "Ingest temporarily offline.") + '</strong> Tool timeline unavailable; the local_store writer is not responding.</div>';
+      return;
+    }
   } catch(e) {
-    el.innerHTML = '<div style="padding:24px;color:#ef5350">Failed to load tool timeline.</div>';
+    el.innerHTML = '<div style="padding:24px;color:#ef5350">' + t("app.failed_to_load_tool_timeline", null, "Failed to load tool timeline.") + '</div>';
     return;
   }
   var tools = data.tools || [];
   if (!tools.length) {
-    el.innerHTML = '<div style="padding:24px;color:var(--text-muted)">No tool calls recorded for this session.</div>';
+    el.innerHTML = '<div style="padding:24px;color:var(--text-muted)">' + t("app.no_tool_calls_recorded_for_this_session", null, "No tool calls recorded for this session.") + '</div>';
     return;
   }
   var stats = data.stats || {};
@@ -12472,10 +21322,10 @@ function _fmtDur(ms) {
 
 async function renderModalModelJourney(el) {
   if (!_modalSessionId) {
-    el.innerHTML = '<div style="padding:20px;color:var(--text-muted);">No session ID available</div>';
+    el.innerHTML = '<div style="padding:20px;color:var(--text-muted);">' + t("app.no_session_id_available", null, "No session ID available") + '</div>';
     return;
   }
-  el.innerHTML = '<div style="padding:20px;color:var(--text-muted);">Loading model journey...</div>';
+  el.innerHTML = '<div style="padding:20px;color:var(--text-muted);">' + t("app.loading_model_journey", null, "Loading model journey...") + '</div>';
   try {
     var r = await fetch('/api/session-model-journey/' + encodeURIComponent(_modalSessionId));
     var data = await r.json();
@@ -12487,7 +21337,7 @@ async function renderModalModelJourney(el) {
     var thinkingChanges = data.thinking_changes || [];
     var stats = data.stats || {};
     if (!segments.length && !thinkingChanges.length) {
-      el.innerHTML = '<div style="padding:20px;color:var(--text-muted);">No model changes detected in this session.</div>';
+      el.innerHTML = '<div style="padding:20px;color:var(--text-muted);">' + t("app.no_model_changes_detected_in_this_session", null, "No model changes detected in this session.") + '</div>';
       return;
     }
     var html = '';
@@ -12560,23 +21410,23 @@ async function renderModalModelJourney(el) {
 
     el.innerHTML = html;
   } catch(e) {
-    el.innerHTML = '<div style="padding:20px;color:var(--text-error);">Failed to load model journey: ' + escHtml(e.message || String(e)) + '</div>';
+    el.innerHTML = '<div style="padding:20px;color:var(--text-error);">' + t("app.failed_to_load_model_journey", null, "Failed to load model journey") + ': ' + escHtml(e.message || String(e)) + '</div>';
   }
 }
 
 async function renderModalSubagents(el) {
   var key = window._modalSessionKey || _modalSessionId;
   if (!key) {
-    el.innerHTML = '<div style="padding:20px;color:var(--text-muted);">No session key available.</div>';
+    el.innerHTML = '<div style="padding:20px;color:var(--text-muted);">' + t("app.no_session_key_available", null, "No session key available.") + '</div>';
     return;
   }
-  el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">Loading subagents…</div>';
+  el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">' + t("app.loading_subagents", null, "Loading subagents…") + '</div>';
   var data;
   try {
     var r = await fetch('/api/task-runs?requester_session_key=' + encodeURIComponent(key) + '&limit=200');
     data = await r.json();
   } catch(e) {
-    el.innerHTML = '<div style="padding:24px;color:#ef5350">Failed to load subagents.</div>';
+    el.innerHTML = '<div style="padding:24px;color:#ef5350">' + t("app.failed_to_load_subagents", null, "Failed to load subagents.") + '</div>';
     return;
   }
   var tasks = data.tasks || [];
@@ -12705,6 +21555,57 @@ function _withTimeout(promise, ms, label) {
   ]);
 }
 
+// ── Anonymous auth-fail-on-first-load instrumentation (issue #1365) ──────
+// The `pgrep openclaw-gatewa` typo in #1357 silently killed gateway-token
+// auto-detect for every fresh install without OPENCLAW_GATEWAY_TOKEN set.
+// We had no way to spot the regression because nothing pinged when first
+// boot rejected the locally-valid token. These pure helpers + the gated
+// emit inside bootDashboard() let us quantify the funnel loss next time.
+// NO token content, NO IP — see /api/anon-auth-fail-ping on the server.
+function _uaClass(ua) {
+  // Bucket the UA into 4 buckets so cardinality stays tiny in analytics.
+  // Order matters: Edge and Opera embed "Chrome" in their UA, so we test
+  // those exclusion-style before falling through to Chrome.
+  var s = String(ua || '').toLowerCase();
+  if (s.indexOf('firefox') !== -1) return 'firefox';
+  // Safari ships "Safari" + "Version/" but Chrome ALSO ships "Safari".
+  // Detect Safari by "safari" present AND "chrome"/"chromium" absent.
+  if (s.indexOf('safari') !== -1 && s.indexOf('chrome') === -1 && s.indexOf('chromium') === -1) return 'safari';
+  if (s.indexOf('chrome') !== -1 || s.indexOf('chromium') !== -1) return 'chrome';
+  return 'other';
+}
+
+function _shouldPingAuthFailFirstLoad(storedToken, authData) {
+  // Fire ONLY when this is genuinely a first-load reject — i.e. the user
+  // has no prior token in localStorage. A 401 with a stored token is a
+  // session timeout / rotated token, not a fresh-install funnel drop, and
+  // would pollute the signal we're trying to measure.
+  if (storedToken) return false;
+  if (!authData) return false;
+  if (authData.needsSetup) return false;  // separate funnel; not our target.
+  return !!(authData.authRequired && !authData.valid);
+}
+
+function _pingAuthFailFirstLoad() {
+  // Fire-and-forget. Never blocks boot, never surfaces errors. The server
+  // logs to local DuckDB/JSONL and best-effort forwards to cloud.
+  try {
+    var badge = document.getElementById('version-badge');
+    var version = badge ? String(badge.textContent || '').replace(/^v/, '').trim() : 'unknown';
+    var body = JSON.stringify({
+      event: 'auth_fail_first_load',
+      version: version || 'unknown',
+      user_agent_class: _uaClass(navigator && navigator.userAgent),
+    });
+    fetch('/api/anon-auth-fail-ping', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: body,
+      keepalive: true,
+    }).catch(function() { /* fail-silent by design */ });
+  } catch (e) { /* never crash boot on telemetry */ }
+}
+
 async function bootDashboard() {
   // Hard floor: dismiss overlay after BOOT_HARD_TIMEOUT_MS no matter what.
   // The dashboard stays usable with partial data; individual panels show
@@ -12730,6 +21631,11 @@ async function bootDashboard() {
       return;
     }
     if (authData.authRequired && !authData.valid) {
+      // Anonymous funnel-loss ping (issue #1365). Gated on "no prior token"
+      // so we measure fresh-install rejects, not session timeouts.
+      if (_shouldPingAuthFailFirstLoad(stored, authData)) {
+        _pingAuthFailFirstLoad();
+      }
       document.getElementById('login-overlay').style.display = 'flex';
       _safeFinishBoot();
       return;
@@ -12774,8 +21680,19 @@ async function bootDashboard() {
   startOverviewTasksRefresh();
 
   var sub = document.getElementById('boot-sub');
-  if (sub) sub.textContent = 'Dashboard ready';
+  if (sub) sub.textContent = t("app.dashboard_ready", null, "Dashboard ready");
   setTimeout(_safeFinishBoot, 180);
+}
+
+// Version impact is a per-OpenClaw-release report — only meaningful when the
+// user controls their own OpenClaw install. In cloud mode ClawMetry manages
+// versions, so the tab is irrelevant. Hide nav item + page (deep-link too).
+function _hideCloudIrrelevantNav() {
+  if (!window.CLOUD_MODE) return;
+  var navItem = document.querySelector('.left-nav-item[data-tab="version-impact"]');
+  if (navItem) navItem.style.display = 'none';
+  var page = document.getElementById('page-version-impact');
+  if (page) page.style.display = 'none';
 }
 
 document.addEventListener('DOMContentLoaded', function() {
@@ -12788,7 +21705,28 @@ document.addEventListener('DOMContentLoaded', function() {
   bootDashboard();
   // Issue #950: multi-profile workspace switcher
   try { initWorkspaceSwitcher(); } catch (e) { /* non-fatal */ }
+  // Global runtime switcher — populate from the session list on load.
+  try { _cmInitGlobalRuntimeSwitcher(); } catch (e) { /* non-fatal */ }
+  try { _hideCloudIrrelevantNav(); } catch (e) { /* non-fatal */ }
+  try { _applyTracingFlag(); } catch (e) { /* non-fatal */ }
 });
+
+// The Tracing tab (Phoenix/Arize-style span waterfall + tree + agent graph) is
+// now GA: shown in the nav by default for every install. The phases-3-4 polish
+// and the daemon-proxy reliability fixes that kept it behind a flag have landed,
+// and it's verified against real traces (event-derived + OTel/OTLP spans).
+// Power users can still hide it with ?tracing=0 (persisted to localStorage);
+// ?tracing=1 clears the opt-out.
+function _applyTracingFlag() {
+  var p = new URLSearchParams(window.location.search);
+  if (p.get('tracing') === '0') { try { localStorage.setItem('cm-ff-tracing-off', '1'); } catch (e) {} }
+  if (p.get('tracing') === '1') { try { localStorage.removeItem('cm-ff-tracing-off'); } catch (e) {} }
+  var on = true;
+  try { if (localStorage.getItem('cm-ff-tracing-off') === '1') on = false; } catch (e) {}
+  if (p.get('tab') === 'tracing') on = true;
+  var el = document.getElementById('left-nav-tracing');
+  if (el) el.style.display = on ? '' : 'none';
+}
 
 // ── Workspace switcher (issue #950) ───────────────────────────────────
 // Discovers all OpenClaw workspaces on this machine and lets power users
@@ -12845,7 +21783,9 @@ function renderWorkspaceSwitcher() {
     item.onclick = function() { selectWorkspace(w); };
     var name = document.createElement('div');
     name.style.cssText = 'font-weight:600;color:var(--text-primary,#fff);';
-    name.textContent = (isActive ? '• ' : '') + (w.name || 'workspace');
+    // Issue #1172: suffix with "(local)" so users can never confuse this
+    // single-machine profile switcher with Cloud-Pro multi-node fleet view.
+    name.textContent = (isActive ? '• ' : '') + (w.name || 'workspace') + ' (local)';
     var path = document.createElement('div');
     path.style.cssText = 'font-size:10px;color:var(--text-muted,#888);font-family:ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
     path.title = w.path;
@@ -12893,190 +21833,6 @@ async function selectWorkspace(w) {
     window.location.reload();
   } catch (e) {
     console.warn('workspace switch error', e);
-  }
-}
-
-// ── History Tab ──────────────────────────────────────────────────────
-var _historyRange = 3600; // seconds
-var _historyFrom = null;
-var _historyTo = null;
-var _histTokensChart = null;
-var _histCostChart = null;
-var _histSessionsChart = null;
-
-function setTimeRange(seconds, btn) {
-  _historyRange = seconds;
-  _historyFrom = null;
-  _historyTo = null;
-  document.querySelectorAll('#time-range-picker .time-btn').forEach(b => b.classList.remove('active'));
-  if (btn) btn.classList.add('active');
-  document.getElementById('custom-range-picker').style.display = 'none';
-  loadHistory();
-}
-
-function showCustomRange() {
-  document.querySelectorAll('#time-range-picker .time-btn').forEach(b => b.classList.remove('active'));
-  var cp = document.getElementById('custom-range-picker');
-  cp.style.display = 'flex';
-  // Default to last 24h
-  var now = new Date();
-  var ago = new Date(now.getTime() - 86400000);
-  document.getElementById('history-to').value = now.toISOString().slice(0,16);
-  document.getElementById('history-from').value = ago.toISOString().slice(0,16);
-}
-
-function applyCustomRange() {
-  var from = document.getElementById('history-from').value;
-  var to = document.getElementById('history-to').value;
-  if (!from || !to) return;
-  _historyFrom = new Date(from).getTime() / 1000;
-  _historyTo = new Date(to).getTime() / 1000;
-  _historyRange = null;
-  loadHistory();
-}
-
-function _getHistoryParams() {
-  var now = Date.now() / 1000;
-  var from_ts, to_ts;
-  if (_historyRange) {
-    from_ts = now - _historyRange;
-    to_ts = now;
-  } else {
-    from_ts = _historyFrom;
-    to_ts = _historyTo;
-  }
-  var span = to_ts - from_ts;
-  var interval = 'minute';
-  if (span > 86400) interval = 'hour';
-  if (span > 604800) interval = 'day';
-  return {from: from_ts, to: to_ts, interval: interval};
-}
-
-function _chartOpts(title, yLabel) {
-  return {
-    responsive: true,
-    maintainAspectRatio: false,
-    interaction: { mode: 'index', intersect: false },
-    plugins: {
-      legend: { display: true, position: 'top', labels: { boxWidth: 12, font: { size: 11 }, color: getComputedStyle(document.body).getPropertyValue('--text-secondary') || '#666' } },
-      tooltip: { backgroundColor: 'rgba(0,0,0,0.8)', titleFont: { size: 12 }, bodyFont: { size: 11 } }
-    },
-    scales: {
-      x: { type: 'time', time: { tooltipFormat: 'MMM d, HH:mm' }, grid: { display: false }, ticks: { font: { size: 10 }, color: getComputedStyle(document.body).getPropertyValue('--text-muted') || '#999' } },
-      y: { beginAtZero: true, grid: { color: 'rgba(128,128,128,0.1)' }, ticks: { font: { size: 10 }, color: getComputedStyle(document.body).getPropertyValue('--text-muted') || '#999' }, title: { display: !!yLabel, text: yLabel || '', font: { size: 11 } } }
-    },
-    onClick: function(evt, elems) {
-      if (elems.length > 0) {
-        var idx = elems[0].index;
-        var ds = this.data.datasets[elems[0].datasetIndex];
-        if (ds && ds.data[idx]) {
-          var ts = ds.data[idx].x;
-          showSnapshot(ts instanceof Date ? ts.getTime()/1000 : ts/1000);
-        }
-      }
-    }
-  };
-}
-
-function _destroyChart(chart) {
-  if (chart) { try { chart.destroy(); } catch(e){} }
-  return null;
-}
-
-async function loadHistory() {
-  var p = _getHistoryParams();
-  var status = document.getElementById('history-status');
-  status.textContent = 'Loading...';
-
-  try {
-    // Fetch token metrics
-    var [tokIn, tokOut, costData, sessData, cronData] = await Promise.all([
-      fetch('/api/history/metrics?metric=tokens_in_total&from='+p.from+'&to='+p.to+'&interval='+p.interval).then(r=>r.json()),
-      fetch('/api/history/metrics?metric=tokens_out_total&from='+p.from+'&to='+p.to+'&interval='+p.interval).then(r=>r.json()),
-      fetch('/api/history/metrics?metric=cost_total&from='+p.from+'&to='+p.to+'&interval='+p.interval).then(r=>r.json()),
-      fetch('/api/history/metrics?metric=sessions_active&from='+p.from+'&to='+p.to+'&interval='+p.interval).then(r=>r.json()),
-      fetch('/api/history/crons?from='+p.from+'&to='+p.to).then(r=>r.json()),
-    ]);
-
-    // Token chart
-    _histTokensChart = _destroyChart(_histTokensChart);
-    var tokInPts = (tokIn.data||[]).map(function(d){ return {x: new Date((d.bucket_ts||d.timestamp)*1000), y: d.avg_val||d.metric_value||0}; });
-    var tokOutPts = (tokOut.data||[]).map(function(d){ return {x: new Date((d.bucket_ts||d.timestamp)*1000), y: d.avg_val||d.metric_value||0}; });
-    var ctx1 = document.getElementById('history-tokens-chart').getContext('2d');
-    _histTokensChart = new Chart(ctx1, {
-      type: 'line',
-      data: {
-        datasets: [
-          { label: 'Input Tokens', data: tokInPts, borderColor: '#6366f1', backgroundColor: 'rgba(99,102,241,0.1)', fill: true, tension: 0.3, pointRadius: 1 },
-          { label: 'Output Tokens', data: tokOutPts, borderColor: '#f59e0b', backgroundColor: 'rgba(245,158,11,0.1)', fill: true, tension: 0.3, pointRadius: 1 }
-        ]
-      },
-      options: _chartOpts('Token Usage', 'Tokens')
-    });
-
-    // Cost chart
-    _histCostChart = _destroyChart(_histCostChart);
-    var costPts = (costData.data||[]).map(function(d){ return {x: new Date((d.bucket_ts||d.timestamp)*1000), y: d.avg_val||d.metric_value||0}; });
-    var ctx2 = document.getElementById('history-cost-chart').getContext('2d');
-    _histCostChart = new Chart(ctx2, {
-      type: 'line',
-      data: {
-        datasets: [
-          { label: 'Total Cost ($)', data: costPts, borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.1)', fill: true, tension: 0.3, pointRadius: 1 }
-        ]
-      },
-      options: _chartOpts('Cost', 'USD')
-    });
-
-    // Sessions chart
-    _histSessionsChart = _destroyChart(_histSessionsChart);
-    var sessPts = (sessData.data||[]).map(function(d){ return {x: new Date((d.bucket_ts||d.timestamp)*1000), y: d.avg_val||d.metric_value||0}; });
-    var ctx3 = document.getElementById('history-sessions-chart').getContext('2d');
-    _histSessionsChart = new Chart(ctx3, {
-      type: 'line',
-      data: {
-        datasets: [
-          { label: 'Active Sessions', data: sessPts, borderColor: '#8b5cf6', backgroundColor: 'rgba(139,92,246,0.1)', fill: true, tension: 0.3, pointRadius: 2, stepped: 'before' }
-        ]
-      },
-      options: _chartOpts('Sessions', 'Count')
-    });
-
-    // Cron runs table
-    var runs = cronData.data || [];
-    var cronHtml = '';
-    if (runs.length === 0) {
-      cronHtml = '<div style="color:var(--text-muted);padding:20px;text-align:center;">No cron runs in this time range</div>';
-    } else {
-      cronHtml = '<table style="width:100%;border-collapse:collapse;"><thead><tr style="border-bottom:1px solid var(--border-primary);"><th style="text-align:left;padding:4px 8px;font-size:11px;color:var(--text-muted);">Time</th><th style="text-align:left;padding:4px 8px;font-size:11px;color:var(--text-muted);">Job</th><th style="text-align:left;padding:4px 8px;font-size:11px;color:var(--text-muted);">Status</th><th style="text-align:right;padding:4px 8px;font-size:11px;color:var(--text-muted);">Duration</th></tr></thead><tbody>';
-      runs.slice(-100).reverse().forEach(function(r) {
-        var t = new Date(r.timestamp * 1000).toLocaleString();
-        var statusColor = r.status === 'success' || r.status === 'completed' ? '#10b981' : (r.status === 'error' || r.status === 'failed' ? '#ef4444' : '#f59e0b');
-        var dur = r.duration_ms ? (r.duration_ms/1000).toFixed(1)+'s' : '--';
-        cronHtml += '<tr style="border-bottom:1px solid var(--border-secondary);"><td style="padding:4px 8px;font-size:12px;">'+t+'</td><td style="padding:4px 8px;font-size:12px;">'+((r.job_name||r.job_id)||'--')+'</td><td style="padding:4px 8px;font-size:12px;"><span style="color:'+statusColor+';font-weight:600;">&#9679;</span> '+(r.status||'--')+'</td><td style="padding:4px 8px;font-size:12px;text-align:right;">'+dur+'</td></tr>';
-      });
-      cronHtml += '</tbody></table>';
-    }
-    document.getElementById('history-cron-table').innerHTML = cronHtml;
-
-    // Update status
-    var totalPts = (tokIn.data||[]).length + (costData.data||[]).length;
-    status.textContent = totalPts > 0 ? totalPts + ' data points' : 'No data yet -- collector polls every 60s';
-  } catch(e) {
-    status.textContent = 'Error: ' + e.message;
-    console.error('History load error:', e);
-  }
-}
-
-async function showSnapshot(ts) {
-  try {
-    var r = await fetch('/api/history/snapshot/' + ts);
-    var data = await r.json();
-    document.getElementById('snapshot-title').textContent = 'Snapshot @ ' + new Date(ts * 1000).toLocaleString();
-    document.getElementById('snapshot-content').textContent = JSON.stringify(data.raw_json || data, null, 2);
-    document.getElementById('snapshot-modal').style.display = 'flex';
-  } catch(e) {
-    console.error('Snapshot error:', e);
   }
 }
 
@@ -13135,13 +21891,13 @@ async function showSnapshot(ts) {
     var driftAlert = document.getElementById('nc-drift-alert');
     var driftDetail = document.getElementById('nc-drift-detail');
     if (data.policy_drifted) {
-      if (driftBadge) { driftBadge.textContent = '⚠️ Policy drift detected'; driftBadge.style.color = '#ef4444'; }
+      if (driftBadge) { driftBadge.textContent = t("app.policy_drift_detected_2", null, "⚠️ Policy drift detected"); driftBadge.style.color = '#ef4444'; }
       if (driftAlert) driftAlert.style.display = 'block';
       if (driftDetail && data.drift_info) {
-        driftDetail.textContent = 'Old: ' + (data.drift_info.old_hash || '?') + '  →  New: ' + (data.drift_info.new_hash || '?') + '\nDetected: ' + (data.drift_info.detected_at || '');
+        driftDetail.textContent = t("app.old", null, "Old: ") + (data.drift_info.old_hash || '?') + '  →  New: ' + (data.drift_info.new_hash || '?') + '\nDetected: ' + (data.drift_info.detected_at || '');
       }
     } else {
-      if (driftBadge) { driftBadge.textContent = '✅ No drift'; driftBadge.style.color = '#22c55e'; }
+      if (driftBadge) { driftBadge.textContent = t("app.no_drift_2", null, "✅ No drift"); driftBadge.style.color = '#22c55e'; }
       if (driftAlert) driftAlert.style.display = 'none';
     }
 
@@ -13150,7 +21906,7 @@ async function showSnapshot(ts) {
     if (policyEl) {
       var policies = data.network_policies || [];
       if (policies.length === 0) {
-        policyEl.innerHTML = '<div style="color:var(--text-muted);">No network policies found</div>';
+        policyEl.innerHTML = '<div style="color:var(--text-muted);">' + t("app.no_network_policies_found", null, "No network policies found") + '</div>';
       } else {
         var rows = policies.map(function(p) {
           var hosts = Array.isArray(p.hosts) ? p.hosts.join(', ') : (p.hosts || '');
@@ -13166,7 +21922,7 @@ async function showSnapshot(ts) {
     if (presetsEl) {
       var presets = data.presets || [];
       if (presets.length === 0) {
-        presetsEl.innerHTML = '<span style="color:var(--text-muted);font-size:12px;">None detected</span>';
+        presetsEl.innerHTML = '<span style="color:var(--text-muted);font-size:12px;">' + t("app.none_detected", null, "None detected") + '</span>';
       } else {
         presetsEl.innerHTML = presets.map(function(p) {
           return '<span style="background:rgba(118,185,0,0.12);color:#76b900;border:1px solid rgba(118,185,0,0.25);border-radius:12px;padding:3px 12px;font-size:12px;font-weight:600;">' + _ncEsc(p) + '</span>';
@@ -13194,3 +21950,796 @@ function _ncEsc(s) {
   } catch(e) {}
 })();
 } } // end if(false) stub */
+
+// On page load: reveal Insights tab when the feature flag is on. The endpoint
+// always returns 200 (since #1431/PR closing); when disabled it returns
+// `{enabled: false}`, when enabled it returns the full config + `enabled: true`.
+// Probing by JSON flag instead of HTTP status keeps the browser console clean
+// on cloud-rendered dashboards where CLAWMETRY_INSIGHTS=1 is unset.
+(function() {
+  try {
+    fetch('/api/insights/config').then(function(r) {
+      return r.ok ? r.json() : null;
+    }).then(function(d) {
+      if (d && d.enabled === true) {
+        var t = document.getElementById('insights-tab');
+        if (t) t.style.display = '';
+      }
+    }).catch(function(){});
+  } catch(e) {}
+})();
+
+// ── Update banner (PyPI version check + one-click upgrade) ─────────────
+// Functions are referenced from clawmetry/templates/partials/banners.html.
+// /api/update-check/status decides visibility; /api/update runs pip install.
+async function checkUpdateStatus() {
+  try {
+    var data = await fetch('/api/update-check/status').then(function(r){return r.json();});
+    var banner = document.getElementById('update-banner');
+    var msg = document.getElementById('update-banner-msg');
+    if (data.show_banner && banner && msg) {
+      var latest = (data.latest_check && data.latest_check.latest) || 'newer';
+      var current = (data.latest_check && data.latest_check.current) || '';
+      msg.textContent = t("app.update_available_v", null, "Update available: v") + latest + ' is out. You are on v' + current + '.';
+      banner.style.display = 'flex';
+      _renderAutoUpdateToggle(!!(data.config && data.config.auto_update));
+    }
+  } catch(e) {}
+}
+
+// Reflect the persisted auto_update preference in the banner toggle. On the
+// hosted cloud (CLOUD_MODE) the local pip-updater doesn't apply — the cloud
+// stays current centrally — so show that instead of a functional switch.
+function _renderAutoUpdateToggle(isOn) {
+  var wrap = document.getElementById('update-banner-auto');
+  var box = document.getElementById('update-banner-auto-toggle');
+  var label = document.getElementById('update-banner-auto-label');
+  if (!wrap) return;
+  if (window.CLOUD_MODE) {
+    wrap.style.display = 'flex';
+    wrap.style.cursor = 'default';
+    wrap.title = 'ClawMetry Cloud is kept on the latest release automatically.';
+    if (box) box.style.display = 'none';
+    if (label) label.textContent = t("app.auto_updates_on_cloud", null, "☁ Auto-updates on Cloud");
+    return;
+  }
+  wrap.style.display = 'flex';
+  if (box) { box.style.display = ''; box.checked = !!isOn; }
+  if (label) label.textContent = isOn ? 'Auto-update on' : 'Auto-update';
+}
+
+// Persist the toggle; if turning it ON while an update is already pending,
+// kick the upgrade right away instead of waiting for the next daily check.
+async function toggleAutoUpdate(on) {
+  var label = document.getElementById('update-banner-auto-label');
+  try {
+    await fetch('/api/update-check/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({auto_update: !!on})
+    });
+  } catch(e) {}
+  if (label) label.textContent = on ? 'Auto-update on' : 'Auto-update';
+  if (on) {
+    // An update is showing (this toggle only renders inside the update banner),
+    // so apply it now — reuse the same vetted path as the Update now button.
+    updateFromBanner();
+  }
+}
+
+async function dismissUpdateBanner() {
+  try {
+    var data = await fetch('/api/update-check/status').then(function(r){return r.json();});
+    if (data.latest_check && data.latest_check.latest) {
+      await fetch('/api/update-check/dismiss', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({version: data.latest_check.latest})
+      });
+    }
+    var banner = document.getElementById('update-banner');
+    if (banner) banner.style.display = 'none';
+  } catch(e) {}
+}
+
+async function updateFromBanner() {
+  var btn = document.getElementById('update-banner-update-btn');
+  var msg = document.getElementById('update-banner-msg');
+  var changelog = document.getElementById('update-banner-changelog');
+  if (!btn) return;
+  var target = '';
+  try {
+    var s = await fetch('/api/update-check/status').then(function(r){return r.json();});
+    target = (s && s.latest_check && s.latest_check.latest) || '';
+  } catch(e) {}
+  if (!confirm('Update ClawMetry' + (target ? ' to v' + target : '') + ' now?\n\nThe dashboard and sync daemon will restart. In-flight requests may be interrupted.')) return;
+  btn.disabled = true;
+  btn.textContent = t("app.updating", null, "Updating...");
+  btn.style.cursor = 'wait';
+  btn.style.opacity = '0.7';
+  if (changelog) changelog.style.display = 'none';
+  if (msg) msg.textContent = t("app.running_pip_install_u_clawmetry_this_usually_takes", null, "Running pip install -U clawmetry. This usually takes 10-30 seconds...");
+  try {
+    var resp = await fetch('/api/update', {method: 'POST'});
+    var d = await resp.json().catch(function(){return {};});
+    if (resp.ok && d.ok) {
+      if (msg) msg.textContent = t("app.updated_to_v", null, "Updated to v") + (d.new_version || target) + '. Restarting dashboard...';
+      var reloaded = false;
+      var attempts = 0;
+      var poll = setInterval(function(){
+        attempts++;
+        fetch('/api/version', {cache: 'no-store'}).then(function(r){
+          if (!r.ok) throw new Error('not-ok');
+          return r.json();
+        }).then(function(v){
+          if (reloaded) return;
+          if (v && v.current && (!target || v.current === target)) {
+            reloaded = true;
+            clearInterval(poll);
+            window.location.reload();
+          }
+        }).catch(function(){});
+        if (attempts > 60) {
+          clearInterval(poll);
+          if (msg) msg.textContent = t("app.restart_taking_longer_than_expected_refresh_the_pa", null, "Restart taking longer than expected. Refresh the page manually.");
+          btn.disabled = false;
+          btn.textContent = t("app.update_now", null, "Update now");
+          btn.style.cursor = 'pointer';
+          btn.style.opacity = '1';
+        }
+      }, 1000);
+    } else {
+      if (msg) msg.textContent = t("app.update_failed", null, "Update failed: ") + ((d && d.error) || ('HTTP ' + resp.status));
+      btn.disabled = false;
+      btn.textContent = t("app.update_now", null, "Update now");
+      btn.style.cursor = 'pointer';
+      btn.style.opacity = '1';
+      if (changelog) changelog.style.display = '';
+    }
+  } catch(e) {
+    if (msg) msg.textContent = t("app.update_failed", null, "Update failed: ") + (e && e.message ? e.message : 'network error');
+    btn.disabled = false;
+    btn.textContent = t("app.update_now", null, "Update now");
+    btn.style.cursor = 'pointer';
+    btn.style.opacity = '1';
+    if (changelog) changelog.style.display = '';
+  }
+}
+
+setInterval(checkUpdateStatus, 3600000);
+setTimeout(checkUpdateStatus, 5000);
+
+// ── Per-screen runtime chip (2nd switch point) ───────────────────────────────
+// A small fixed chip (bottom-right) on every tab that names the runtime the
+// current screen is showing, and is itself a switch point: clicking it opens a
+// menu mirroring the header dropdown (locked runtimes show a padlock + route to
+// upgrade instead of selecting). Reuses the same state as the header switcher
+// (_cmGlobalRtCounts / _cmLockedRuntimes / _cmRuntimeFilter) so the two stay in
+// lockstep. Self-contained IIFE appended at EOF so it can't disturb other code.
+(function () {
+  var CHIP_ID = 'cm-runtime-chip';
+  var MENU_ID = 'cm-runtime-chip-menu';
+  function _rt() { try { return (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all'; } catch (e) { return 'all'; } }
+  function _label(rt) {
+    if (rt === 'all') return 'All runtimes';
+    try { return (typeof _cmRuntimeLabel === 'function') ? _cmRuntimeLabel(rt) : rt; } catch (e) { return rt; }
+  }
+  function _locked(rt) { try { return !!(typeof _cmLockedRuntimes !== 'undefined' && _cmLockedRuntimes && _cmLockedRuntimes[rt]); } catch (e) { return false; } }
+  function _counts() { try { return (typeof _cmGlobalRtCounts !== 'undefined' && _cmGlobalRtCounts) || {}; } catch (e) { return {}; } }
+  function _labels() { try { return (typeof _CM_RT_LABEL !== 'undefined' && _CM_RT_LABEL) || {}; } catch (e) { return {}; } }
+  function _esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+  function _closeMenu() { var m = document.getElementById(MENU_ID); if (m && m.parentNode) m.parentNode.removeChild(m); }
+
+  function _openMenu(anchor) {
+    _closeMenu();
+    var counts = _counts(), locked = _cmLockedRuntimes || {}, labels = _labels();
+    var free = {};
+    try { free = (typeof _cmFreeRuntimes !== 'undefined' && _cmFreeRuntimes) || {}; } catch (e) {}
+    // Free runtimes (openclaw/nemoclaw) always list, even at 0 recent sessions
+    // — mirrors the header dropdown so the two switch points agree.
+    var observed = Object.keys(labels).filter(function (k) { return counts[k] || free[k]; });
+    var lockedKeys = Object.keys(locked).filter(function (k) { return observed.indexOf(k) < 0; });
+    var order = observed.concat(lockedKeys);
+    var cur = _rt();
+    var m = document.createElement('div');
+    m.id = MENU_ID;
+    m.style.cssText = 'position:fixed;z-index:99999;background:var(--bg-secondary,#161b22);border:1px solid var(--border-primary,#30363d);border-radius:10px;padding:6px;box-shadow:0 8px 24px rgba(0,0,0,0.4);min-width:200px;font-size:13px;';
+    var html = '';
+    var allActive = cur === 'all';
+    html += '<div data-rt="all" class="cm-rtc-item" style="padding:7px 10px;border-radius:7px;cursor:pointer;display:flex;justify-content:space-between;gap:10px;' + (allActive ? 'background:var(--bg-accent,#7c5cff);color:#fff;' : 'color:var(--text-primary,#e6edf3);') + '"><span>All runtimes</span></div>';
+    order.forEach(function (k) {
+      var isLocked = _locked(k), active = k === cur;
+      var right = isLocked ? '🔒 Upgrade' : ((counts[k] || 0) + (counts[k] === 1 ? ' session' : ' sessions'));
+      var _mic = (typeof window.cmRuntimeIcon === 'function') ? window.cmRuntimeIcon(k, 16, { chip: true }) + ' ' : '';
+      html += '<div data-rt="' + k + '" data-locked="' + (isLocked ? '1' : '') + '" class="cm-rtc-item" style="padding:7px 10px;border-radius:7px;cursor:pointer;display:flex;justify-content:space-between;gap:10px;' + (active ? 'background:var(--bg-accent,#7c5cff);color:#fff;' : 'color:var(--text-primary,#e6edf3);') + '"><span style="display:inline-flex;align-items:center;gap:6px;">' + (isLocked ? '🔒 ' : '') + _mic + _esc(_label(k)) + '</span><span style="opacity:.7;font-size:11px;white-space:nowrap;">' + _esc(right) + '</span></div>';
+    });
+    m.innerHTML = html;
+    document.body.appendChild(m);
+    var r = anchor.getBoundingClientRect();
+    var mh = m.offsetHeight, mw = m.offsetWidth;
+    m.style.left = Math.max(8, r.right - mw) + 'px';
+    m.style.top = Math.max(8, r.top - mh - 8) + 'px';
+    m.addEventListener('click', function (ev) {
+      var it = ev.target.closest ? ev.target.closest('.cm-rtc-item') : null;
+      if (!it) return;
+      var rt = it.getAttribute('data-rt');
+      if (it.getAttribute('data-locked')) {
+        window.open('https://app.clawmetry.com/upgrade?source=runtime_chip', '_blank', 'noopener');
+        _closeMenu();
+        return;
+      }
+      _closeMenu();
+      try { if (typeof _cmSetRuntimeFilter === 'function') _cmSetRuntimeFilter(rt); } catch (e) {}
+      try { if (typeof _applyRuntimeFlowDiagram === 'function') _applyRuntimeFlowDiagram(rt); } catch (e) {}
+      // Mirror the header <select> so both switch points agree.
+      try { var sel = document.getElementById('cm-global-runtime'); if (sel) sel.value = rt; } catch (e) {}
+      try { if (typeof switchTab === 'function' && _cmCurrentTab) switchTab(_cmCurrentTab); } catch (e) {}
+      _cmRenderRuntimeChip();
+    });
+    setTimeout(function () {
+      document.addEventListener('click', function _h(e) {
+        if (e.target.closest && (e.target.closest('#' + MENU_ID) || e.target.closest('#' + CHIP_ID))) return;
+        _closeMenu(); document.removeEventListener('click', _h);
+      });
+    }, 0);
+  }
+
+  window._cmRenderRuntimeChip = function () {
+    if (!document.body) return;
+    var cur = _rt();
+    var chip = document.getElementById(CHIP_ID);
+    if (!chip) {
+      chip = document.createElement('button');
+      chip.id = CHIP_ID;
+      chip.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:99998;display:inline-flex;align-items:center;gap:7px;padding:8px 13px;border-radius:20px;border:1px solid var(--border-primary,#30363d);background:var(--bg-secondary,#161b22);color:var(--text-secondary,#9ca3af);font-size:12px;font-weight:600;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,0.3);';
+      chip.title = 'Runtime this screen is showing — click to switch';
+      chip.addEventListener('click', function () {
+        var existing = document.getElementById(MENU_ID);
+        if (existing) { _closeMenu(); return; }
+        _openMenu(chip);
+      });
+      document.body.appendChild(chip);
+    }
+    var dot = _locked(cur) ? '🔒' : '🟢';
+    chip.innerHTML = '<span style="font-size:11px;opacity:.65;">Runtime</span> <span style="color:var(--text-primary,#e6edf3);">' + dot + ' ' + _esc(_label(cur)) + '</span> <span style="opacity:.5;">▾</span>';
+  };
+
+  function _boot() {
+    try { window._cmRenderRuntimeChip(); } catch (e) {}
+    // Keep the chip label in sync as the user navigates tabs / changes runtime.
+    if (typeof switchTab === 'function' && !switchTab.__cmChipWrapped) {
+      var _origSwitch = switchTab;
+      window.switchTab = function () {
+        var r = _origSwitch.apply(this, arguments);
+        try { window._cmRenderRuntimeChip(); } catch (e) {}
+        return r;
+      };
+      window.switchTab.__cmChipWrapped = true;
+    }
+    setInterval(function () { try { window._cmRenderRuntimeChip(); } catch (e) {} }, 5000);
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { setTimeout(_boot, 800); });
+  else setTimeout(_boot, 800);
+})();
+
+// ── Swimlane Compare ──────────────────────────────────────────────────────
+// N agents / sessions / runtimes rendered as parallel live columns. Each lane
+// has a header (model, cost, in/out tokens, context %) and a dense event
+// stream (reuses /api/transcript-events). Differentiator vs single-agent trace
+// tools: swimlane the runtimes and sessions side by side. Lanes persist in
+// localStorage. Live = 3s re-poll (no SSE in MVP). Only polls while the tab is
+// active (timer cleared in switchTab).
+var _swimlaneTimer = null;
+// Per-cycle cache of the cross-lane data we fetch once (sessions + usage) so
+// the renderer can decorate each lane header without re-fetching per lane.
+var _swimlaneSessionIndex = {};   // session_id -> /api/sessions row
+var _swimlaneCostIndex = {};      // session_id -> cost_usd (from /api/usage)
+var _swimlaneEventCache = {};     // session_id -> {events, ts}
+
+// Tool-badge colors mirror the Brain/Flow convention so badges read the same
+// across tabs.
+var _SWIMLANE_TOOL_COLORS = {
+  exec: '#f59e0b', browser: '#3b82f6', web_search: '#8b5cf6', web_fetch: '#06b6d4',
+  message: '#ec4899', read: '#6b7280', write: '#22c55e', edit: '#f97316',
+  tts: '#a855f7', image: '#ef4444', canvas: '#14b8a6', nodes: '#6366f1',
+  process: '#64748b'
+};
+
+function _swimlaneLanes() {
+  try {
+    var raw = localStorage.getItem('cm-swimlane-lanes');
+    var arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr.slice(0, 4) : [];
+  } catch (e) { return []; }
+}
+function _swimlaneSetLanes(arr) {
+  try { localStorage.setItem('cm-swimlane-lanes', JSON.stringify((arr || []).slice(0, 4))); }
+  catch (e) {}
+}
+function _swimlaneMode() {
+  try { return localStorage.getItem('cm-swimlane-mode') || 'swimlane'; }
+  catch (e) { return 'swimlane'; }
+}
+function _swimlaneRaceSort() {
+  try { return localStorage.getItem('cm-swimlane-race-sort') || 'cost'; }
+  catch (e) { return 'cost'; }
+}
+
+function setSwimlaneMode(mode) {
+  try { localStorage.setItem('cm-swimlane-mode', mode); } catch (e) {}
+  loadSwimlane();
+}
+function setSwimlaneRaceSort(sort) {
+  try { localStorage.setItem('cm-swimlane-race-sort', sort); } catch (e) {}
+  loadSwimlane();
+}
+
+function _swimlaneShortSid(sid) {
+  sid = String(sid || '');
+  var i = sid.indexOf(':');
+  var rest = i > 0 ? sid.slice(i + 1) : sid;
+  return rest.length > 14 ? rest.slice(0, 6) + '…' + rest.slice(-4) : rest;
+}
+function _swimlaneSessionLabel(sid) {
+  var s = _swimlaneSessionIndex[sid] || {};
+  return s.displayName || s.title || s.subject || _swimlaneShortSid(sid);
+}
+
+// Add a lane (deduped, capped at 4) and re-render.
+function swimlaneAddLane(sid) {
+  if (!sid) return;
+  var lanes = _swimlaneLanes();
+  if (lanes.indexOf(sid) !== -1) return;
+  if (lanes.length >= 4) { lanes = lanes.slice(0, 3); }
+  lanes.push(sid);
+  _swimlaneSetLanes(lanes);
+  closeSwimlaneAddLane();
+  loadSwimlane();
+}
+function swimlaneRemoveLane(sid) {
+  _swimlaneSetLanes(_swimlaneLanes().filter(function (x) { return x !== sid; }));
+  loadSwimlane();
+}
+function clearSwimlaneLanes() {
+  _swimlaneSetLanes([]);
+  loadSwimlane();
+}
+
+// One-click preset: most-recent session per distinct runtime (cap 4). This is
+// the headline demo path — the 14 runtimes side by side. Respects the global
+// runtime switcher: when scoped to one runtime, only that runtime is picked.
+function swimlanePresetPerRuntime() {
+  var rtFilter = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+  fetch('/api/sessions').then(function (r) { return r.json(); }).then(function (d) {
+    var sessions = (d && d.sessions) || (Array.isArray(d) ? d : []) || [];
+    // newest-first
+    sessions = sessions.slice().sort(function (a, b) {
+      return _swimlaneActiveEpoch(b) - _swimlaneActiveEpoch(a);
+    });
+    var seen = {};
+    var picks = [];
+    sessions.forEach(function (s) {
+      if (picks.length >= 4) return;
+      var sid = s.session_id || s.sessionId;
+      if (!sid) return;
+      var rt = (typeof _cmRuntimeOf === 'function') ? _cmRuntimeOf(s) : 'openclaw';
+      if (rtFilter !== 'all' && rt !== rtFilter) return;
+      if (seen[rt]) return;
+      seen[rt] = 1;
+      picks.push(sid);
+    });
+    _swimlaneSetLanes(picks);
+    loadSwimlane();
+  }).catch(function () {});
+}
+
+function _swimlaneActiveEpoch(s) {
+  var v = s.last_active_at || s.updated_at || s.updatedAt || s.started_at || s.lastActivityAt;
+  if (!v) return 0;
+  if (typeof v === 'number') return v < 1e12 ? v * 1000 : v;
+  var t = Date.parse(String(v));
+  return isNaN(t) ? 0 : t;
+}
+
+// ── Add-lane picker ───────────────────────────────────────────────────────
+function openSwimlaneAddLane() {
+  var ov = document.getElementById('swimlane-add-overlay');
+  if (ov) ov.style.display = 'flex';
+  var list = document.getElementById('swimlane-add-list');
+  if (list) list.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:16px;">Loading sessions...</div>';
+  var rtFilter = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+  fetch('/api/sessions').then(function (r) { return r.json(); }).then(function (d) {
+    var sessions = (d && d.sessions) || (Array.isArray(d) ? d : []) || [];
+    sessions = sessions.slice().sort(function (a, b) {
+      return _swimlaneActiveEpoch(b) - _swimlaneActiveEpoch(a);
+    });
+    var chosen = _swimlaneLanes();
+    var html = '';
+    var shown = 0;
+    sessions.forEach(function (s) {
+      var sid = s.session_id || s.sessionId;
+      if (!sid) return;
+      var rt = (typeof _cmRuntimeOf === 'function') ? _cmRuntimeOf(s) : 'openclaw';
+      // Filter the picker to the scoped runtime (don't drop already-pinned).
+      if (rtFilter !== 'all' && rt !== rtFilter) return;
+      shown++;
+      var already = chosen.indexOf(sid) !== -1;
+      var rtLbl = (typeof _cmRuntimeLabel === 'function') ? _cmRuntimeLabel(rt) : rt;
+      var label = s.displayName || s.title || s.subject || _swimlaneShortSid(sid);
+      var tok = Number(s.total_tokens || 0);
+      var tokStr = tok > 1e6 ? (tok / 1e6).toFixed(1) + 'M' : (tok > 1e3 ? (tok / 1e3).toFixed(0) + 'K' : tok);
+      html += '<div class="swimlane-add-row' + (already ? ' is-added' : '') + '" onclick="' + (already ? '' : 'swimlaneAddLane(' + JSON.stringify(sid) + ')') + '">';
+      html += '<span class="swimlane-rt-chip">' + escHtml(rtLbl) + '</span>';
+      html += '<span class="swimlane-add-name" title="' + escHtml(sid) + '">' + escHtml(label) + '</span>';
+      html += '<span class="swimlane-add-tok">' + tokStr + ' tok</span>';
+      html += '<span class="swimlane-add-state">' + (already ? 'added' : '+ add') + '</span>';
+      html += '</div>';
+    });
+    if (!shown) {
+      var note = rtFilter !== 'all'
+        ? 'No ' + escHtml((typeof _cmRuntimeLabel === 'function') ? _cmRuntimeLabel(rtFilter) : rtFilter) + ' sessions found. Clear the runtime filter to see all.'
+        : 'No sessions found yet.';
+      html = '<div style="color:var(--text-muted);font-size:12px;padding:16px;">' + note + '</div>';
+    }
+    var l = document.getElementById('swimlane-add-list');
+    if (l) l.innerHTML = html;
+  }).catch(function () {
+    var l = document.getElementById('swimlane-add-list');
+    if (l) l.innerHTML = '<div style="color:var(--text-error);font-size:12px;padding:16px;">Failed to load sessions.</div>';
+  });
+}
+function closeSwimlaneAddLane() {
+  var ov = document.getElementById('swimlane-add-overlay');
+  if (ov) ov.style.display = 'none';
+}
+
+// ── Loader ────────────────────────────────────────────────────────────────
+async function loadSwimlane() {
+  if (_cmCurrentTab !== 'swimlane') return;
+  var host = document.getElementById('swimlane-lanes');
+  if (!host) return;
+
+  // Reflect mode + race-sort button state.
+  var mode = _swimlaneMode();
+  document.querySelectorAll('.swimlane-mode-btn').forEach(function (b) {
+    b.classList.toggle('active', b.getAttribute('data-mode') === mode);
+  });
+  var raceSortWrap = document.getElementById('swimlane-race-sort');
+  if (raceSortWrap) raceSortWrap.style.display = (mode === 'race') ? 'flex' : 'none';
+  var raceSort = _swimlaneRaceSort();
+  document.querySelectorAll('.swimlane-sort-btn').forEach(function (b) {
+    b.classList.toggle('active', b.getAttribute('data-sort') === raceSort);
+  });
+
+  var lanes = _swimlaneLanes();
+  if (!lanes.length) {
+    if (host) host.innerHTML =
+      '<div class="swimlane-empty">'
+      + '<div style="font-size:28px;margin-bottom:10px;">🏊</div>'
+      + '<div style="font-size:14px;color:var(--text-primary);font-weight:600;margin-bottom:6px;">Pick up to 4 sessions to compare</div>'
+      + '<div style="font-size:12px;color:var(--text-muted);margin-bottom:16px;">Each lane streams its turns, tools and results side by side.</div>'
+      + '<button type="button" class="refresh-btn" onclick="swimlanePresetPerRuntime()">Compare 1 per runtime</button> '
+      + '<button type="button" class="refresh-btn" onclick="openSwimlaneAddLane()">+ Add lane</button>'
+      + '</div>';
+    var sp0 = document.getElementById('swimlane-single-picker');
+    if (sp0) sp0.style.display = 'none';
+    return;
+  }
+
+  // Fetch cross-lane context once + per-lane transcript-events concurrently.
+  var rtFilter = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+  var sessionsP = fetch('/api/sessions').then(function (r) { return r.json(); }).catch(function () { return {}; });
+  var usageP = fetch('/api/usage').then(function (r) { return r.json(); }).catch(function () { return {}; });
+  var eventPs = lanes.map(function (sid) {
+    return fetch('/api/transcript-events/' + encodeURIComponent(sid))
+      .then(function (r) { return r.json(); })
+      .then(function (j) { return { sid: sid, data: j }; })
+      .catch(function () { return { sid: sid, data: { events: [] } }; });
+  });
+
+  var results;
+  try {
+    results = await Promise.all([sessionsP, usageP].concat(eventPs));
+  } catch (e) {
+    return;
+  }
+  var sessData = results[0] || {};
+  var usageData = results[1] || {};
+  var eventResults = results.slice(2);
+
+  // Index sessions + costs for header decoration.
+  _swimlaneSessionIndex = {};
+  var sessList = (sessData && sessData.sessions) || (Array.isArray(sessData) ? sessData : []) || [];
+  sessList.forEach(function (s) {
+    var sid = s.session_id || s.sessionId;
+    if (sid) _swimlaneSessionIndex[sid] = s;
+  });
+  _swimlaneCostIndex = (usageData && usageData.sessionCosts) || {};
+
+  // Build lane view-models.
+  var laneModels = eventResults.map(function (er) {
+    return _swimlaneBuildLane(er.sid, er.data, rtFilter);
+  });
+
+  // Single mode: render one lane full-width with a lane selector.
+  var sp = document.getElementById('swimlane-single-picker');
+  if (mode === 'single') {
+    var activeSid = _swimlaneLanes().indexOf(window._swimlaneSingleSid) !== -1
+      ? window._swimlaneSingleSid : lanes[0];
+    window._swimlaneSingleSid = activeSid;
+    if (sp) {
+      if (lanes.length > 1) {
+        var ph = '<span style="font-size:11px;color:var(--text-muted);margin-right:6px;">Lane:</span>';
+        lanes.forEach(function (sid) {
+          ph += '<button type="button" class="swimlane-single-tab' + (sid === activeSid ? ' active' : '')
+            + '" onclick="window._swimlaneSingleSid=' + JSON.stringify(sid) + ';loadSwimlane()">'
+            + escHtml(_swimlaneSessionLabel(sid)) + '</button>';
+        });
+        sp.innerHTML = ph;
+        sp.style.display = 'flex';
+      } else { sp.style.display = 'none'; }
+    }
+    var one = laneModels.filter(function (lm) { return lm.sid === activeSid; });
+    host.className = 'swimlane-lanes single';
+    host.innerHTML = one.map(function (lm) { return _swimlaneRenderLane(lm, false, 0); }).join('');
+    return;
+  }
+  if (sp) sp.style.display = 'none';
+
+  // Race mode: reorder by cost or latency desc and add rank pills.
+  var ranked = false;
+  if (mode === 'race') {
+    ranked = true;
+    var key = _swimlaneRaceSort();
+    laneModels.sort(function (a, b) {
+      if (key === 'latency') return b.latencyMs - a.latencyMs;
+      return b.costUsd - a.costUsd;
+    });
+  }
+
+  host.className = 'swimlane-lanes' + (mode === 'race' ? ' race' : '');
+  var capHtml = '';
+  if (mode === 'race') {
+    capHtml = '<div class="swimlane-race-caption">Race mode (beta): lanes ordered by '
+      + escHtml(_swimlaneRaceSort()) + '. No live animation yet.</div>';
+  }
+  host.innerHTML = capHtml + laneModels.map(function (lm, i) {
+    return _swimlaneRenderLane(lm, ranked, i + 1);
+  }).join('');
+}
+
+// Build a lane view-model from the events payload + indexed session/cost data.
+function _swimlaneBuildLane(sid, data, rtFilter) {
+  var events = (data && data.events) || [];
+  var s = _swimlaneSessionIndex[sid] || {};
+  var rt = (typeof _cmRuntimeOf === 'function') ? _cmRuntimeOf(s.session_id ? s : { session_id: sid }) : 'openclaw';
+  var model = s.model || '';
+  var cost = Number(_swimlaneCostIndex[sid] != null ? _swimlaneCostIndex[sid] : (s.total_cost || 0)) || 0;
+  // No reliable in/out split in /api/sessions or /api/usage top rows — fall
+  // back to total + "--" rather than inventing a split (per spec).
+  var inTok = (typeof s.input_tokens === 'number') ? s.input_tokens : null;
+  var outTok = (typeof s.output_tokens === 'number') ? s.output_tokens : null;
+  var totalTok = Number(s.total_tokens || 0);
+  // Context %: derive from ctx tokens (input+cache if present) vs cap.
+  var ctxTok = (inTok != null ? inTok : totalTok);
+  var cap = /\[1m\]/i.test(model) ? 1000000 : 200000;
+  var pct = ctxTok > 0 ? Math.min(100, (ctxTok / cap) * 100) : null;
+  // latency = span of the lane's events.
+  var firstTs = null, lastTs = null;
+  events.forEach(function (ev) {
+    if (typeof ev.timestamp === 'number') {
+      if (firstTs == null || ev.timestamp < firstTs) firstTs = ev.timestamp;
+      if (lastTs == null || ev.timestamp > lastTs) lastTs = ev.timestamp;
+    }
+  });
+  var latencyMs = (firstTs != null && lastTs != null) ? (lastTs - firstTs) : 0;
+  var liveTs = _swimlaneActiveEpoch(s);
+  var isLive = liveTs > 0 && (Date.now() - liveTs) < 60000;
+  // Filtered-out flag: a pinned lane whose runtime is excluded by the global
+  // switcher gets a dimmed state (don't silently drop the user's pick).
+  var filteredOut = (rtFilter && rtFilter !== 'all' && rt !== rtFilter);
+  return {
+    sid: sid, events: events, runtime: rt, model: model, costUsd: cost,
+    inTok: inTok, outTok: outTok, totalTok: totalTok, ctxPct: pct,
+    latencyMs: latencyMs, isLive: isLive, filteredOut: filteredOut,
+    label: s.displayName || s.title || s.subject || _swimlaneShortSid(sid)
+  };
+}
+
+function _swimlaneRenderLane(lm, ranked, rank) {
+  var rtLbl = (typeof _cmRuntimeLabel === 'function') ? _cmRuntimeLabel(lm.runtime) : lm.runtime;
+  var costStr = '$' + (lm.costUsd || 0).toFixed(4);
+  var inStr = (lm.inTok != null) ? lm.inTok.toLocaleString() : '--';
+  var outStr = (lm.outTok != null) ? lm.outTok.toLocaleString() : '--';
+  var totStr = (lm.totalTok || 0).toLocaleString();
+  var pctStr = (lm.ctxPct != null) ? Math.round(lm.ctxPct) + '%' : '--';
+  var pctW = (lm.ctxPct != null) ? Math.round(lm.ctxPct) : 0;
+
+  var h = '<div class="swimlane-col' + (lm.filteredOut ? ' filtered-out' : '') + '">';
+  h += '<div class="swimlane-header">';
+  h += '<div class="swimlane-hrow1">';
+  if (ranked) h += '<span class="swimlane-rank">#' + rank + '</span>';
+  h += '<span class="swimlane-rt-chip">' + escHtml(rtLbl) + '</span>';
+  h += '<span class="swimlane-title" title="' + escHtml(lm.sid) + '">' + escHtml(lm.label) + '</span>';
+  if (lm.isLive) h += '<span class="swimlane-live-dot" title="active in the last 60s"></span>';
+  h += '<span class="swimlane-x" title="Remove lane" onclick="swimlaneRemoveLane(' + JSON.stringify(lm.sid) + ')">✕</span>';
+  h += '</div>';
+  h += '<div class="swimlane-model">' + escHtml(lm.model || 'model unknown') + '</div>';
+  h += '<div class="swimlane-stats">';
+  h += '<span class="swimlane-stat"><b>' + costStr + '</b><i>cost</i></span>';
+  h += '<span class="swimlane-stat"><b>' + inStr + ' / ' + outStr + '</b><i>in / out</i></span>';
+  if (lm.inTok == null) h += '<span class="swimlane-stat"><b>' + totStr + '</b><i>total tok</i></span>';
+  h += '</div>';
+  h += '<div class="swimlane-ctx"><div class="swimlane-ctx-bar"><div class="swimlane-ctx-fill" style="width:' + pctW + '%;"></div></div><span class="swimlane-ctx-lbl">ctx ' + pctStr + '</span></div>';
+  if (lm.filteredOut) h += '<div class="swimlane-filtered-note">Filtered out by runtime switcher</div>';
+  h += '</div>';
+
+  h += '<div class="swimlane-events">';
+  h += _swimlaneRenderEvents(lm.events);
+  h += '</div>';
+  h += '</div>';
+  return h;
+}
+
+function _swimlaneTrunc(s, n) {
+  s = String(s || '').replace(/\s+/g, ' ').trim();
+  return s.length > n ? s.slice(0, n) + '…' : s;
+}
+
+// Render the dense event stream. Turn boundaries are synthesized: a `user`
+// event opens a turn; we count turns as we go. Per-turn token deltas are
+// deferred (transcript-events carries no per-event tokens).
+function _swimlaneRenderEvents(events) {
+  if (!events || !events.length) {
+    return '<div class="swimlane-ev-empty">No events recorded for this lane yet.</div>';
+  }
+  var turnN = 0;
+  var rows = '';
+  events.forEach(function (ev) {
+    var type = ev.type || '';
+    if (type === 'user') {
+      turnN++;
+      rows += '<div class="swimlane-ev swimlane-turn" data-type="turn">';
+      rows += '<span class="swimlane-badge swimlane-b-turn">TURN ' + turnN + '</span>';
+      rows += '<span class="swimlane-ev-text">' + escHtml(_swimlaneTrunc(ev.text, 120)) + '</span>';
+      rows += '</div>';
+    } else if (type === 'thinking') {
+      rows += '<div class="swimlane-ev swimlane-ind">';
+      rows += '<span class="swimlane-badge swimlane-b-think">THINK</span>';
+      rows += '<span class="swimlane-ev-text think">' + escHtml(_swimlaneTrunc(ev.text, 140)) + '</span>';
+      rows += '</div>';
+    } else if (type === 'exec') {
+      rows += '<div class="swimlane-ev swimlane-ind">';
+      rows += '<span class="swimlane-badge swimlane-b-exec">EXEC</span>';
+      rows += '<code class="swimlane-ev-code">' + escHtml(_swimlaneTrunc(ev.command || ev.text, 120)) + '</code>';
+      rows += '</div>';
+    } else if (type === 'read') {
+      rows += '<div class="swimlane-ev swimlane-ind">';
+      rows += '<span class="swimlane-badge swimlane-b-read">READ</span>';
+      rows += '<span class="swimlane-ev-text">' + escHtml(_swimlaneTrunc(ev.file || ev.text, 120)) + '</span>';
+      rows += '</div>';
+    } else if (type === 'tool') {
+      var tn = ev.toolName || '?';
+      var col = _SWIMLANE_TOOL_COLORS[tn] || '#6b7280';
+      rows += '<div class="swimlane-ev swimlane-ind">';
+      rows += '<span class="swimlane-tool-badge" style="background:' + col + ';">' + escHtml(tn) + '</span>';
+      if (ev.text) rows += '<span class="swimlane-ev-text">' + escHtml(_swimlaneTrunc(ev.text, 100)) + '</span>';
+      rows += '</div>';
+    } else if (type === 'result') {
+      rows += '<div class="swimlane-ev swimlane-ind">';
+      rows += '<span class="swimlane-badge swimlane-b-result">RESULT</span>';
+      rows += '<span class="swimlane-ev-text result">✓ ' + escHtml(_swimlaneTrunc(ev.text, 100)) + '</span>';
+      rows += '</div>';
+    } else if (type === 'agent') {
+      rows += '<div class="swimlane-ev swimlane-ind">';
+      rows += '<span class="swimlane-badge swimlane-b-agent">AGENT</span>';
+      rows += '<span class="swimlane-ev-text agent">' + escHtml(_swimlaneTrunc(ev.text, 140)) + '</span>';
+      rows += '</div>';
+    } else if (type === 'model_change') {
+      rows += '<div class="swimlane-ev swimlane-divider">model → ' + escHtml(_swimlaneTrunc(ev.modelId, 60)) + '</div>';
+    } else if (type === 'thinking_level_change') {
+      rows += '<div class="swimlane-ev swimlane-divider">thinking level → ' + escHtml(_swimlaneTrunc(ev.thinkingLevel, 40)) + '</div>';
+    }
+  });
+  return rows;
+}
+
+// ── Agent Graph tab (#1012) ─────────────────────────────────────────────────
+// Fleet-level cross-session view: which agent types were active in the window
+// and their spawn relationships.  No vendor JS needed — plain SVG.
+
+var _AGENT_COLORS = {
+  openclaw: '#6366f1', 'claude-code': '#10b981', cursor: '#f59e0b',
+  codex: '#3b82f6', hermes: '#ec4899', gemini: '#8b5cf6'
+};
+
+function loadAgentGraph() {
+  var statusEl = document.getElementById('agent-graph-status');
+  var svgEl    = document.getElementById('agent-graph-svg');
+  var statsEl  = document.getElementById('agent-graph-stats');
+  if (!statusEl) return;
+  statusEl.style.display = 'block';
+  statusEl.textContent = 'Loading…';
+  if (svgEl) svgEl.style.display = 'none';
+  if (statsEl) statsEl.style.display = 'none';
+
+  var win   = parseInt((document.getElementById('agent-graph-window') || {}).value || '86400', 10);
+  var now   = Math.floor(Date.now() / 1000);
+  var since = now - win;
+  fetch('/api/local/agent-graph?since=' + since + '&until=' + now)
+    .then(function(r) {
+      // The cloud disables /api/local/* (no local DuckDB) with HTTP 410.
+      // Say so honestly instead of pretending there is no data.
+      if (r.status === 410) return {_cloud_disabled: true};
+      return r.ok ? r.json() : {nodes: [], edges: []};
+    })
+    .then(function(data) {
+      if (data && data._cloud_disabled) {
+        statusEl.style.display = 'block';
+        statusEl.textContent = t('app.agent_graph_local_only', null,
+          'The agent graph is built from your local data store, so it is only available on the dashboard running on your machine (http://localhost:8900).');
+        return;
+      }
+      statusEl.style.display = 'none';
+      _renderAgentGraph(data.nodes || [], data.edges || []);
+    })
+    .catch(function() {
+      statusEl.textContent = 'Could not load agent graph. Is the daemon running?';
+    });
+}
+
+function _renderAgentGraph(nodes, edges) {
+  var svgEl   = document.getElementById('agent-graph-svg');
+  var statsEl = document.getElementById('agent-graph-stats');
+  var statsIn = document.getElementById('agent-graph-stats-inner');
+  if (!svgEl) return;
+
+  if (!nodes.length) {
+    svgEl.style.display = 'none';
+    var statusEl = document.getElementById('agent-graph-status');
+    if (statusEl) { statusEl.style.display = 'block'; statusEl.textContent = 'No agent span data in this time window.'; }
+    return;
+  }
+
+  var W = 700, H = 420, cx = W / 2, cy = H / 2;
+  var r = Math.min(cx - 80, cy - 80);
+  var angle = nodes.length > 1 ? (2 * Math.PI / nodes.length) : 0;
+  var pos = {};
+  nodes.forEach(function(n, i) {
+    var a = nodes.length === 1 ? 0 : angle * i - Math.PI / 2;
+    pos[n.id] = {x: nodes.length === 1 ? cx : cx + r * Math.cos(a), y: nodes.length === 1 ? cy : cy + r * Math.sin(a)};
+  });
+
+  var parts = ['<defs><marker id="ag-arrow" markerWidth="7" markerHeight="7" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#6366f155"/></marker></defs>'];
+  edges.forEach(function(e) {
+    var f = pos[e.from], t = pos[e.to];
+    if (!f || !t) return;
+    parts.push('<line x1="' + f.x.toFixed(1) + '" y1="' + f.y.toFixed(1) + '" x2="' + t.x.toFixed(1) + '" y2="' + t.y.toFixed(1) + '" stroke="#6366f155" stroke-width="2" marker-end="url(#ag-arrow)"/>');
+  });
+
+  nodes.forEach(function(n) {
+    var p   = pos[n.id];
+    var col = _AGENT_COLORS[n.agent_type] || '#94a3b8';
+    var nr  = Math.max(22, Math.min(44, 22 + Math.log1p(n.span_count) * 3.5));
+    parts.push(
+      '<circle cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) + '" r="' + nr.toFixed(1) + '" fill="' + col + '22" stroke="' + col + '" stroke-width="2" style="cursor:pointer" onclick="switchTab(\'tracing\')" title="' + escHtml(n.label) + ': ' + n.span_count + ' spans"/>',
+      '<text x="' + p.x.toFixed(1) + '" y="' + (p.y + 4).toFixed(1) + '" text-anchor="middle" fill="' + col + '" font-size="10" font-weight="700" pointer-events="none">' + escHtml(n.agent_type.slice(0, 10)) + '</text>',
+      '<text x="' + p.x.toFixed(1) + '" y="' + (p.y + nr + 14).toFixed(1) + '" text-anchor="middle" fill="var(--text-muted)" font-size="10" pointer-events="none">' + n.session_count + ' sess · ' + n.span_count + ' spans</text>'
+    );
+  });
+
+  svgEl.innerHTML = parts.join('');
+  svgEl.style.display = 'block';
+
+  if (statsEl && statsIn) {
+    var totalCost = nodes.reduce(function(s, n) { return s + (n.cost_usd || 0); }, 0);
+    var totalTok  = nodes.reduce(function(s, n) { return s + (n.total_tokens || 0); }, 0);
+    statsIn.innerHTML =
+      '<span><b>' + nodes.length + '</b> agent type' + (nodes.length !== 1 ? 's' : '') + '</span>' +
+      '<span><b>' + edges.length + '</b> spawn edge' + (edges.length !== 1 ? 's' : '') + '</span>' +
+      (totalCost ? '<span>$<b>' + totalCost.toFixed(4) + '</b> total cost</span>' : '') +
+      (totalTok  ? '<span><b>' + (totalTok / 1000).toFixed(1) + 'K</b> tokens</span>' : '');
+    statsEl.style.display = 'block';
+  }
+}

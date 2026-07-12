@@ -1,46 +1,76 @@
 <div class="page" id="page-usage">
-  <div class="refresh-bar">
-    <button class="refresh-btn" onclick="loadUsage()">↻ Refresh</button>
-    <button class="refresh-btn" onclick="exportUsageData()" style="margin-left: 8px;">📥 Export CSV</button>
+  <div id="usage-node-scope-banner" style="background:var(--bg-secondary,#f1f5f9);border:1px solid var(--border-primary,#e2e8f0);border-left:3px solid #3b82f6;padding:10px 14px;border-radius:4px;margin-bottom:12px;font-size:13px;color:var(--text-secondary,#64748b);">
+    ℹ️ <span data-i18n="usage.local_scope_note">Numbers below are for this computer only.</span> <a id="usage-fleet-note" href="#" onclick="showTab('fleet');return false" style="color:#3b82f6;text-decoration:none;display:none;" data-i18n="usage.fleet_note">See Fleet for all machines.</a>
   </div>
-  
+  <div class="refresh-bar">
+    <button class="refresh-btn" onclick="loadUsage()">↻ <span data-i18n="common.refresh">Refresh</span></button>
+    <button class="refresh-btn" onclick="exportUsageData()" style="margin-left: 8px;">📥 <span data-i18n="usage.export_csv">Export CSV</span></button>
+  </div>
+
   <!-- Cost Warnings -->
   <div id="cost-warnings" style="display:none; margin-bottom: 16px;"></div>
-  
+
   <!-- Main Usage Stats -->
   <div class="grid">
     <div class="card">
-      <div class="card-title"><span class="icon">📊</span> Today</div>
+      <div class="card-title"><span class="icon">📊</span> <span data-i18n="usage.today">Today</span></div>
       <div class="card-value" id="usage-today">--</div>
       <div class="card-sub" id="usage-today-cost"></div>
     </div>
     <div class="card">
-      <div class="card-title"><span class="icon">📅</span> This Week</div>
+      <div class="card-title"><span class="icon">📅</span> <span data-i18n="usage.this_week">This Week</span></div>
       <div class="card-value" id="usage-week">--</div>
       <div class="card-sub" id="usage-week-cost"></div>
     </div>
     <div class="card">
-      <div class="card-title"><span class="icon">📆</span> This Month</div>
+      <div class="card-title"><span class="icon">📆</span> <span data-i18n="usage.this_month">This Month</span></div>
       <div class="card-value" id="usage-month">--</div>
       <div class="card-sub" id="usage-month-cost"></div>
     </div>
     <div class="card" id="trend-card" style="display:none;">
-      <div class="card-title"><span class="icon">📈</span> Trend</div>
+      <div class="card-title"><span class="icon">📈</span> <span data-i18n="usage.trend">Trend</span></div>
       <div class="card-value" id="trend-direction">--</div>
       <div class="card-sub" id="trend-prediction"></div>
     </div>
   </div>
-  <div class="section-title">📊 Token Usage (14 days)</div>
-  <div class="card">
-    <div class="usage-chart" id="usage-chart">Loading...</div>
+  <!-- Efficiency grade + Savings ideas (design spec: .claude/ux_audit/DESIGN_SPEC.md §1b/§5).
+       Filled by app.js renderEfficiencyCard() from /api/efficiency (the daemon-computed
+       `efficiency` snapshot slice on cloud). Hidden until the slice answers; honest
+       collecting/empty states are rendered by JS, never a silent blank. -->
+  <div class="card" id="efficiency-card" style="display:none;margin-bottom:16px;"></div>
+  <!-- QW4: title + card hidden together by app.js when the 14-day series is empty,
+       so an empty chart never renders under populated totals. -->
+  <div class="section-title" id="usage-chart-title">📊 <span data-i18n="usage.token_usage_14d">Token Usage (14 days)</span></div>
+  <div class="card" id="usage-chart-card">
+    <div class="usage-chart" id="usage-chart" data-i18n="app.loading">Loading...</div>
   </div>
-  <div class="section-title">💰 Cost Breakdown <span id="usage-cost-info-icon" class="tooltip-info-icon" style="display:none;">i</span></div>
-  <div class="card"><table class="usage-table" id="usage-cost-table"><tbody><tr><td colspan="3" style="color:#666;">Loading...</td></tr></tbody></table></div>
+  <div class="section-title">💰 <span data-i18n="usage.cost_breakdown">Cost Breakdown</span> <span id="usage-cost-info-icon" class="tooltip-info-icon" style="display:none;">i</span></div>
+  <div class="card"><table class="usage-table" id="usage-cost-table"><tbody><tr><td colspan="3" style="color:#666;" data-i18n="app.loading">Loading...</td></tr></tbody></table></div>
+  <!-- Cost Forecast (#1413) — projected month-end spend. JS: app.js loadCostForecast() -> /api/cost-forecast. Revived from the dead DASHBOARD_HTML block (UI-coverage audit 2026-06-06). -->
+  <div class="section-title" id="cost-forecast-title" style="display:none;">📈 Cost Forecast <span style="font-size:11px;font-weight:400;color:var(--text-muted);margin-left:8px;">projected month-end · based on last 7 days</span></div>
+  <div class="card" id="cost-forecast-card" style="display:none;">
+    <div id="cost-forecast-content" style="min-height:48px;color:var(--text-muted);"></div>
+  </div>
+  <!-- Prompt Cache Analytics (#979) — hit rate / savings per model. JS: app.js loadCachePerf() -> /api/cache-trends. Revived from the dead block. -->
+  <div class="section-title" id="cache-perf-title" style="display:none;">⚡ Prompt Cache <span style="font-size:11px;font-weight:400;color:var(--text-muted);margin-left:8px;">hit rate · savings · per model · 14 days</span></div>
+  <div class="card" id="cache-perf-card" style="display:none;">
+    <div id="cache-perf-content" style="min-height:48px;color:var(--text-muted);"></div>
+  </div>
+  <!-- Cache Risk card (issue #2839) — re-read tax from idle-gap expiries -->
+  <div class="section-title" id="cache-risk-title" style="display:none;">⏱ Cache Re-read Tax <span style="font-size:11px;font-weight:400;color:var(--text-muted);margin-left:8px;">idle-gap expiries · prompt-cache rebuild cost</span></div>
+  <div class="card" id="cache-risk-card" style="display:none;">
+    <div id="cache-risk-content" style="min-height:48px;color:var(--text-muted);"></div>
+  </div>
+  <!-- Compression Potential card (issue #2837) — recoverable tokens from compressible tool output -->
+  <div class="section-title" id="compression-potential-title" style="display:none;">🗜 Compression Potential <span style="font-size:11px;font-weight:400;color:var(--text-muted);margin-left:8px;">compressible tool output · recoverable tokens</span></div>
+  <div class="card" id="compression-potential-card" style="display:none;">
+    <div id="compression-potential-content" style="min-height:48px;color:var(--text-muted);"></div>
+  </div>
   <!-- Issue #68 — top sessions by cost (per-session breakdown) -->
-  <div class="section-title">🏆 Top Sessions by Cost <span style="font-size:11px;font-weight:400;color:var(--text-muted);margin-left:8px;">which session burned the budget · top 20</span></div>
-  <div class="card"><table class="usage-table" id="usage-top-sessions-table"><tbody><tr><td colspan="6" style="color:#666;">Loading...</td></tr></tbody></table></div>
+  <div class="section-title">🏆 <span data-i18n="usage.top_sessions_by_cost">Top Sessions by Cost</span> <span style="font-size:11px;font-weight:400;color:var(--text-muted);margin-left:8px;" data-i18n="usage.top_sessions_hint">which session burned the budget · top 20</span></div>
+  <div class="card"><table class="usage-table" id="usage-top-sessions-table"><tbody><tr><td colspan="6" style="color:#666;" data-i18n="app.loading">Loading...</td></tr></tbody></table></div>
   <div id="usage-anomaly-section" style="display:none;">
-    <div class="section-title">⚠️ Anomaly Alerts <span id="usage-anomaly-badge" style="
+    <div class="section-title">⚠️ <span data-i18n="usage.anomaly_alerts">Anomaly Alerts</span> <span id="usage-anomaly-badge" style="
       font-size:11px;
       font-weight:600;
       padding:2px 8px;
@@ -51,7 +81,7 @@
       "></span></div>
     <div class="card" id="usage-anomaly-list" style="font-size:13px;"></div>
   </div>
-  <div class="section-title">🧩 Cost By Plugin / Skill</div>
+  <div class="section-title">🧩 <span data-i18n="usage.cost_by_plugin_skill">Cost By Plugin / Skill</span></div>
   <div class="card">
     <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap;">
       <canvas id="usage-plugin-pie" width="280" height="280" style="max-width:280px;max-height:280px;"></canvas>
@@ -60,11 +90,11 @@
         min-width:220px;
         font-size:12px;
         color:var(--text-secondary);
-        ">Loading...</div>
+        " data-i18n="app.loading">Loading...</div>
     </div>
   </div>
-  <div class="section-title">💸 Top Sessions by Cost
-    <span style="float:right;font-size:12px;font-weight:400;color:var(--text-muted);">Alert threshold:
+  <div class="section-title">💸 <span data-i18n="usage.top_sessions_by_cost">Top Sessions by Cost</span>
+    <span style="float:right;font-size:12px;font-weight:400;color:var(--text-muted);"><span data-i18n="usage.alert_threshold">Alert threshold:</span>
       $<input id="session-cost-threshold" type="number" min="0" step="0.01" value="0.50" style="
         width:60px;
         padding:2px 6px;
@@ -74,27 +104,27 @@
         color:var(--text-primary);
         font-size:12px;
         " onchange="renderSessionCostChart()">
-      per session</span>
+      <span data-i18n="usage.per_session">per session</span></span>
   </div>
   <div class="card">
     <canvas id="usage-session-cost-bar" height="180" style="width:100%;display:block;margin-bottom:12px;"></canvas>
-    <div id="usage-session-cost-table" style="font-size:12px;color:var(--text-secondary);">Loading...</div>
+    <div id="usage-session-cost-table" style="font-size:12px;color:var(--text-secondary);" data-i18n="app.loading">Loading...</div>
   </div>
   <div id="otel-extra-sections" style="display:none;">
     <div class="grid" style="margin-top:16px;">
       <div class="card">
-        <div class="card-title"><span class="icon">⏱️</span> Avg Run Duration</div>
+        <div class="card-title"><span class="icon">⏱️</span> <span data-i18n="usage.avg_run_duration">Avg Run Duration</span></div>
         <div class="card-value" id="usage-avg-run">--</div>
-        <div class="card-sub">from OTLP openclaw.run.duration_ms</div>
+        <div class="card-sub" data-i18n="usage.from_otlp_run_duration">from OTLP openclaw.run.duration_ms</div>
       </div>
       <div class="card">
-        <div class="card-title"><span class="icon">💬</span> Messages Processed</div>
+        <div class="card-title"><span class="icon">💬</span> <span data-i18n="usage.messages_processed">Messages Processed</span></div>
         <div class="card-value" id="usage-msg-count">--</div>
-        <div class="card-sub">from OTLP openclaw.message.processed</div>
+        <div class="card-sub" data-i18n="usage.from_otlp_message_processed">from OTLP openclaw.message.processed</div>
       </div>
     </div>
-    <div class="section-title">🤖 Model Breakdown</div>
-    <div class="card"><table class="usage-table" id="usage-model-table"><tbody><tr><td colspan="2" style="color:#666;">No model data</td></tr></tbody></table></div>
+    <div class="section-title">🤖 <span data-i18n="usage.model_breakdown">Model Breakdown</span></div>
+    <div class="card"><table class="usage-table" id="usage-model-table"><tbody><tr><td colspan="2" style="color:#666;" data-i18n="app.no_model_data">No model data</td></tr></tbody></table></div>
     <div style="
       margin-top:12px;
       padding:8px 12px;
@@ -103,23 +133,28 @@
       border-radius:8px;
       font-size:12px;
       color:#60ff80;
-      ">📡 Data source: OpenTelemetry OTLP - real-time metrics from OpenClaw</div>
+      ">📡 <span data-i18n="usage.otlp_data_source">Data source: OpenTelemetry OTLP - real-time metrics from OpenClaw</span></div>
   </div>
   <!-- Cost Comparison Panel (GH#554) -->
-  <div class="section-title" id="cost-comparison-section" style="display:flex;align-items:center;">💱 Cost Comparison <span style="font-size:11px;font-weight:400;color:var(--text-muted);margin-left:8px;">what same workload costs elsewhere · 30 days</span></div>
+  <div class="section-title" id="cost-comparison-section" style="display:flex;align-items:center;">💱 <span data-i18n="usage.cost_comparison">Cost Comparison</span> <span style="font-size:11px;font-weight:400;color:var(--text-muted);margin-left:8px;" data-i18n="usage.cost_comparison_hint">what same workload costs elsewhere · 30 days</span></div>
   <div class="card" id="cost-comparison-card" style="display:none;">
-    <div id="cost-comparison-content" style="min-height:60px;color:var(--text-muted);">Loading...</div>
+    <div id="cost-comparison-content" style="min-height:60px;color:var(--text-muted);" data-i18n="app.loading">Loading...</div>
   </div>
-    <div class="section-title">🔮 Trace Clusters <span style="
+  <!-- Spend Optimization Recommendations (issue #1415) -->
+  <div class="section-title" id="spend-optimization-section" style="display:flex;align-items:center;">💡 <span data-i18n="usage.spend_optimization">Spend Optimization</span> <span style="font-size:11px;font-weight:400;color:var(--text-muted);margin-left:8px;" data-i18n="usage.spend_optimization_hint">model downgrade suggestions · 30 days</span></div>
+  <div class="card" id="spend-optimization-card" style="display:none;">
+    <div id="spend-optimization-content" style="min-height:60px;color:var(--text-muted);" data-i18n="app.loading">Loading...</div>
+  </div>
+    <div class="section-title">🔮 <span data-i18n="usage.trace_clusters">Trace Clusters</span> <span style="
       font-size:11px;
       font-weight:400;
       color:var(--text-muted);
       margin-left:8px;
-      ">auto-group sessions by behavior pattern</span></div>
+      " data-i18n="usage.trace_clusters_hint">auto-group sessions by behavior pattern</span></div>
   <div class="card">
-    <div id="trace-clusters-content" style="min-height:60px;color:var(--text-muted);">Loading...</div>
+    <div id="trace-clusters-content" style="min-height:60px;color:var(--text-muted);" data-i18n="app.loading">Loading...</div>
   </div>
-  <div class="section-title" style="display:flex;align-items:center;">📅 Activity Heatmap <span style="font-size:11px;font-weight:400;color:var(--text-muted);margin-left:8px;">hourly usage intensity</span>
+  <div class="section-title" style="display:flex;align-items:center;">📅 <span data-i18n="usage.activity_heatmap">Activity Heatmap</span> <span style="font-size:11px;font-weight:400;color:var(--text-muted);margin-left:8px;" data-i18n="usage.activity_heatmap_hint">hourly usage intensity</span>
     <span style="margin-left:auto;display:flex;gap:6px;">
       <button id="heatmap-btn-7d" class="time-btn active" onclick="loadHeatmap(7)" style="font-size:11px;padding:2px 8px;">7d</button>
       <button id="heatmap-btn-30d" class="time-btn" onclick="loadHeatmap(30)" style="font-size:11px;padding:2px 8px;">30d</button>
@@ -127,16 +162,21 @@
   </div>
   <div class="card">
     <div class="heatmap-wrap">
-      <div id="heatmap-grid" class="heatmap-grid">Loading...</div></div>
+      <div id="heatmap-grid" class="heatmap-grid" data-i18n="app.loading">Loading...</div></div>
     <div id="heatmap-legend" class="heatmap-legend"></div>
   </div>
-  <div class="section-title">🎯 Skill Cost Leaderboard <span style="
+  <div class="section-title">🎯 <span data-i18n="usage.skill_cost_leaderboard">Skill Cost Leaderboard</span> <span style="
     font-size:11px;
     font-weight:400;
     color:var(--text-muted);
     margin-left:8px;
-    ">heuristic attribution — 30s window</span></div>
+    " data-i18n="usage.skill_cost_leaderboard_hint">heuristic attribution, 30s window</span></div>
   <div class="card" id="skill-leaderboard-card">
-    <div id="skill-leaderboard-content" style="min-height:60px;color:var(--text-muted);">Loading...</div>
+    <div id="skill-leaderboard-content" style="min-height:60px;color:var(--text-muted);" data-i18n="app.loading">Loading...</div>
+  </div>
+  <!-- Cost by team/agent (issue #3000) — hidden until data is available -->
+  <div class="section-title" id="usage-by-team-title" style="display:none;">👥 Cost by Team <span style="font-size:11px;font-weight:400;color:var(--text-muted);margin-left:8px;">per-agent attribution · last 7 days</span></div>
+  <div class="card" id="usage-by-team-card" style="display:none;">
+    <div id="usage-by-team-content" style="font-size:13px;color:var(--text-secondary);min-height:40px;"></div>
   </div>
 </div>
