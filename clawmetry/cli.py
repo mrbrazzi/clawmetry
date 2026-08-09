@@ -906,6 +906,20 @@ def _cmd_connect(args) -> None:
     # passed in directly by onboard's Self-Hosted trial path (args.keep_local),
     # which has already asked its own questions and must not be re-prompted.
     _keep_local_signin = bool(getattr(args, "keep_local", False))
+    if _keep_local_signin:
+        # A fresh self-host machine has NO marker yet (the interactive
+        # Case-B path below only runs when one already exists). Write it
+        # BEFORE any config/daemon work: the daemon must never observe a
+        # cm_ key without the marker, or it starts pushing (founder
+        # live-hit 2026-08-09; the end-of-flow touch alone leaves a
+        # window where a respawning daemon sees key-without-marker).
+        try:
+            from pathlib import Path as _P
+
+            _P(NOCLOUD_MARKER_PATH).parent.mkdir(parents=True, exist_ok=True)
+            _P(NOCLOUD_MARKER_PATH).touch(exist_ok=True)
+        except Exception:
+            pass
     if is_cloud_disabled() and not getattr(args, "force", False) and not _keep_local_signin:
         # Two cases here:
         #
