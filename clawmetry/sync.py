@@ -3792,9 +3792,20 @@ def _local_ingest_session_batch(
     # session_file is like '<uuid>.jsonl' — use the uuid as the canonical
     # session_id so the dashboard's per-session views can correlate.
     session_id = subagent_id or session_file.split(".jsonl", 1)[0]
+    # Harvest the session's working directory / git branch as we walk the
+    # batch. Every runtime that writes a transcript stamps these per line
+    # (Claude Code carries `cwd` + `gitBranch` on nearly all of them), but no
+    # session row ever carried them, which is why the sessions list reads as a
+    # wall of UUIDs. Last non-empty wins so an agent that cd's or switches
+    # branch mid-session ends up showing where it IS. One targeted UPDATE
+    # after the loop, not a sparse upsert — see update_session_location().
+    seen_cwd: str | None = None
+    seen_branch: str | None = None
     for obj in batch:
         if not isinstance(obj, dict):
             continue
+        seen_cwd = _session_cwd(obj) or seen_cwd
+        seen_branch = _session_git_branch(obj) or seen_branch
         # Issue #1088 Phase 4: opportunistically project inbound channel
         # messages into the channel_messages table. Best-effort — never
         # blocks the events ingest below on a per-row failure. The channel
@@ -3872,6 +3883,18 @@ def _local_ingest_session_batch(
         })
     if rows:
         store.ingest_many(rows)
+    # Stamp where this session is running. Runs after ingest_many so a session
+    # row created by this same batch is already there to update. Non-fatal and
+    # non-blocking: a session with no location is a cosmetic gap, never a
+    # reason to lose the batch's events.
+    if seen_cwd or seen_branch:
+        try:
+            store.update_session_location(
+                session_id, agent_type=agent_type,
+                cwd=seen_cwd, git_branch=seen_branch,
+            )
+        except Exception as _e:
+            log.debug("session location update skipped (non-fatal): %s", _e)
     # Reconstruct OTel-compatible spans from this batch (issue #1010 / Trace 4).
     # ``agent_type`` rides through so a non-OpenClaw batch on this transcript
     # shape (NemoClaw sandbox sessions, agent_type='nemoclaw') stamps its REAL
@@ -3886,6 +3909,58 @@ def _local_ingest_session_batch(
             store.ingest_spans_batch(_spans)
     except Exception as _e:
         log.debug("span reconstruction skipped (non-fatal): %s", _e)
+
+
+# Where each runtime records the working directory and git branch of a
+# session. Every runtime that writes a transcript records the directory
+# somewhere; the spelling is all that differs, so one alias list covers the
+# OSS adapters AND the gated ones in clawmetry-pro without each having to
+# learn a new contract. Claude Code writes ``cwd`` / ``gitBranch`` on nearly
+# every line; Codex records ``cwd`` in its rollout header; the IDE runtimes
+# tend toward ``workspace``/``project``. Order is priority: the first
+# non-empty alias wins.
+_CWD_ALIASES = (
+    "cwd", "workingDirectory", "working_directory", "working_dir",
+    "workspace", "workspace_path", "workspaceRoot", "project_path",
+    "project_dir", "projectRoot", "directory", "folder",
+)
+_GIT_BRANCH_ALIASES = (
+    "git_branch", "gitBranch", "branch", "vcs_branch", "scm_branch",
+)
+
+
+def _first_alias(row: dict, aliases: tuple) -> str | None:
+    """First non-empty value among ``aliases`` in ``row``, else None.
+
+    Also looks one level into a ``metadata`` / ``extra`` sub-dict, because
+    several adapters tuck environment details there rather than at the top
+    level. Never raises — a malformed row yields None, per the
+    never-crash-on-bad-input rule.
+    """
+    if not isinstance(row, dict):
+        return None
+    nests = [row]
+    for key in ("metadata", "extra", "data", "env"):
+        sub = row.get(key)
+        if isinstance(sub, dict):
+            nests.append(sub)
+    for src in nests:
+        for alias in aliases:
+            val = src.get(alias)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return None
+
+
+def _session_cwd(row: dict) -> str | None:
+    """Working directory a session ran in, or None if the runtime hid it."""
+    return _first_alias(row, _CWD_ALIASES)
+
+
+def _session_git_branch(row: dict) -> str | None:
+    """Git branch a session ran on, or None. A detached HEAD legitimately
+    reports no branch, so None here is not necessarily a parse failure."""
+    return _first_alias(row, _GIT_BRANCH_ALIASES)
 
 
 def _local_ingest_sessions_batch(rows: list, node_id: str) -> None:
@@ -3932,6 +4007,8 @@ def _local_ingest_sessions_batch(rows: list, node_id: str) -> None:
             "cost_usd": cost,
             "message_count": s.get("message_count") or 0,
             "metadata": meta_extras or None,
+            "cwd":        _session_cwd(s),
+            "git_branch": _session_git_branch(s),
         })
     if session_rows:
         store.ingest_sessions_batch(session_rows)
@@ -16787,6 +16864,69 @@ _STUCK_HEARTBEAT_MAX_MSG = 200
 # How many newest events to inspect per candidate session. 120 comfortably
 # covers a streak well past the threshold plus the preceding progress marker.
 _STUCK_EVENT_WINDOW = 120
+# ── "needs you" attention detector (control-plane P2) ─────────────────────
+#
+# STUCK answers "is the agent spinning". This answers the DIFFERENT question
+# "is the agent BLOCKED ON ME" — the one that actually costs someone their
+# afternoon, because a spinning agent burns money while a blocked one burns
+# nothing and simply never finishes.
+#
+# Transcript inference, not ground truth. A permission dialog is a UI state
+# the runtime never writes down; what it DOES leave behind is a tool
+# invocation with no result and no subsequent activity. That shape is also
+# what a legitimately slow tool looks like for its first few seconds, so the
+# dwell threshold below is what separates them. Every row this produces is
+# stamped ``signal="inferred"`` and callers must surface it as such — a hook
+# feed (which reports the dialog directly) will stamp ``signal="hook"`` and
+# outrank it. Never present an inference as a certainty.
+#
+# Tuning: 45s is well past any interactive tool's normal round trip (a Bash
+# call, a file read, a web fetch) and well under a human's reaction time to
+# a prompt they have noticed, so a row that trips this is overwhelmingly a
+# dialog nobody has answered.
+ATTENTION_PENDING_SECONDS = int(
+    os.environ.get("CLAWMETRY_ATTENTION_PENDING_SECONDS", "45"))
+# Beyond this a session stops being "needs you now" and is just abandoned;
+# flagging day-old sessions forever would train people to ignore the list.
+ATTENTION_RECENT_MINUTES = int(
+    os.environ.get("CLAWMETRY_ATTENTION_RECENT_MINUTES", "180"))
+# Newest events to inspect per candidate. We only need to find the newest
+# tool call and confirm nothing followed it, so this is far smaller than the
+# stuck window.
+_ATTENTION_EVENT_WINDOW = 40
+# Latest attention result, computed ONCE per daemon tick and served from here.
+# Running the detector per HTTP request would mean up to 300 proxied event
+# queries on every page load — the exact request storm the performance rule
+# forbids. Same contract as _LATEST_STUCK: ``ts`` is when it last refreshed,
+# and an EMPTY ``items`` with a FRESH ts means "checked, nobody is waiting",
+# which is how the UI self-clears. A stale ts means "no signal", never
+# "nobody waiting" — the difference matters, because silently reporting
+# "all clear" from a wedged detector is worse than reporting nothing.
+_LATEST_ATTENTION: dict = {"ts": 0.0, "items": []}
+# Readers treat a cache older than this as no-signal rather than all-clear.
+_ATTENTION_FRESH_SECONDS = 300
+# How long a hook-stamped "waiting" row may stand without being cleared.
+# Generous, because a human genuinely can leave a prompt open for hours --
+# but bounded, because a hook process that died mid-prompt must not pin the
+# badge forever. Two hours is well past a lunch break, well short of a day.
+ATTENTION_HOOK_MAX_AGE_SECONDS = int(
+    os.environ.get("CLAWMETRY_ATTENTION_HOOK_MAX_AGE", "7200"))
+# Event types that RESOLVE a pending tool call — seeing one means the tool
+# came back and the agent is not blocked on a human.
+_ATTENTION_TOOL_RESULT_TYPES = frozenset({
+    "tool_result", "tool.result", "toolresult", "tool_output", "tool.output",
+})
+# Unambiguous progress — a human spoke, or the session finished. Assistant
+# envelopes are deliberately NOT here: on Claude Code and OpenClaw v3 a tool
+# call arrives INSIDE an ``assistant`` / ``model.completed`` turn, so treating
+# those as progress would blind the detector to the exact shape it exists to
+# find. They are classified by content instead (text = a reply = progress;
+# tool-only = the pending call), mirroring the stuck detector.
+_ATTENTION_PROGRESS_TYPES = frozenset({
+    "user", "prompt.submitted",
+    "session.ended", "session.end", "session.completed", "session.stopped",
+})
+
 # ── n-gram circular-loop detector constants ───────────────────────────────
 NGRAM_MIN_TOOL_CALLS = int(os.environ.get("CLAWMETRY_NGRAM_MIN_TOOLS", "6"))
 NGRAM_MIN_REPEATS    = int(os.environ.get("CLAWMETRY_NGRAM_MIN_REPEATS", "3"))
@@ -16903,6 +17043,158 @@ def _stuck_assistant_has_text(data: Any) -> bool:
     if isinstance(at, list) and any(isinstance(t, str) and t.strip() for t in at):
         return True
     return False
+
+
+def _attention_event_type(ev: dict) -> str:
+    """Lowercased event type of a store row, '' when absent."""
+    if not isinstance(ev, dict):
+        return ""
+    return str(ev.get("event_type") or ev.get("type") or "").strip().lower()
+
+
+def _detect_attention_sessions(store) -> list[dict]:
+    """Sessions that appear to be BLOCKED ON A HUMAN right now.
+
+    Distinct from :func:`_detect_stuck_sessions`, which finds agents spinning
+    through tool calls without progress. This finds the opposite failure: an
+    agent that has stopped dead waiting for someone to answer a permission
+    prompt. A spinning agent burns money; a blocked one burns nothing and
+    silently never finishes, which is why it goes unnoticed for hours.
+
+    The shape we match, walking each candidate's events newest-first:
+      * the newest meaningful event is a TOOL CALL,
+      * no tool result and no assistant/user turn came after it,
+      * and it has been pending longer than ``ATTENTION_PENDING_SECONDS``.
+
+    Returns ``[{session_id, runtime, state, waiting_seconds, tool, signal,
+    cwd, git_branch, title}]``, longest-waiting first. ``signal`` is always
+    ``"inferred"`` here — this reads a transcript, it does not observe the
+    dialog. Callers MUST render that distinction rather than implying we
+    know. Read-only and never raises: any store error logs and yields ``[]``
+    so the daemon loop survives a detection bug.
+    """
+    try:
+        sessions = store.query_sessions_table(limit=300) or []
+    except Exception as e:  # noqa: BLE001
+        log.warning("attention-detect: query_sessions_table failed: %s", e)
+        return []
+
+    out: list[dict] = []
+    for s in sessions:
+        if not isinstance(s, dict):
+            continue
+        # A finished agent is not waiting on anybody.
+        if s.get("ended_at"):
+            continue
+        if str(s.get("status") or "").lower() in (
+            "ended", "completed", "stopped", "failed",
+        ):
+            continue
+        sid = s.get("session_id") or ""
+        if not sid:
+            continue
+        # Rows are ordered most-recently-active first, so the first row past
+        # the window ends the scan rather than just skipping.
+        last_active = s.get("last_active_at") or s.get("started_at")
+        idle_s = _seconds_since(last_active)
+        if last_active and idle_s > ATTENTION_RECENT_MINUTES * 60:
+            break
+        # Cheap pre-filter: a session touched seconds ago cannot have been
+        # blocked long enough to qualify, and skipping it avoids the per-
+        # session event query entirely. At ~300 candidates a tick this is the
+        # difference between a free check and a real query cost.
+        if idle_s < ATTENTION_PENDING_SECONDS:
+            continue
+
+        try:
+            events = store.query_events(
+                session_id=sid, limit=_ATTENTION_EVENT_WINDOW,
+            ) or []
+        except Exception as e:  # noqa: BLE001
+            log.warning("attention-detect: query_events failed for %s: %s",
+                        sid, e)
+            continue
+
+        pending_tool: dict | None = None
+        for ev in events:  # newest-first
+            if not isinstance(ev, dict):
+                continue
+            et = _attention_event_type(ev)
+            if not et:
+                continue
+            data = ev.get("data")
+            # The tool came back — the agent is working, not blocked.
+            if et in _ATTENTION_TOOL_RESULT_TYPES:
+                break
+            role = _stuck_event_role(data)
+            # A human spoke, or the session ended.
+            if et in _ATTENTION_PROGRESS_TYPES or role == "user":
+                break
+            if et in _STUCK_ASSISTANT_EVENT_TYPES or role == "assistant":
+                # An assistant turn carrying TEXT is a reply: the agent got
+                # far enough to say something, so it is not sitting on an
+                # unanswered prompt.
+                if _stuck_assistant_has_text(data):
+                    break
+                # Tool-only assistant turn — this IS the pending call. On
+                # Claude Code this is the ONLY shape a pending tool takes,
+                # which is why classifying by envelope type alone missed it.
+                if _stuck_tool_call_count(et, data) > 0:
+                    pending_tool = ev
+                    break
+                continue
+            if _stuck_tool_call_count(et, data) > 0:
+                pending_tool = ev
+                break
+        if pending_tool is None:
+            continue
+
+        waiting = _seconds_since(pending_tool.get("ts"))
+        if waiting < ATTENTION_PENDING_SECONDS:
+            continue
+        out.append({
+            "session_id":      sid,
+            "runtime":         s.get("agent_type") or "",
+            "state":           "waiting_approval",
+            "waiting_seconds": waiting,
+            "tool":            _attention_tool_name(pending_tool),
+            # Inference, not observation. A hook feed will stamp "hook".
+            "signal":          "inferred",
+            "title":           s.get("title") or "",
+            "cwd":             s.get("cwd") or "",
+            "git_branch":      s.get("git_branch") or "",
+        })
+
+    out.sort(key=lambda r: r.get("waiting_seconds") or 0, reverse=True)
+    return out
+
+
+def _attention_tool_name(ev: dict) -> str:
+    """Best-effort name of the tool a session is blocked on ('' if unknown).
+
+    Knowing it is `Bash` versus `Read` is most of what someone needs to
+    decide whether to walk over and approve it, so it is worth digging for.
+    """
+    try:
+        from clawmetry.local_store import _iter_tool_invocation_names
+        names = list(_iter_tool_invocation_names(
+            _attention_event_type(ev), ev.get("data")))
+        if names:
+            return str(names[0])[:80]
+    except Exception:
+        pass
+    data = ev.get("data")
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except Exception:
+            return ""
+    if isinstance(data, dict):
+        for key in ("tool", "tool_name", "toolName", "name"):
+            val = data.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()[:80]
+    return ""
 
 
 def _detect_stuck_sessions(store) -> list[dict]:
@@ -17196,6 +17488,114 @@ def _detect_ngram_loop_sessions(store) -> list[dict]:
     return out
 
 
+def _pending_approval_attention(store) -> list[dict]:
+    """Sessions with a PENDING row in the approvals queue.
+
+    A pending approval is not an inference: a human has been asked and has
+    not answered. It is ground truth for every runtime the approvals engine
+    covers — including ones with no hook of their own — so these are stamped
+    ``signal="hook"`` alongside the runtimes that report directly.
+
+    Read-only and never raises; an unreachable approvals table just means
+    this source contributes nothing that tick.
+    """
+    try:
+        rows = store.query_approvals(status="pending", limit=200) or []
+    except Exception as e:  # noqa: BLE001
+        log.debug("attention: pending-approval read failed: %s", e)
+        return []
+
+    out: list[dict] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        sid = str(r.get("requestor_session_id") or "").strip()
+        if not sid:
+            continue
+        # Ids are stored namespaced (`claude_code:<uuid>`); the prefix is the
+        # runtime, and a bare id means OpenClaw.
+        runtime = sid.split(":", 1)[0] if ":" in sid else "openclaw"
+        out.append({
+            "session_id": sid,
+            "runtime": runtime,
+            "state": "waiting_approval",
+            # NOT "hook". Confidence is the same (a human really has been
+            # asked), but PROVENANCE differs and provenance decides who
+            # clears the row. A 'hook' row is owned by the hook receiver and
+            # is deliberately immune to the daemon's replace; a 'queue' row
+            # is derived by the daemon each tick and must vanish the moment
+            # the approval leaves pending — otherwise the badge would outlive
+            # the decision by up to two hours. The UI renders both as
+            # confirmed.
+            "signal": "queue",
+            "tool": str(r.get("action") or "")[:80],
+            "waiting_seconds": _seconds_since(r.get("created_at")),
+            "title": "", "cwd": "", "git_branch": "",
+        })
+    return out
+
+
+def _refresh_attention_cache(store) -> int:
+    """Recompute the "needs you" list and publish it to ``_LATEST_ATTENTION``.
+
+    Refreshes ``ts`` on every successful run INCLUDING the empty case, so a
+    UI showing "2 sessions need you" clears itself the moment they stop
+    waiting. On a detector ERROR we deliberately leave the previous value in
+    place and let the freshness gate age it out — clearing on a transient
+    error would hide a real, still-blocked session mid-incident. Returns the
+    number of waiting sessions found.
+    """
+    items = _detect_attention_sessions(store)
+    # Fold in the approvals queue. A pending approval is a human who HAS been
+    # asked and has not answered — ground truth, and it covers every runtime
+    # the approvals engine reaches, including ones with no hook of their own.
+    # Merged by session id with the approval winning, because "we know" beats
+    # "we guessed" and the same session can legitimately appear in both.
+    try:
+        by_id = {i["session_id"]: i for i in items}
+        for row in _pending_approval_attention(store):
+            by_id[row["session_id"]] = row
+        items = sorted(by_id.values(),
+                       key=lambda r: (r.get("signal") == "inferred",
+                                      -(r.get("waiting_seconds") or 0)))
+    except Exception as _me:  # noqa: BLE001
+        log.debug("attention: approval merge failed (continuing): %s", _me)
+    _LATEST_ATTENTION["items"] = items
+    _LATEST_ATTENTION["ts"] = time.time()
+    # Persist onto the session rows so every reader — the dashboard, the
+    # cloud snapshot, anything else — sees it through DuckDB rather than
+    # needing a live handle on this in-process cache. Best-effort: a failed
+    # write leaves the in-memory cache serving the daemon's own consumers.
+    try:
+        store.apply_session_attention(items)
+        # Hook rows are deliberately exempt from the replace above, so this
+        # is the only thing that reclaims one whose hook process died between
+        # "prompt opened" and "prompt answered". A permanently-wrong badge is
+        # exactly what teaches people to ignore the list.
+        store.expire_stale_hook_attention(ATTENTION_HOOK_MAX_AGE_SECONDS)
+    except Exception as _pe:  # noqa: BLE001
+        log.debug("attention-detect: persist failed (continuing): %s", _pe)
+    return len(items)
+
+
+def attention_snapshot() -> dict:
+    """The current "needs you" list, for the dashboard and the snapshot.
+
+    Returns ``{"items": [...], "fresh": bool, "age_seconds": int}``.
+    ``fresh`` False means the daemon has not refreshed recently, so callers
+    must render "no signal" rather than "nobody is waiting" — an empty list
+    from a wedged detector must never read as all-clear.
+    """
+    ts = float(_LATEST_ATTENTION.get("ts") or 0.0)
+    age = int(max(0.0, time.time() - ts)) if ts else -1
+    fresh = bool(ts) and age <= _ATTENTION_FRESH_SECONDS
+    return {
+        "items": list(_LATEST_ATTENTION.get("items") or []) if fresh else [],
+        "fresh": fresh,
+        "age_seconds": age,
+    }
+
+
 def _emit_stuck_signals(store, state: dict) -> int:
     """Run stuck detection and emit each as a loop_signals row so the EXISTING
     device-alert path (``_build_device_summary`` → ``query_recent_loop_signals``)
@@ -17236,6 +17636,15 @@ def _emit_stuck_signals(store, state: dict) -> int:
         _LATEST_STUCK["ts"] = time.time()
     except Exception as _ce:  # noqa: BLE001
         log.debug("stuck-detect: cache refresh failed (continuing): %s", _ce)
+
+    # Refresh the "needs you" cache on the same tick. Deliberately separate
+    # from the stuck cache above: a session can be stuck, waiting, both, or
+    # neither, and collapsing them would lose the distinction that makes the
+    # attention list actionable. Never lets a detector bug take down the loop.
+    try:
+        _refresh_attention_cache(store)
+    except Exception as _ae:  # noqa: BLE001
+        log.debug("attention-detect: cache refresh failed (continuing): %s", _ae)
 
     memo = state.setdefault("stuck_emit_memo", {})
     if not isinstance(memo, dict):
@@ -18738,6 +19147,41 @@ def sync_system_snapshot(config: dict, state: dict, paths: dict) -> int:
     elif nemo.get("detected"):
         payload.setdefault("sandbox", {})
         payload["sandbox"]["runtime"] = "nemoclaw"
+
+    # "Needs you" list, for the cloud dashboard's Overview strip.
+    #
+    # Rides the E2E-ENCRYPTED snapshot, never the plaintext heartbeat that
+    # `stuck` uses: these rows carry project paths, branch names and tool
+    # names. That is user data, and it does not leave the machine in the
+    # clear. The cloud stores an opaque blob and decrypts it in the browser.
+    #
+    # `fresh` rides along so the cloud can distinguish "nobody is waiting"
+    # from "this node has gone quiet" — the same three-state contract the
+    # local strip renders. Best-effort: the snapshot must still ship if the
+    # attention pass has never run.
+    try:
+        _att = attention_snapshot()
+        payload["attention"] = {
+            "fresh": bool(_att.get("fresh")),
+            "items": [
+                {
+                    "session_id": it.get("session_id") or "",
+                    "runtime":    it.get("runtime") or "",
+                    "state":      it.get("state") or "",
+                    "signal":     it.get("signal") or "inferred",
+                    "tool":       it.get("tool") or "",
+                    "waiting_seconds": int(it.get("waiting_seconds") or 0),
+                    "title":      (it.get("title") or "")[:120],
+                    "cwd":        it.get("cwd") or "",
+                    "git_branch": it.get("git_branch") or "",
+                }
+                # Capped: the strip only ever renders a handful, and the
+                # snapshot is already a multi-hundred-KB blob.
+                for it in (_att.get("items") or [])[:20]
+            ],
+        }
+    except Exception as _att_e:  # noqa: BLE001
+        log.debug("attention snapshot slice failed (continuing): %s", _att_e)
 
     log.info(
         f"System snapshot: {len(subagents_list)} subagents ({active_count} active)"

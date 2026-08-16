@@ -1915,6 +1915,12 @@ function switchTab(name) {
   if (name === 'inventory') { if (typeof renderInventory === 'function') renderInventory(); }
   if (name === 'overview') loadAll();
   if (name === 'overview') { if (typeof _velocityPollTimer !== 'undefined' && _velocityPollTimer) clearInterval(_velocityPollTimer); if (typeof loadTokenVelocity === 'function') _velocityPollTimer = visibilitySetInterval(function() { if (!_cmIsOverviewTab()) return; loadTokenVelocity(); }, 30000); }
+  // Needs-you strip. loadAll() only runs on tab switch, so without this the
+  // strip would go stale while you sit on Overview — and an agent that starts
+  // waiting while you are looking at the page is exactly the case this
+  // feature exists for. One cheap scoped read, on the same 30s cadence and
+  // the same tab + visibility gates as the velocity poller above.
+  if (name === 'overview') { if (typeof _needsYouTimer !== 'undefined' && _needsYouTimer) clearInterval(_needsYouTimer); if (typeof loadNeedsYou === 'function') _needsYouTimer = visibilitySetInterval(function() { if (!_cmIsOverviewTab()) return; loadNeedsYou(); }, 30000); }
   if (name === 'usage') loadUsage();
   // Agent Graph (#3315): the original wiring landed in the DEAD first
   // DASHBOARD_HTML's inline switchTab in dashboard.py, so the loader never
@@ -2105,6 +2111,226 @@ function _friendlyBytes(n) {
 // UI-coverage audit: today's activity counters strip. Reads /api/activity-today
 // (local: cached DuckDB rollup; cloud: cm-cloud-activity serves it from the
 // snapshot's activityToday slice). Hidden until there is any activity today.
+// ── Needs-you strip ────────────────────────────────────────────────────────
+// "Is anything waiting on me right now?" -- the question people actually open
+// the dashboard with, answered above every chart.
+//
+// THREE states, and telling them apart is the whole point:
+//   waiting  -> one row per blocked agent, with its confidence
+//   quiet    -> "Nothing needs you right now" + how many are working
+//   unknown  -> "Can't tell right now" when the daemon has gone silent
+//
+// The third is why this is not a one-liner. An empty list from a wedged
+// detector must never render as all-clear: a calm reassurance that turns out
+// to be wrong is how you teach someone to stop trusting the whole dashboard.
+
+// Is this signal a CONFIRMED one? 'hook' means the runtime told us directly;
+// 'queue' means a real approval is sitting unanswered in our own queue. Both
+// are things we know rather than deduce, so both read as confirmed. Only
+// 'inferred' is a guess. Kept in one place so a new source cannot end up
+// rendering as certain on one surface and hedged on another.
+function _cmAttnConfirmed(signal) {
+  return signal === 'hook' || signal === 'queue';
+}
+
+function cmNeedsAge(sec) {
+  sec = Math.max(0, parseInt(sec, 10) || 0);
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.floor(sec / 60) + 'm';
+  return Math.floor(sec / 3600) + 'h';
+}
+
+// Plain-language line per row. "Wants to run Bash" beats "pending tool_use
+// approval" for someone who has never opened an observability tool.
+function cmNeedsPhrase(item) {
+  var esc = (typeof escapeHtml === 'function') ? escapeHtml : function (s) { return s; };
+  // Reuse the switcher's label map — one definition of "what this runtime is
+  // called", so the strip can never disagree with the header.
+  var runtime = esc((typeof _cmRuntimeLabel === 'function')
+    ? _cmRuntimeLabel(item.runtime) : (item.runtime || 'Agent'));
+  var tool = item.tool ? esc(item.tool) : '';
+  if (_cmAttnConfirmed(item.signal)) {
+    return tool
+      ? '<b>' + runtime + '</b> is asking to run ' + tool
+      : '<b>' + runtime + '</b> is asking for permission';
+  }
+  return tool
+    ? '<b>' + runtime + '</b> has been on ' + tool + ' with no reply'
+    : '<b>' + runtime + '</b> has been silent mid-task';
+}
+
+// Last rendered signature. The strip is an aria-live region, so rewriting it
+// with identical content would make a screen reader re-announce "nothing
+// needs you" every poll. Only paint when something actually changed.
+var _cmNeedsSig = null;
+//: Handle for the Overview poller, cleared and re-armed on each tab switch so
+//: two visits cannot leave two intervals running.
+var _needsYouTimer = null;
+
+function cmRenderNeedsYou(d) {
+  var box = document.getElementById('needs-you');
+  if (!box) return;
+  var sig = JSON.stringify([
+    d && d.fresh, (d && d.working) || 0,
+    ((d && d.items) || []).map(function (i) {
+      // Wait time is excluded on purpose: a ticking counter would make every
+      // poll a change and defeat the guard. The row's identity is what it is
+      // waiting on, not how long it has waited.
+      return [i.session_id, i.signal, i.tool].join('|');
+    }),
+    (d && d.runtimes_without_approval) || [],
+  ]);
+  if (sig === _cmNeedsSig) return;
+  _cmNeedsSig = sig;
+  var esc = (typeof escapeHtml === 'function') ? escapeHtml : function (s) { return s; };
+  box.classList.remove('is-waiting', 'is-unknown');
+
+  // 1. We could not check. Say that -- do not imply all-clear.
+  if (!d || d.fresh === false) {
+    box.classList.add('is-unknown');
+    // On the hosted dashboard the reason is different and the user can do
+    // nothing about it: the cloud has no DuckDB, so this is computed on the
+    // machine the agent runs on and reaches here through the snapshot.
+    // Blaming their machine for our missing plumbing would be a lie.
+    var sub = window.CLOUD_MODE
+      ? t('needs.cloud_sub', null,
+          'This is worked out on the machine your agent runs on, and is not in the hosted view yet.')
+      : t('needs.unknown_sub', null,
+          'ClawMetry has not heard from your machine recently, so it cannot say what needs you.');
+    box.innerHTML =
+      '<div class="cm-needs-head">' +
+        '<span class="cm-needs-title">' +
+          t('needs.unknown_title', null, "Can't tell right now") + '</span>' +
+        '<span class="cm-needs-sub">' + sub + '</span>' +
+      '</div>';
+    box.style.display = '';
+    return;
+  }
+
+  var items = d.items || [];
+
+  // 2. Nothing waiting. The reassuring case, and the one people see most.
+  if (!items.length) {
+    var working = parseInt(d.working, 10) || 0;
+    var sub = working === 1
+      ? t('needs.one_working', null, '1 agent working')
+      : (working > 0
+          ? t('needs.n_working', { n: working }, working + ' agents working')
+          : t('needs.none_running', null, 'No agents running'));
+    // Some runtimes have no permission prompt at all (Pi's trust machinery
+    // guards loading config, not running tools). Filtered to one of those,
+    // "nothing needs you" would imply we looked and found nothing — so say
+    // what is actually true instead.
+    var noAsk = d.runtimes_without_approval || [];
+    var rtNow = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+    if (noAsk.length && rtNow && rtNow !== 'all' && noAsk.indexOf(rtNow) !== -1) {
+      var rtName = (typeof _cmRuntimeLabel === 'function')
+        ? _cmRuntimeLabel(rtNow) : rtNow;
+      sub = t('needs.never_asks', { runtime: rtName },
+              rtName + " never asks for permission, so nothing here waits on you.");
+    }
+    box.innerHTML =
+      '<div class="cm-needs-head">' +
+        '<span class="cm-needs-title">' +
+          t('needs.clear_title', null, 'Nothing needs you right now') + '</span>' +
+        '<span class="cm-needs-sub">' + esc(sub) + '</span>' +
+      '</div>';
+    box.style.display = '';
+    return;
+  }
+
+  // 3. Something is waiting.
+  box.classList.add('is-waiting');
+  var title = items.length === 1
+    ? t('needs.one_waiting', null, '1 agent needs you')
+    : t('needs.n_waiting', { n: items.length }, items.length + ' agents need you');
+
+  var rows = items.slice(0, 6).map(function (it) {
+    var hook = _cmAttnConfirmed(it.signal);
+    var where = [it.project, it.git_branch].filter(Boolean).join(' · ');
+    var confidence = hook
+      ? t('needs.confident', null, 'Waiting for you')
+      : t('needs.inferred', null, "Looks like it's waiting");
+    return '' +
+      '<button type="button" class="cm-needs-row" ' +
+        'onclick="cmOpenNeedsSession(' + JSON.stringify(it.session_id || '').replace(/"/g, '&quot;') + ')" ' +
+        'title="' + esc(confidence) + '">' +
+        '<span class="cm-needs-dot ' + (hook ? 'is-hook' : 'is-inferred') + '" aria-hidden="true"></span>' +
+        '<span class="cm-needs-what">' + cmNeedsPhrase(it) + '</span>' +
+        '<span class="cm-needs-where">' + esc(where) + '</span>' +
+        '<span class="cm-needs-age">' + cmNeedsAge(it.waiting_seconds) + '</span>' +
+      '</button>';
+  }).join('');
+
+  // Only claim certainty where we have it. If every row is a guess, say so
+  // once at the bottom rather than hedging on each line.
+  var allInferred = items.every(function (i) { return !_cmAttnConfirmed(i.signal); });
+  var note = allInferred
+    ? '<div class="cm-needs-note">' +
+        t('needs.inferred_note', null,
+          "Worked out from what each agent last did, so this is a best guess.") +
+      '</div>'
+    : '';
+
+  var extra = items.length > 6
+    ? '<div class="cm-needs-note">' +
+        t('needs.more', { n: items.length - 6 }, '+' + (items.length - 6) + ' more') +
+      '</div>'
+    : '';
+
+  box.innerHTML =
+    '<div class="cm-needs-head">' +
+      '<span class="cm-needs-title">' + esc(title) + '</span>' +
+    '</div>' +
+    '<div class="cm-needs-list">' + rows + '</div>' + extra + note;
+  box.style.display = '';
+}
+
+// Jump to the blocked session's transcript. Falls back to the Sessions page
+// when the deep link is unavailable, so the row is never a dead end.
+function cmOpenNeedsSession(sid) {
+  if (!sid) return;
+  try {
+    if (typeof showTranscript === 'function') { showTranscript(sid); return; }
+    if (typeof switchPage === 'function') { switchPage('transcripts'); return; }
+  } catch (e) { console.warn('needs-you open failed', e); }
+}
+
+// Session-row badge. Same two confidences as the strip, same wording, so a
+// user only has to learn the distinction once. Returns '' when nothing is
+// waiting — an absent badge is the quiet default, not a "no" badge.
+function _cmAttentionBadge(state, signal, tool) {
+  if (!state) return '';
+  var esc = (typeof escapeHtml === 'function') ? escapeHtml : function (s) { return s; };
+  var hook = _cmAttnConfirmed(signal);
+  var label = hook
+    ? t('needs.badge_waiting', null, 'Waiting for you')
+    : t('needs.badge_maybe', null, 'Maybe waiting');
+  var why = hook
+    ? (tool ? 'This agent is asking to run ' + tool + '.'
+            : 'This agent is asking for permission.')
+    : (tool ? 'Best guess: ' + tool + ' was started and never came back.'
+            : 'Best guess: this agent went quiet mid-task.');
+  return '<span class="cm-attn-badge" title="' + esc(why) + '">' +
+           '<span class="cm-needs-dot ' + (hook ? 'is-hook' : 'is-inferred') +
+             '" aria-hidden="true"></span>' + esc(label) +
+         '</span>';
+}
+
+async function loadNeedsYou() {
+  var box = document.getElementById('needs-you');
+  if (!box) return;
+  var rt = (typeof _cmRuntimeFilter === 'function') ? _cmRuntimeFilter() : 'all';
+  var q = (rt && rt !== 'all') ? ('?runtime=' + encodeURIComponent(rt)) : '';
+  var d = null;
+  try {
+    d = await fetchJsonWithTimeout('/api/attention' + q, 4000);
+  } catch (e) {
+    d = null;   // renders "can't tell", which is the truth here
+  }
+  cmRenderNeedsYou(d);
+}
+
 async function loadActivityToday() {
   var strip = document.getElementById('activity-today-strip');
   if (!strip) return;
@@ -4202,6 +4428,9 @@ async function loadAll() {
     if (typeof loadOutcomeTile === 'function') setTimeout(function(){ loadOutcomeTile().catch(function(e){console.warn('outcome tile failed',e)}); }, 800);
     // UI-coverage audit — today's activity counters strip.
     if (typeof loadActivityToday === 'function') setTimeout(function(){ loadActivityToday().catch(function(e){console.warn('activity today failed',e)}); }, 900);
+    // Needs-you strip. First on the page, so it loads first — this is the
+    // question people open the dashboard with.
+    if (typeof loadNeedsYou === 'function') loadNeedsYou().catch(function(e){console.warn('needs-you failed',e)});
     document.getElementById('refresh-time').textContent = t("app.updated", null, "Updated ") + new Date().toLocaleTimeString();
 
     if (overview.infra) {
@@ -17927,6 +18156,11 @@ async function loadTranscripts() {
         html += '<button type="button" onclick="event.stopPropagation();scoreTranscript(\'' + escHtml(raw) + '\')" style="background:var(--button-bg);color:var(--text-secondary);border:1px solid var(--border-primary);border-radius:6px;padding:3px 10px;font-size:11px;font-weight:600;cursor:pointer;">' + t('transcripts.score_btn', null, 'Score') + '</button>';
         html += '</span>';
       }
+      // "Needs you" badge — same vocabulary as the Overview strip, so the two
+      // surfaces teach each other. Renders nothing when nothing is waiting;
+      // an absent badge is the quiet default, not a "no" badge.
+      html += _cmAttentionBadge(
+        tx.attention, tx.attention_signal, tx.attention_tool);
       html += '<span style="color:#444;font-size:18px;margin-left:8px;">▸</span>';
       html += '</div>';
     });
