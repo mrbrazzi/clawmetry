@@ -26,10 +26,10 @@ The north star: **don't stop at "code compiles." Stop at "verified working in pr
 > - **Before adding any poller/fetch, ask:** does this need to run on *every* tab? every *N* seconds? can it reuse an existing fetch or the snapshot?
 > - **Measure before shipping:** open the Network panel / Resource Timing and confirm no endpoint is fetched N× per cycle and no background poller fires off its own screen. "It works" is not enough — "it works without a request storm" is the bar.
 
-> ## Multi-runtime: ClawMetry observes 12 agent runtimes, not just OpenClaw (non-negotiable)
-> **ClawMetry is runtime-neutral. It observes 12 AI agent runtimes, not OpenClaw alone.** Free on every plan: **OpenClaw, NVIDIA NemoClaw**. Also supported: **Aider, Claude Code, Codex, Cursor, Goose, Hermes, NanoClaw, opencode, PicoClaw, Qwen Code**. The enabled set is live at `GET /api/runtimes` (authed); read it, never hardcode a stale copy.
+> ## Multi-runtime: ClawMetry observes 22 agent runtimes, not just OpenClaw (non-negotiable)
+> **ClawMetry is runtime-neutral. It observes 22 AI agent runtimes, not OpenClaw alone.** Free on every plan: **OpenClaw, NVIDIA NemoClaw**. Also supported: **Aider, Antigravity, Claude Code, Codex, Cursor, Deep Agents, DeepSeek Harness, Exo, GitHub Copilot, Goose, Grok, Hermes, n8n, NanoClaw, opencode, Pi, PicoClaw, QM, Qwen Code**. The enabled set is live at `GET /api/runtimes` (authed); read it, never hardcode a stale copy. The *count* in prose is derived from `FREE_RUNTIMES | PAID_RUNTIMES` and enforced by `scripts/sync_runtime_count.py` (see section 2a).
 > - **User-facing copy and UI must never imply OpenClaw-only.** Framing like "designed for OpenClaw agents", "your OpenClaw machine", "No OpenClaw detected", or "Looking for OpenClaw activity" is a bug. Use runtime-neutral language ("your AI agent", "the machine your agent runs on") or name the runtimes ("OpenClaw, NVIDIA NemoClaw + 10 more runtimes", matching the homepage install card). Naming runtimes is public; pricing and tier internals stay private.
-> - **Verify across all 12 runtimes, end to end.** Never ship a change verified only on OpenClaw. Use a `/workflow` to fan out a per-runtime E2E check: one agent per runtime that installs or configures it, runs a real turn, and asserts it lands correctly (in Brain by agent_type, in the right tab, with cost and tokens). "Works on OpenClaw" is not "works".
+> - **Verify across all 22 runtimes, end to end.** Never ship a change verified only on OpenClaw. Use a `/workflow` to fan out a per-runtime E2E check: one agent per runtime that installs or configures it, runs a real turn, and asserts it lands correctly (in Brain by agent_type, in the right tab, with cost and tokens). "Works on OpenClaw" is not "works".
 > Burned 2026-06-01: the docs FAQ said "ClawMetry is designed for OpenClaw agents" and the cloud empty-states plus the radar assumed OpenClaw-only. Many surfaces still need this sweep; when you touch a screen, fix its runtime framing.
 
 ---
@@ -53,9 +53,19 @@ A trial user converts to paying ONLY if the hosted dashboard is flawless during 
 5. **Verify before you assert (RULE #1, strict).** Never state a number, a config state ("the secret is set"), or "it works" without reading the actual artifact / run log / decrypted data. An unverified claim that turns out false is a bug shipped straight to the user's trust. (Burned 2026-06-06: claimed "CI secrets unset / turns skipped" - they were set and turns ran; and "0.12.453 has the banner" - it did not.)
 6. **Walk the trial path before you ship.** For any user-facing change: open the HOSTED dashboard as a trial user, switch runtimes, click the tab, and confirm zero blank/wrong/error states and a clean browser console. If you cannot walk it, you are not done.
 
+## 0b. Desktop installers are a high-priority ROI lever (HARD BAR)
+
+Founder call 2026-08-08: the desktop app (`desktop/`) is one of the highest-ROI things in this repo — one download that observes every AI-CLI runtime on a machine (Claude Code, Codex, Cursor, OpenClaw, Hermes, …), no curl, no terminal. That promise is worthless if the download itself is janky. Each of the three platforms is a HARD BAR, not a nice-to-have:
+
+1. **Every platform ships its own real, native installer/executable — not a bare archive.** Windows gets a proper `.exe` installer (Start Menu shortcut, uninstaller registered in Add/Remove Programs), macOS gets a `.dmg` with a drag-to-`/Applications` affordance, Linux gets a self-contained `.AppImage` (no root, no distro-specific package manager assumption) at minimum, with `.deb`/`.rpm` as a stretch for native package-manager installs. A `.zip` or a bare `.tar.gz` of a PyInstaller one-folder build is **not** a shipped installer — it's a build artifact that leaked onto the download page (this happened: Windows shipped a `.zip` for months, and the Linux CI job is literally named "Linux single-folder + AppImage" but only ever emitted a `.tar.gz` — the AppImage step was never written).
+2. **Stable, version-less download URLs per platform** (`desktop/README.md`'s convention: a fixed-name copy alongside the versioned one, both on the same GitHub Release, so `.../releases/latest/download/<fixed-name>` never needs updating). Every new installer format gets its own fixed name and its own row in clawmetry-landing's `_DESKTOP_DOWNLOAD_URLS`.
+3. **Build locally before trusting CI.** `makensis` (NSIS) and `appimagetool` can both be exercised in a plain Linux sandbox without a Windows/Linux-GUI machine — compile the script / validate the AppDir structure before pushing, don't find out from a red Windows/Linux runner 8 minutes later.
+4. **Stability over speed.** These installers are a stranger's first impression of the product on a machine you don't control — antivirus-flagged, SmartScreen-warned, or "app can't be opened because it is from an unidentified developer" all read as "this is a scam," not "unsigned OSS binary." Code-signing (Windows Authenticode, macOS Developer ID notarization — the pipeline is wired for BOTH; Windows activates when the `WINDOWS_CERT_PFX_BASE64`/`WINDOWS_CERT_PASSWORD` secrets are set) closes that gap; until a cert exists, the installer copy must say so honestly rather than pretend it's signed. On Windows the stakes are higher than a SmartScreen warning: Smart App Control in enforce mode blocks the unsigned NSIS uninstaller's `%TEMP%` relaunch, so the app cannot be uninstalled from Settings > Apps (lab repro 2026-08-10) — and the uninstaller can ONLY be signed at makensis time (`!uninstfinalize`), because `WriteUninstaller` regenerates `Uninstall.exe` from the embedded stub on every (re)install.
+5. **Verify the artifact, not the build log.** "CI went green" is not "the installer works" — actually download the produced `.exe`/`.dmg`/`.AppImage` from the release URL and confirm its byte size and (where testable) that it runs, same evidentiary bar as §0a.5.
+
 ## 1. The data-flow rule (this is the one that bites)
 
-ClawMetry is **read-only** and **DuckDB-first**:
+ClawMetry is **DuckDB-first** (and a control plane that defaults to observation — it is *not* read-only; see CLAUDE.md Conventions):
 
 - Every feature persists to and reads from the local **DuckDB** store. Reading raw JSONL, log files, `sessions.json`, or process stats *inside a request handler* is a violation — it works locally and silently returns empty in cloud (the cloud container has no `~/.openclaw` filesystem). Most "works locally, broken in cloud" bugs are exactly this.
 - The blessed path for anything the cloud needs to display:
@@ -126,6 +136,18 @@ Hold the line with:
 - **Poll in seconds-to-minutes, never sub-second.** The daemon wakes, works, then sleeps.
 - **Profile before shipping anything on the ingest / query / snapshot path.** `sample <pid> 4` (macOS) or py-spy. If it sustains more than ~1 core, it does not ship. Guard the caps + cache with a regression test so it stays mechanical.
 
+## 1f. Keep Software Factory in sync (Drift Bot)
+
+This repo (and `clawmetry-cloud` / `clawmetry-pro` / `clawmetry-mac` / `clawmetry-railway`) is tracked in [8090 Software Factory](https://factory.8090.ai) as the "ClawMetry" project: Requirements and Blueprints describing what the product does and how. A `drift-bot` GitHub status check runs on every PR and posts an inline comment when the code says something the Blueprints/Requirements don't. Real example: PR #4599 shipped the installer's stale-duplicate sweep and documented it in `CHANGELOG.md`, but no Blueprint said the installers clean up other Python interpreters on PATH, so Drift Bot failed the PR.
+
+**`CHANGELOG.md` is not enough.** Drift Bot reads Blueprints/Requirements, not the changelog. Before merging a change that alters documented (or should-be-documented) product behavior:
+- Check whether an existing Blueprint covers the area you touched; if your change makes it wrong or incomplete, update it.
+- If no Blueprint covers it yet, say so in the PR description so a human (or the next agent) creates one — don't let it merge silently undocumented.
+- The dashboard's "Sync Blueprint with Code" agent action (or the Software Factory MCP skill, `npx skills add 8090-inc/software-factory-plugin`) can do this for you; point it at the specific PR/CHANGELOG entry rather than asking for a blanket sync of everything.
+- A red `drift-bot` check is a real signal like any other CI failure (§4) — fix the documentation gap, don't merge past it.
+
+Separately, **check [Pending Work Orders](https://factory.8090.ai) regularly**, not just when drift-bot fires. Work Orders are the actual tickets Software Factory queues from Requirements/Blueprints; picking them up (not just reacting to drift after the fact) is how the docs and the code stay one thing instead of drifting apart again next week.
+
 ## 2. Make the change
 
 - New HTTP endpoints go in `routes/<feature>.py` on that feature's Blueprint, not in `dashboard.py`. Shared helpers reach back via late `import dashboard as _d`.
@@ -133,6 +155,82 @@ Hold the line with:
 - Match surrounding style: `snake_case` funcs, minimal deps (Flask + waitress + cryptography), never crash on bad input (graceful fallbacks + a logged warning).
 - **No em-dashes (`—`, U+2014), no double-dashes (`--`), no `X, Y, and Z [emdash] coda` pattern in user-facing copy.** That pattern is an AI-tell, and the user has explicitly banned it. Applies to: landing HTML, dashboard banners, marketing copy, blog posts, CHANGELOG release entries, bounty and job posts (incl. external platforms like rentahuman.ai), public docs, email templates, modal copy, and any PR description users see. Allowed in: code comments, internal notes in `docs/`, commit messages, and internal-only PR bodies. Use a comma, parenthetical, colon, or full stop instead. **Belt-and-braces:** before sending any user-facing text (a PR via someone else's API, a CHANGELOG entry, landing copy, modal text), grep the payload for `—` or `--` and refuse to send if matched. Burned twice: 2026-05-26 on landing PR #211 (em-dashes in marketing copy), 2026-05-28 on the rentahuman.ai bounty redraft (em-dashes everywhere despite the rule being in memory, so the user had to re-flag it).
 - **Keep business internals out of this public repo.** This repo is public — investors, competitors, and prospective hires browse it. Any doc with live revenue/MRR/funnel/conversion numbers or monetization/pricing strategy (conversion roadmaps, conversion PRDs, pricing analysis) goes in **`clawmetry-cloud/docs/` (private), NEVER `clawmetry/docs/`**. Same rule as `[intel/*]` issues. Before creating any doc, ask: would this leak positioning, lead pipeline, or revenue if a competitor read it? If yes → private repo. (Burned 2026-05-26: a conversion roadmap + PRDs with the real paying-customer/MRR funnel were written into public `docs/` and had to be relocated.)
+
+## 2a. Adding a runtime: every surface, every repo, ONE sprint (canonical checklist)
+
+A runtime is "supported" only when it exists on **every** surface below, in all four
+repos, and is verified live. Half of it shipping is worse than none: the product says
+21, the homepage says 20, the README lists it unlinked, and `/runtimes/<slug>` is a 404.
+**Burned 2026-08-17 (Exo):** adapter, OSS wiring, `[RELEASE]` 0.12.726, cloud pin,
+`/api/runtimes` = 21 — all done — and the storefront never followed for a day. The
+product half of the flywheel had run; the storefront half had not. This section is the
+canonical list; `clawmetry-pro`, `clawmetry-cloud`, and `clawmetry-landing` FLYWHEELs
+point here and carry only their own slice.
+
+Order of operations (each step is a PR that merges before the next starts):
+
+**1. `clawmetry-pro` — the adapter (private).**
+`clawmetry_pro/adapters/<runtime>.py` (self-contained, base SDK only), `_PAID_ADAPTERS`
+entry, REAL fixture under `tests/fixtures/runtimes/<rt>/REAL/` with a README naming how
+it was captured, `RuntimeSpec` + a matrix leg in `runtime-conformance.yml` (the matrix is
+hardcoded, not derived), unit tests over the real file shapes (empty, torn tail, dup /
+replayed events, fork/subagent lineage, cost ladder). Bump `pyproject` + `__version__`
+in lockstep. Verify with an isolated ingest, not the daemon proxy (see memory
+`exo-runtime-adapter-shipped`).
+
+**2. `clawmetry` (this repo) — wiring + count + public contract, then `[RELEASE]`.**
+| Surface | What to touch |
+|---|---|
+| Catalogue | `clawmetry/entitlements.py`: `PAID_RUNTIMES` (or `FREE_RUNTIMES`), `RUNTIME_LABELS`, **`RUNTIME_LANDING_PATHS`** (`/runtimes/<slug>`, the public page this runtime WILL have). |
+| Ingest | `clawmetry/sync.py` family loop (label map + store-root discovery + `CLAWMETRY_<RT>_*` env override), `clawmetry/runtime_probe.py`, `clawmetry/runtime_memory.py` (memory/skills catalog), `clawmetry/numbat_ingest.py` aliases, `routes/harness.py`, `routes/usage.py`, `routes/attention.py`; a new provider → `clawmetry/providers_pricing.py`. |
+| UI | `clawmetry/static/js/app.js`: every runtime map (`_CM_RT_PREFIXES`, labels, icons, `_CM_RT_CAPS`, the harness card map at the `deepseek_harness:` anchors — grep the previous runtime's id and mirror EVERY hit; qm was missed in `_CM_RT_PREFIXES` once). |
+| Count | run `python3 scripts/sync_runtime_count.py` and commit what it rewrites (README, translations, FLYWHEEL, ARCHITECTURE, CLI, desktop onboarding, device page). `setup.py` derives the PyPI summary itself. |
+| README grid | add `EMOJI **[Label](https://clawmetry.com/runtimes/<slug>)**` to the "Works with N agent runtimes" line — LINKED, never bare bold. |
+| Docs | `docs/ENTITLEMENTS.md` runtime list; `docs/RUNTIME_SCREENSHOTS.md` + `screenshots/runtimes/<rt>/` once a real capture exists (staging recipe in memory `runtime-screenshot-gallery-staging-recipe`); `CHANGELOG.md` entry (no em-dashes). |
+| Tests (count pins that break) | `tests/test_entitlements.py::test_paid_runtimes_exact_membership`, `tests/test_phase4_adapter_move.py`, `tests/test_advertised_runtimes_match_catalogue.py`, `tests/test_runtime_count_copy_sync.py`, **`tests/test_runtime_public_surfaces.py`** (README grid links every catalogue runtime; `CLAWMETRY_LIVE_CHECKS=1` also asserts each page is 200 on clawmetry.com). |
+| Ship | `[RELEASE]` PR → PyPI; crack the wheel and grep for the runtime id before you pin it anywhere. |
+
+**3. `clawmetry-cloud` — serve it.** Roll the pro wheel (`_pro_wheel_path`), bump the
+`clawmetry==X` pin, deploy, then verify live: `GET /api/runtimes` includes the id and
+`/api/license/download` serves the pro version that carries the adapter.
+
+**4. `clawmetry-landing` + this README — the storefront (same day as step 3).**
+`runtimes-<slug>.html` themed to the vendor's own palette/type, `app.py` route,
+`sitemap_gen.py`, homepage `.rt-cloud` tile + tooltip enumeration, chip on every other
+runtime page, the fleet count everywhere it is quoted (connect, pricing, control tower,
+how-it-works, agent-builder, push, device, llms.txt, `locales/en.json`),
+`docs/PUBLIC_CLAIMS.md` §3.1 with a dated "Reconciled" line, and the guard
+`tests/test_pages.py::test_runtime_surfaces_are_in_lockstep`. Then run
+`CLAWMETRY_LIVE_CHECKS=1 pytest tests/test_runtime_public_surfaces.py` here: every
+`RUNTIME_LANDING_PATHS` entry must be 200 on clawmetry.com. Also `gh repo edit
+--description` if the count is in it, and any awesome-list / directory entries you own.
+
+**5. Verify like the founder will:** open the homepage grid, click the new tile, open
+the dashboard with the runtime switcher on the new runtime, screenshot all three, and
+put them in the PRs. If you cannot show the tile, the page, and the data, it did not ship.
+
+### The count is derived, never hand-edited
+
+`FREE_RUNTIMES | PAID_RUNTIMES` in `clawmetry/entitlements.py` is the **only**
+place the supported-runtime set is declared. Everything that quotes a number
+hangs off it:
+
+| Surface | How it stays true |
+|---|---|
+| PyPI summary (`setup.py`) | **Derived.** `setup.py` parses `entitlements.py` at build time, so it cannot drift. |
+| README, translations, FLYWHEEL, ARCHITECTURE, AUDIT, CLI, desktop onboarding, device page | **Rewritten** by `python3 scripts/sync_runtime_count.py`. |
+| README runtime grid links | **Enforced** by `tests/test_runtime_public_surfaces.py` against `RUNTIME_LANDING_PATHS`. |
+| All of the above | **Enforced** by `tests/test_runtime_count_copy_sync.py`, which fails CI on drift. Also runs via `make lint`. |
+| Landing pages | **Enforced in `clawmetry-landing`** by `test_runtime_surfaces_are_in_lockstep` (derives the fleet from `runtimes-*.html`); cross-checked from here by the opt-in live test above. GitHub repo description: `gh repo edit --description` by hand in the same sprint. |
+
+If a number in prose legitimately is *not* the supported-runtime count (a free-tier
+count, a dated research note, a capacity estimate), add it to `EXEMPT` in the script
+with the reason. Do not reword the prose to dodge the regex.
+
+Burned 2026-08-15: the catalogue said 20 while the README said 14, PyPI said 12, and
+FLYWHEEL said 12, across 27 stale mentions in 16 files. Maintainers of external lists
+click through, and a PyPI page contradicting the homepage is the kind of thing that
+gets a submission closed.
 
 ## 3. Verify locally BEFORE the PR (the loop that actually catches bugs)
 
@@ -183,7 +281,7 @@ gh pr create --title "feat: …" --body "…"    # explain WHY + the verificatio
 
 - **Never push directly to `main`. No exceptions.** Not for empty re-trigger commits. Not for `Dockerfile` cache-bust comments. Not for one-line CI tweaks. Not for typo fixes. Not even for reverts. Every change goes through a branch + PR + CI, including changes whose only purpose is to nudge CI itself. The 30 seconds a one-line PR costs is the price of every other agent and human being able to trust `main`. If a deploy is stuck and you think the fix is "obvious," that means it is a perfect 1-line PR, not a justification to bypass review. Burned 2026-05-28 on `clawmetry-landing`: I pushed two commits straight to `main` (`a2cfb7b` empty re-trigger and `acfa10e` 2-line Dockerfile cache-bust) framing the urgency of a stuck Cloud Run deploy as license to skip the rule. Both would have taken 30 seconds as PRs. The user rightly called it out.
 - End commit messages with the `Co-Authored-By` trailer; end PR bodies with the Claude Code footer.
-- **CI must be 100% green before merge — red means it will not deploy.** The matrix includes: Syntax & Lint, API Tests (3 OS), E2E Browser Tests, **Live OpenClaw E2E (real gateway)**, MOAT Verifier + Keystone, Eval Suite Gate, Sync matrix (3 OS × 3 Py), Install/boot/health, wheel/asset presence, pip install.
+- **CI must be 100% green before merge — red means it will not deploy.** The matrix includes: Syntax & Lint, API Tests (3 OS), E2E Browser Tests, **Live OpenClaw E2E (real gateway)**, MOAT Verifier + Keystone, Eval Suite Gate, Sync matrix (3 OS × 3 Py), Install/boot/health, wheel/asset presence, pip install, and **`drift-bot`** (Software Factory blueprint/requirement sync, §1f — fix the doc gap, it is not a flaky check to retry).
 - A red check is a real signal. **Fix the cause — code or test — never skip or `xfail` to get green.** If a test encodes the wrong expectation (e.g. an IA-v2 rename), fix the test to match reality; read the *rendered* HTML before "fixing" a selector so you don't fix half of it.
 - Merge with `gh pr merge <n> --squash --delete-branch`.
 - After any cross-cutting fix on main, **rebase every open PR** (`gh pr update-branch`) — "main green" ≠ "PRs green."

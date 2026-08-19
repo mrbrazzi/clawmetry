@@ -126,10 +126,12 @@ def _read_discovery():
             return None
         # Cheap liveness check: PID alive? Avoids the ~5s socket
         # connect-refused wait when the daemon was killed but the file
-        # wasn't cleaned up (atexit doesn't fire on SIGKILL).
-        try:
-            _os.kill(pid, 0)
-        except OSError:
+        # wasn't cleaned up (atexit doesn't fire on SIGKILL). Uses the
+        # portable probe: os.kill(pid, 0) never raises on Windows, so it
+        # would treat every stale discovery file as a live daemon.
+        from clawmetry.process_control import is_alive as _pid_alive
+
+        if not _pid_alive(pid):
             return None
         return {"port": port, "token": token}
     except (FileNotFoundError, ValueError, OSError):
@@ -255,9 +257,18 @@ def _coerce_args(shape: str, raw: dict) -> dict:
         }
     if shape == "agent_graph":
         return {
+            "runtime": raw.get("runtime") or None,
             "since": raw.get("since"),
             "until": raw.get("until"),
             "limit": _safe_int(raw.get("limit"), default=500, lo=1, hi=2000),
+        }
+    if shape == "replay_events":
+        sid = raw.get("session_id")
+        if not sid:
+            raise ValueError("replay_events shape requires session_id")
+        return {
+            "session_id": sid,
+            "limit": _safe_int(raw.get("limit"), default=2000, lo=1, hi=10000),
         }
     raise ValueError(f"unknown shape: {shape}")
 
@@ -480,6 +491,26 @@ def http_agent_graph():
         return jsonify({"error": str(e)[:300]}), 500
 
 
+@bp_local_query.route("/api/local/replay-events/<path:session_id>", methods=["GET"])
+def http_replay_events(session_id: str):
+    """Flat canonical replay-event rows for one session (#4813).
+
+    Powers ``/api/replay-tree/<session_id>`` (the tree-building endpoint
+    lives in ``routes/sessions.py``). Returned rows are ts-ascending; the
+    endpoint layer groups them into turns/delegations/workflows.
+    Empty ``rows`` is the honest shape until adapter mappers land.
+    """
+    try:
+        raw = dict(request.args.to_dict())
+        raw["session_id"] = session_id
+        args = _coerce_args("replay_events", raw)
+        return jsonify(_dispatch("replay_events", args))
+    except ValueError as e:
+        return jsonify({"error": str(e)[:300]}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 500
+
+
 @bp_local_query.route("/api/local/sandbox-logs/<sandbox_name>", methods=["GET"])
 def http_sandbox_logs(sandbox_name: str):
     """Return OCSF sandbox audit log events for a NemoClaw sandbox.
@@ -546,6 +577,18 @@ def http_query():
 
 _DAEMON_METHODS = frozenset({
     "query_events",
+    # "Needs you" state. The hook receiver (routes/hooks.py) runs in the
+    # DASHBOARD process while the daemon owns the writer lock, so these must
+    # be proxied — an unlisted method is a silent no-op and the badge would
+    # simply never appear.
+    "set_session_attention",
+    "clear_session_attention",
+    # Agent-Inventory roster (#task-12): ``sync._build_runtime_summary`` runs
+    # in the DASHBOARD process when /api/inventory composes locally; without
+    # this method the proxy returned None, ``by_runtime``/``by_runtime_model``
+    # came back empty, and every roster row showed 0 conversations / $0 even
+    # though the store had real sessions (live-hit 2026-07-29).
+    "query_model_rollup",
     "query_sessions",
     "query_sessions_table",
     "query_aggregates",
@@ -569,6 +612,14 @@ _DAEMON_METHODS = frozenset({
     # gateway RPC (down), surfacing as the same 6 s timeout the PR was
     # supposed to fix. Adding both here closes the loop.
     "query_alert_rules",
+    # Founder 2026-08-15: locally-created alert rules live in the fleet
+    # SQLite DB, but ``sync._evaluate_alerts_local`` only ever reads DuckDB.
+    # Nothing bridged the two (``ingest_alert_rule`` was cloud-relay-only),
+    # so a rule created from the Alerts tab on a no-cloud node was evaluated
+    # by nobody and sat on "never triggered" forever. routes/alerts.py now
+    # mirrors on write/update/delete through these two.
+    "ingest_alert_rule",
+    "delete_alert_rule",
     "query_channel_config_status",
     "query_crons",
     # Issue #605 DuckDB follow-up: per-job cron-run timeline. Read by
@@ -711,6 +762,16 @@ _DAEMON_METHODS = frozenset({
     # ongoing) for the Overview tile + /api/outcomes endpoint. Inline-
     # classifies any unlabeled rows so the dashboard never paints "0%".
     "query_outcomes",
+    # Quality tab (2026-08-15 rebuild). Scopes by the REAL runtime (session-id
+    # prefix) and returns metadata, which carries both the true runtime label
+    # and the persisted quality verdicts. Deliberately separate from
+    # query_outcomes, which filters on the hardcoded agent_type column.
+    "query_quality_sessions",
+    # Drive-by: `make lint-daemon-allowlist` was red on main. Session replay
+    # (routes/sessions.py:3010) calls this through the proxy, but the entry
+    # was never added — so on daemon installs the replay tree silently came
+    # back empty. Same failure mode as the query_cache_metrics drive-by below.
+    "query_replay_events",
     "reclassify_session_outcome",
     # Issue #1619 Phase 1: LLM-as-judge eval surface. Reads + the persist
     # write all go via the daemon (writer-lock owner) so the dashboard
@@ -719,10 +780,27 @@ _DAEMON_METHODS = frozenset({
     "query_recent_evals",
     "query_eval_summary",
     "persist_eval_score",
+    # Issue #2862 (resurrected) — per-metric eval verdicts (deterministic
+    # checks now, named metric engines later). Same daemon-proxy rationale
+    # as the judge surface above.
+    "query_eval_metrics",
+    "query_sessions_missing_eval_metrics",
+    "persist_eval_metric",
+    # Drive-by (make lint-daemon-allowlist was red on main): both methods
+    # exist on LocalStore and are already called through the proxy from
+    # routes/usage.py and routes/channels.py; the allowlist entries were
+    # simply never added, so those proxy calls silently returned None on
+    # daemon installs.
+    "query_cache_metrics",
+    "query_channel_delivery_health",
     # Eval->monitor loop: per-session eval/outcome fields for the two runs in
     # /api/run-compare's quality rows. Read-only; routed through the daemon
     # proxy so the dashboard process never opens the writer-locked DuckDB.
     "query_session_quality",
+    # Evals drill-down (feat/evals-simplify): one-shot per-session eval detail
+    # for the Recently Scored row-click drawer. Read-only through the daemon
+    # so the dashboard never opens the writer-locked DuckDB itself.
+    "query_session_eval_detail",
     "health",
     # Issue #876 — NemoClaw guardrail enforcement events + metrics.
     # Routed through the daemon proxy so /api/nemoclaw/events and
@@ -772,6 +850,10 @@ _DAEMON_METHODS = frozenset({
     # routes/usage.py:/api/efficiency through the daemon proxy (read-only;
     # the daemon owns the writer lock).
     "query_efficiency_rollup",
+    # Spend flow (feat/spend-flow): the cached event-content walk behind
+    # GET /api/spend-flow (input categories -> runtime -> output categories).
+    # Read-only; computed + TTL-cached inside the daemon (writer-lock owner).
+    "query_spend_flow",
     # Issue #2861 -- version-aware health regression. Read-only join of
     # sessions + heartbeats; routed through the daemon proxy so the
     # dashboard process never opens DuckDB writable.
@@ -782,6 +864,17 @@ _DAEMON_METHODS = frozenset({
     # proxy so the dashboard process never opens DuckDB writable.
     "ingest_security_event",
     "query_security_events",
+    # Severity rollup for the Security tab's tiles — counted in SQL so the
+    # numbers survive the list cap.
+    "count_security_events",
+    # Undo for findings that should not have been recorded (engine-prefixed
+    # ids, so one engine's output can be removed without touching another's).
+    # A write, so it must go through the daemon like every other write.
+    "delete_security_events_by_id_prefix",
+    # Undo for an unwanted ingest (e.g. a numbat at-rest scan backfilling the
+    # live activity feed). Write under the daemon's _write_lock, so it must
+    # go through the proxy like every other write.
+    "delete_events_by_type",
     # Issue #3306 — audit log read path. ingest_ is called from operator
     # actions; query_ serves /api/audit-log. Both routed through the daemon
     # proxy so the dashboard process never opens DuckDB writable.
@@ -803,6 +896,12 @@ _DAEMON_METHODS = frozenset({
     "log_ar_history",
     "list_ar_rules",
     "query_ar_history",
+    # Issue #3696 — OpenClaw backup/snapshot lifecycle observability.
+    "query_backups",
+    # Agent CLI Phase 1 (docs/CLI.md): `clawmetry usage --by team`
+    # reads the per-team rollup through the daemon proxy. Every other method
+    # the agent CLI calls was already allowlisted; guards-in-same-PR rule.
+    "query_usage_by_team",
 })
 
 

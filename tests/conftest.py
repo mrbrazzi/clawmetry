@@ -11,6 +11,23 @@ import pytest
 import requests
 
 
+# On Windows, ntpath.expanduser resolves "~" from USERPROFILE (not HOME), so
+# monkeypatch.setenv("HOME", tmp_path) silently fails to sandbox the config
+# dir.  This shim restores POSIX parity for the test suite only.
+if sys.platform == "win32":
+    import ntpath as _ntpath
+
+    _nt_expanduser_orig = _ntpath.expanduser
+
+    def _nt_expanduser_home_aware(path):
+        if path[:1] == "~" and os.environ.get("HOME"):
+            return os.environ["HOME"] + path[1:]
+        return _nt_expanduser_orig(path)
+
+    _ntpath.expanduser = _nt_expanduser_home_aware
+    os.path.expanduser = _nt_expanduser_home_aware
+
+
 # Playwright's sync API can only be entered once per process. Share a single
 # browser across all E2E test modules via this session-scoped fixture; each
 # module owns its own contexts off the shared browser.
@@ -151,6 +168,17 @@ def server(base_url, token):
     # Propagate the CI test token so the server accepts our requests
     if token:
         env["OPENCLAW_GATEWAY_TOKEN"] = token
+    # Trial-end hard block is default-ON (see clawmetry/trial_enforcement.py).
+    # CI runs have no license file → every non-allowlisted request would 402,
+    # and the entire api_test suite (which exercises /api/overview /api/sessions
+    # /api/usage etc. — all NOT on the block allowlist) would ERROR at fixture
+    # setup because the readiness probe fails. Force this test process out so
+    # the legacy tests keep testing what they were written to test; the
+    # hard-block behaviour gets its own dedicated tests in
+    # test_trial_hard_block.py that explicitly re-enable it. Force-set (not
+    # setdefault) so a CI runner that happens to inherit CLAWMETRY_HARD_BLOCK=1
+    # from a matrix step still gets the opt-out applied here.
+    env["CLAWMETRY_HARD_BLOCK"] = "0"
     # Derive port from base_url
     try:
         port = base_url.split(":")[-1].rstrip("/")

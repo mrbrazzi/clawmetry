@@ -56,6 +56,10 @@ when the tap is disabled, but future scope grants start working immediately.
 """
 
 from __future__ import annotations
+from clawmetry.gateway_protocol import (
+    GATEWAY_MAX_PROTOCOL as _GW_MAX_PROTO,
+    GATEWAY_MIN_PROTOCOL as _GW_MIN_PROTO,
+)
 
 import json
 import logging
@@ -101,6 +105,7 @@ CHANNEL_NAMES: tuple[str, ...] = (
     "tlon",
     "synologychat",
     "nextcloudtalk",
+    "clickclack",
 )
 
 
@@ -425,8 +430,8 @@ class GatewayTap:
         # handshake with `protocol-mismatch`.
         cid = f"clawmetry-tap-{uuid.uuid4().hex[:8]}"
         connect_params = {
-            "minProtocol": 3,
-            "maxProtocol": 4,
+            "minProtocol": _GW_MIN_PROTO,
+            "maxProtocol": _GW_MAX_PROTO,
             "client": {
                 "id": "cli",
                 "version": "clawmetry-ws-tap",

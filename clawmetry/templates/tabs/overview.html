@@ -1,4 +1,13 @@
 <div class="page active" id="page-overview">
+  <!-- Needs-you strip. The first thing on the page because it answers the
+       question people actually open the dashboard with: "is anything waiting
+       on me?" Most of the time it is one calm line, and that reassurance IS
+       the feature. JS: app.js loadNeedsYou() -> /api/attention (cloud:
+       cm-cloud-attention serves it from the snapshot's sessions slice, which
+       already carries the attention_* fields). Hidden until the first load
+       resolves so it never flashes a wrong answer. -->
+  <div id="needs-you" class="cm-needs" style="display:none;" aria-live="polite"></div>
+
   <!-- Human-first hero (FLYWHEEL vision): a newcomer should grasp "is my agent
        alive, what did it do, is it healthy, what did it cost" in ~5s, no jargon.
        Populated by _renderOverviewHero(); the power tools (autonomy / compare /
@@ -71,17 +80,14 @@
     <button onclick="openEvalRubricModal()" title="Judge key &amp; rubric" data-i18n-title="overview.eval_setup" aria-label="Judge key &amp; rubric" style="background:var(--button-bg);color:var(--text-secondary);border:1px solid var(--border-primary);border-radius:8px;padding:6px 10px;font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap;">⚙</button>
   </div>
 
-  <!-- Named evaluator library. Brands ClawMetry's shipped quality / reliability
-       / efficiency / safety / agent signals as a named catalogue (Traceloop-style),
-       honest about what is live today vs coming with Pro. Cloud-safe: the
-       catalogue is static data /api/evaluators returns with or without a store. -->
-  <div id="evaluators-card" style="background:var(--bg-secondary);border:2px solid var(--border-primary);border-radius:12px;padding:18px 22px;margin-bottom:14px;box-shadow:var(--card-shadow);">
-    <div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:4px;">
-      <div style="font-size:13px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:1.5px;">🔬 <span data-i18n="evaluators.title">Evaluators on your agent</span></div>
-      <div id="evaluators-count" style="font-size:11px;color:var(--text-muted);"></div>
+  <!-- Compact evaluators strip. The full named-evaluator library moved to the
+       dedicated Evals tab; Overview keeps a one-line honest summary + link. -->
+  <div id="evaluators-overview-card" onclick="switchTab('evals')" style="cursor:pointer;background:var(--bg-secondary);border:2px solid var(--border-primary);border-radius:12px;padding:14px 22px;margin-bottom:14px;box-shadow:var(--card-shadow);display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+    <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;">
+      <span style="font-size:13px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:1.5px;">🔬 <span data-i18n="evaluators.title">Evaluators on your agent</span></span>
+      <span id="evaluators-overview-line" style="font-size:12px;color:var(--text-muted);"></span>
     </div>
-    <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px;" data-i18n="evaluators.subtitle">Named checks ClawMetry runs to tell you if your agent is doing good work. Each one answers a plain question.</div>
-    <div id="evaluators-list" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px;"></div>
+    <span style="font-size:12px;font-weight:600;color:var(--text-secondary);white-space:nowrap;"><span data-i18n="evaluators.open_tab">Open Evals</span> →</span>
   </div>
 
   <!-- Per-runtime sparkline of recent runs (#2196 item #4). Severity: red=real
@@ -254,6 +260,7 @@
         box-shadow:var(--card-shadow);
         ">
         <div style="font-size:14px;font-weight:700;color:var(--text-primary);margin-bottom:12px;">🏥 <span data-i18n="overview.system_health">System Health</span></div>
+        <div id="sh-version-regression" style="margin-bottom:10px;"></div>
         <div style="
           font-size:11px;
           text-transform:uppercase;
@@ -525,6 +532,10 @@
       <div class="tool-spark"><span>--</span></div></div>
     <div id="active-tasks-grid"></div>
     <div id="activity-stream"></div>
+    <!-- Live log stream overview target (#3761): startLogStream() appends lines
+         here via appendLogLine('ov-logs', ...). Hidden in overview; the full
+         panel lives in page-logs (tabs/logs.html). -->
+    <div id="ov-logs"></div>
   </div>
 
   <!-- old system health removed, now inside tasks pane -->

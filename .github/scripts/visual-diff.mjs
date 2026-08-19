@@ -55,7 +55,7 @@ const AUTH_TOKEN = process.env.CLAWMETRY_VISUAL_DIFF_TOKEN || "";
 // switchTab() name here, in CANONICAL_TABS, and in PR_SCREENSHOT_TABS.
 // `overview` is the implicit default -- listed first for a `root` baseline.
 const DEFAULT_TABS =
-  "overview,flow,brain,usage,crons,memory,security,subagents,transcripts,logs,skills,models,approvals,alerts,notifications,context,limits,clusters,history,channels,dives,harness,inventory,nemoclaw,policy,selfevolve,swimlane,tool-catalog,tracing,turn-anatomy,version-impact,context-economics";
+  "overview,flow,brain,usage,crons,memory,security,subagents,transcripts,logs,skills,models,approvals,alerts,notifications,limits,clusters,history,channels,dives,harness,inventory,nemoclaw,policy,selfevolve,swimlane,tool-catalog,tracing,turn-anatomy,version-impact,context-economics,agents,evals";
 const TABS = (process.env.PR_SCREENSHOT_TABS || DEFAULT_TABS)
   .split(",")
   .map((p) => p.trim())
@@ -92,7 +92,7 @@ async function reachable(url) {
  * This is called before the screenshot loop to provide an early diagnostic
  * message. A failure no longer aborts the run -- we continue screenshotting
  * so the PR comment always has images (showing the overlay) rather than
- * "Bot run failed before producing screenshots". The error is collected into
+ * "no screenshots". The error is collected into
  * preflightFailed[] and merged into authGaps at the end so the workflow
  * still exits 3 to signal the auth problem.
  */
@@ -158,7 +158,7 @@ async function shoot(browser, baseUrl, view, tab, file) {
   try {
     // The dashboard opens long-lived SSE streams (logs/brain/health), so
     // waiting for `networkidle` deadlocks. Use `domcontentloaded` and rely
-    // on the explicit dwell + scroll loop below to settle content.
+    // on the explicit overlay-wait + scroll loop below to settle content.
     const resp = await page.goto(baseUrl + "/", {
       waitUntil: "domcontentloaded",
       timeout: 30000,
@@ -171,30 +171,77 @@ async function shoot(browser, baseUrl, view, tab, file) {
     // a wall of identical "login" screenshots.
     if (resp && resp.status() >= 300 && resp.status() < 400) ok = false;
 
-    // Switch to the requested tab via the page's own router. Overview is the
-    // default landing tab so we only call switchTab() for everything else.
+    // Wait for the auth overlay to be dismissed before switching tabs.
+    // The dashboard bootstrap fetches /api/auth/check asynchronously after
+    // domcontentloaded. A fixed 1200ms dwell raced this async request on
+    // slow CI runners: the overlay was still visible when switchTab() ran,
+    // switchTab() returned "no-switchtab" (app.js blocked behind the overlay),
+    // and every screenshot landed on the overview tab with the overlay visible.
+    // This was the root cause of the user-reported bug (2026-05-17):
+    // "screenshots always broken -- gateway token not passed for OSS,
+    // never displays other screens."
+    //
+    // Polling until the overlay is hidden (up to 5s) eliminates the race
+    // and also guarantees window.switchTab is available before we call it,
+    // because app.js only registers switchTab after a successful auth check.
+    //
+    // All 4 overlay IDs are checked here to match _BLOCKING_OVERLAY_IDS in
+    // tests/test_e2e_oss_all_tabs.py. Previously only login-overlay and
+    // gw-setup-overlay were checked, leaving auth-overlay and setup-overlay
+    // undetected -- tabs showing those overlays were silently screenshotted
+    // as content and the bot exited 0 (false green).
+    try {
+      await page.waitForFunction(
+        () => {
+          for (const id of ["login-overlay", "gw-setup-overlay", "auth-overlay", "setup-overlay"]) {
+            const el = document.getElementById(id);
+            if (!el) continue;
+            const cs = getComputedStyle(el);
+            if (cs.display !== "none" && cs.visibility !== "hidden") return false;
+          }
+          return true;
+        },
+        { timeout: 5000, polling: 200 }
+      );
+    } catch {
+      // Overlay still blocking after 5s. The canary check below flags it
+      // with a clear error; the screenshot will show the overlay for diagnosis.
+    }
+
+    // Switch to the requested tab. The overlay wait above ensures app.js
+    // has loaded and window.switchTab is registered before this runs.
     if (tab !== "overview") {
       try {
-        await page.evaluate((name) => {
-          if (typeof window.switchTab === "function") window.switchTab(name);
+        const switchResult = await page.evaluate((name) => {
+          if (typeof window.switchTab !== "function") return "no-switchtab";
+          window.switchTab(name);
+          return "ok";
         }, tab);
-      } catch {
+        if (switchResult !== "ok") {
+          ok = false;
+          console.error(
+            `[switch-fail] ${baseUrl} tab=${tab}: window.switchTab() not available ` +
+            `(result=${switchResult}). app.js may have failed to load or ` +
+            `auth is still blocking after 5s. Ensure OPENCLAW_GATEWAY_TOKEN matches CLAWMETRY_VISUAL_DIFF_TOKEN.`
+          );
+        }
+      } catch (switchErr) {
         ok = false;
+        console.error(`[switch-fail] ${baseUrl} tab=${tab} threw: ${switchErr && switchErr.message}`);
       }
     }
 
-    // Let JS-driven content fetch + render. Most tabs fire one or two
-    // /api/* calls and paint. networkidle would block forever if any SSE
-    // stream is open, so just dwell.
-    await page.waitForTimeout(1200);
+    // Brief settle for tab-specific API calls and content to render.
+    await page.waitForTimeout(400);
 
-    // Auth-gap canary #2: if the login overlay or the gateway-setup
-    // overlay is visible after dwell, the token seed didn't take. Surface
-    // it now so the workflow can fail loudly instead of publishing a wall
-    // of identical overlay shots.
+    // Auth-gap canary #2: overlay still visible after the explicit wait
+    // confirms a real token mismatch, not a timing race.
+    // Checks all 4 overlay IDs (matches _BLOCKING_OVERLAY_IDS in
+    // tests/test_e2e_oss_all_tabs.py) so auth-overlay and setup-overlay
+    // variants are also detected as auth failures.
     const overlayBlocking = await page.evaluate(() => {
       const seen = [];
-      for (const id of ["login-overlay", "gw-setup-overlay"]) {
+      for (const id of ["login-overlay", "gw-setup-overlay", "auth-overlay", "setup-overlay"]) {
         const el = document.getElementById(id);
         if (!el) continue;
         const cs = getComputedStyle(el);
@@ -207,7 +254,7 @@ async function shoot(browser, baseUrl, view, tab, file) {
     if (overlayBlocking.length > 0) {
       ok = false;
       console.error(
-        `[auth-gap] ${baseUrl} tab=${tab} overlay still visible: ${overlayBlocking.join(", ")}`
+        `[auth-gap] ${baseUrl} tab=${tab} overlay still visible after 5s poll: ${overlayBlocking.join(", ")}`
       );
     }
 
@@ -319,19 +366,20 @@ async function main() {
       // Sanity gate: '/' must return HTTP 200 AND no auth overlay must be
       // visible. A non-200 means the SPA didn't render. ok=false with HTTP 200
       // means an overlay was visible after token injection (shoot() sets
-      // ok=false when #login-overlay / #gw-setup-overlay is visible, but the
-      // old code never added that to authGaps -- fixed here).
+      // ok=false when any blocking overlay is visible, but the old code never
+      // added that to authGaps -- fixed here).
       for (const [label, res] of [["base", baseRes], ["head", headRes]]) {
         if (res.status !== 200) {
           authGaps.push(
             `${label} ${view.name}/${tab}: HTTP ${res.status || "no-response"} (expected 200)`
           );
         } else if (!res.ok) {
-          // HTTP 200 but ok=false: shoot() detected an auth overlay or render
-          // error. Treat as an auth gap so the workflow fails loudly instead of
-          // silently posting overlay screenshots with a green exit code.
+          // HTTP 200 but ok=false: shoot() detected an auth overlay, a
+          // switchTab() failure, or a render error. Treat as an auth gap so
+          // the workflow fails loudly instead of silently posting screenshots
+          // of the overview tab with a green exit code.
           authGaps.push(
-            `${label} ${view.name}/${tab}: auth overlay visible or render error (token not accepted)`
+            `${label} ${view.name}/${tab}: auth overlay, switchTab() failure, or render error (token not accepted or app.js not loaded)`
           );
         }
       }

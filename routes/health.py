@@ -2,8 +2,10 @@
 routes/health.py — Health / reliability / diagnostics / rate-limits endpoints.
 
 Extracted from dashboard.py as Phase 5.5 of the incremental modularisation.
-Owns the 11 routes registered on bp_health:
+Owns the routes registered on bp_health:
 
+  GET  /healthz                   — liveness probe (k8s / load-balancer, unauthenticated)
+  GET  /api/_internal/healthz    — same probe at a GFE-bypass path (GFE intercepts bare /healthz on Cloud Run)
   GET  /api/reliability           — cross-session behavioral reliability trend
   GET  /api/heatmap               — activity heatmap (events per hour, N days)
   GET  /api/system-health         — comprehensive system health (services, disks, crons)
@@ -50,6 +52,14 @@ from flask import Blueprint, Response, jsonify, request
 from clawmetry.config import is_local_store_read_enabled
 
 bp_health = Blueprint('health', __name__)
+
+
+@bp_health.route("/healthz")
+@bp_health.route("/api/_internal/healthz")
+def healthz():
+    """Kubernetes/load-balancer liveness probe — always returns 200."""
+    import dashboard as _d
+    return jsonify({"status": "ok", "service": "clawmetry", "version": _d.__version__})
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +583,7 @@ def compute_gateway_health(
           "uptime_seconds": int | null,
           "rss_mb": float | null,
           "cpu_pct": float | null,
-          "status": "healthy" | "warning" | "critical" | "not_running",
+          "status": "healthy" | "warning" | "critical" | "not_running" | "externally_supervised",
           "memory_threshold_mb": 900,
         }
     """
@@ -592,6 +602,8 @@ def compute_gateway_health(
         except Exception:
             pid = None
     if pid is None:
+        if os.environ.get("OPENCLAW_SUPERVISOR_MODE") == "external":
+            payload["status"] = "externally_supervised"
         return payload
 
     vitals = None
@@ -1307,6 +1319,18 @@ def api_system_health():
     else:
         top_source = "gateway"
 
+    # Trusted-proxy device pairing (#4431): surface auto-approved vs
+    # manually-approved device grants from the gateway in the health view.
+    # _gateway_trusted_proxy_devices() reads gateway.status (+ fallback
+    # gateway.devices RPC); returns {} when the gateway is down or the
+    # feature hasn't shipped yet — never raises.
+    trusted_devices: dict = {}
+    try:
+        from clawmetry.adapters.openclaw import _gateway_trusted_proxy_devices
+        trusted_devices = _gateway_trusted_proxy_devices()
+    except Exception:
+        pass
+
     return jsonify(
         {
             "services": services,
@@ -1327,6 +1351,7 @@ def api_system_health():
             "sandbox": _d._detect_sandbox_metadata(),
             "inference": _d._detect_inference_metadata(),
             "security": _d._detect_security_metadata(),
+            "trusted_devices": trusted_devices,
             "service_status": service_status,
             "daemon": daemon_health,
             "daemon_error_rate_per_min": round(
@@ -1752,16 +1777,17 @@ def api_health():
 
     # 3. Memory usage (RSS of this process + overall)
     try:
-        import resource
+        # `resource` is POSIX-only and `free` is Linux-only, so this whole
+        # memory check silently vanished on Windows. helpers.system covers
+        # all three platforms with stdlib calls.
+        from helpers.system import memory_usage
 
-        rss_mb = (
-            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-        )  # KB -> MB on Linux
-        mem = subprocess.run(["free", "-m"], capture_output=True, text=True, timeout=2)
-        mem_parts = mem.stdout.strip().split("\n")[1].split()
-        used_mb = int(mem_parts[2])
-        total_mb = int(mem_parts[1])
-        pct = (used_mb / total_mb) * 100
+        mu = memory_usage()
+        if not mu:
+            raise RuntimeError("memory usage unavailable")
+        used_mb = mu["used_mb"]
+        total_mb = mu["total_mb"]
+        pct = mu["pct"]
         if pct > 90:
             checks.append(
                 {
@@ -3046,6 +3072,57 @@ def api_loop_signals():
     })
 
 
+@bp_health.route("/api/backups")
+def api_backups():
+    """Return OpenClaw backup/snapshot records (issue #3696).
+
+    Query params (all optional):
+      limit       — max rows (default 50, clamp 1..200)
+      node_id     — filter to a specific node
+      backup_type — filter to 'global' or 'agent'
+
+    Response:
+      {
+        "backups": [
+          {"backup_id": str, "node_id": str, "ts": str,
+           "backup_type": str, "agent_id": str|null,
+           "scope": str, "file_path": str|null,
+           "file_size_bytes": int|null,
+           "verify_status": str|null, "verify_ts": str|null}
+        ],
+        "count": <int>,
+        "last_backup_ts": <str|null>,
+        "last_verify_status": <str|null>
+      }
+
+    Empty-list fallback (HTTP 200) on any error or when no backups have
+    been ingested yet — this is normal for fresh installs.
+    """
+    try:
+        limit = max(1, min(200, int(request.args.get("limit", 50))))
+    except (TypeError, ValueError):
+        limit = 50
+    node_id = request.args.get("node_id") or None
+    backup_type = request.args.get("backup_type") or None
+
+    rows = _ls_call("query_backups", node_id=node_id,
+                    backup_type=backup_type, limit=limit)
+    if not rows:
+        rows = []
+
+    last_backup_ts = rows[0].get("ts") if rows else None
+    last_verify_status = next(
+        (r.get("verify_status") for r in rows if r.get("verify_status")),
+        None,
+    )
+    return jsonify({
+        "backups": rows,
+        "count": len(rows),
+        "last_backup_ts": last_backup_ts,
+        "last_verify_status": last_verify_status,
+    })
+
+
 # ---------------------------------------------------------------------------
 # MCP tool call observability (#850)
 # ---------------------------------------------------------------------------
@@ -3515,6 +3592,9 @@ def api_security_threats_history():
     session_id = (request.args.get("session_id") or "").strip() or None
     severity = (request.args.get("severity") or "").strip() or None
     since = (request.args.get("since") or "").strip() or None
+    runtime = (request.args.get("runtime") or "").strip().lower() or None
+    if runtime in ("all", "node"):
+        runtime = None
     try:
         limit = max(1, min(1000, int(request.args.get("limit", 200))))
     except (TypeError, ValueError):
@@ -3529,73 +3609,77 @@ def api_security_threats_history():
                 session_id=session_id,
                 severity=severity,
                 since=since,
+                runtime=runtime,
                 limit=limit,
             )
         except Exception:
             rows = None
+        if rows is None and runtime:
+            # Version skew: a daemon older than the runtime kwarg raises rather
+            # than filtering. Retry unfiltered and narrow here — a scoped view
+            # that degrades to node-wide silently would break FLYWHEEL §1c.
+            try:
+                from routes.local_query import local_store_via_daemon
+                rows = local_store_via_daemon(
+                    "query_security_events",
+                    session_id=session_id,
+                    severity=severity,
+                    since=since,
+                    limit=limit,
+                )
+                if rows is not None:
+                    rows = [
+                        r for r in rows
+                        if str((r or {}).get("session_id") or "")
+                        .split(":", 1)[0].lower() == runtime
+                    ]
+            except Exception:
+                rows = None
 
     if rows is None:
         try:
             from clawmetry import local_store as _ls
             rows = _ls.get_store().query_security_events(
-                session_id=session_id, severity=severity, since=since, limit=limit
+                session_id=session_id, severity=severity, since=since,
+                runtime=runtime, limit=limit,
             )
         except Exception:
             rows = []
 
-    return jsonify({"threats": rows or [], "total": len(rows or [])})
-
-
-@bp_health.route("/api/audit-log")
-def api_audit_log():
-    """Return operator audit-log entries from DuckDB (#3306).
-
-    Records human actions (approve, deny, kill_session, config_change, etc.)
-    written via ``ingest_audit_log_entry``. Auth / RBAC enforcement is
-    cloud-side; this endpoint is the OSS read surface.
-
-    Query params:
-      actor      — filter by actor identity
-      action     — filter by action type
-      session_id — narrow to one session
-      since      — ISO timestamp lower bound
-      limit      — max rows (default 200)
-    """
-    actor = (request.args.get("actor") or "").strip() or None
-    action = (request.args.get("action") or "").strip() or None
-    session_id = (request.args.get("session_id") or "").strip() or None
-    since = (request.args.get("since") or "").strip() or None
+    # True severity rollup, counted in SQL. The list above is capped for the
+    # browser; counting it would under-report the tiles on a node that holds
+    # hundreds of findings.
+    counts = None
     try:
-        limit = max(1, min(1000, int(request.args.get("limit", 200))))
-    except (TypeError, ValueError):
-        limit = 200
-
-    rows = None
-    if is_local_store_read_enabled():
-        try:
-            from routes.local_query import local_store_via_daemon
-            rows = local_store_via_daemon(
-                "query_audit_log",
-                actor=actor,
-                action=action,
-                session_id=session_id,
-                since=since,
-                limit=limit,
-            )
-        except Exception:
-            rows = None
-
-    if rows is None:
+        from routes.local_query import local_store_via_daemon
+        counts = local_store_via_daemon(
+            "count_security_events", runtime=runtime, since=since
+        )
+    except Exception:
+        counts = None
+    if counts is None:
         try:
             from clawmetry import local_store as _ls
-            rows = _ls.get_store().query_audit_log(
-                actor=actor, action=action, session_id=session_id,
-                since=since, limit=limit,
+            counts = _ls.get_store().count_security_events(
+                runtime=runtime, since=since
             )
         except Exception:
-            rows = []
+            counts = None
+    if not isinstance(counts, dict):
+        # Last resort: count what we actually have rather than claiming zero.
+        counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0,
+                  "total": len(rows or [])}
+        for r in rows or []:
+            sev = str((r or {}).get("severity") or "").lower()
+            if sev in counts and sev != "total":
+                counts[sev] += 1
 
-    return jsonify({"entries": rows or [], "total": len(rows or [])})
+    return jsonify({
+        "threats": rows or [],
+        "total": len(rows or []),
+        "counts": counts,
+        "scope": runtime or "node",
+    })
 
 
 @bp_health.route("/api/doctor-findings")

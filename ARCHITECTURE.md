@@ -39,7 +39,7 @@ C4Context
 title C1: ClawMetry (open source) system context
 
 Person(dev, "Developer / Operator", "Runs AI agents; wants to see what they do and what they cost")
-System(clawmetry, "ClawMetry", "Local-first, real-time observability for 12 agent runtimes. Reads what your agents already write; never modifies them.")
+System(clawmetry, "ClawMetry", "Local-first, real-time observability for 22 agent runtimes. Reads what your agents already write; never modifies them.")
 
 System_Ext(runtimes, "AI Agent Runtimes", "OpenClaw + NVIDIA NemoClaw (free in OSS) and, with the optional Pro plugin, Claude Code, Codex, Cursor, Goose, Hermes, Aider, NanoClaw, opencode, PicoClaw, Qwen Code")
 System_Ext(gateway, "OpenClaw Gateway", "WebSocket control plane (JSON-RPC, :18789) for live data + cron RPC")
@@ -92,7 +92,7 @@ Rel(daemon, cloud, "E2E snapshot push", "HTTPS")
 
 ## Claude Code as a Second Data Source
 
-ClawMetry also supports **Claude Code** (`~/.claude/projects/`) as a data source via a dedicated dashboard (`dashboard_claudecode.py`). Claude Code stores session transcripts as JSONL files with a similar schema to OpenClaw sessions.
+ClawMetry supports **Claude Code** (`~/.claude/projects/`) as a data source through the main dashboard's runtime scope — pick `claude_code` in the runtime switcher and the same `/api/sessions`, `/api/transcripts`, etc. render its data. Claude Code stores session transcripts as JSONL files with a similar schema to OpenClaw sessions.
 
 ```
 ~/.claude/
@@ -103,11 +103,6 @@ ClawMetry also supports **Claude Code** (`~/.claude/projects/`) as a data source
 │   └── ...more projects
 └── settings.json
 ```
-
-The Claude Code dashboard is a standalone Flask app that can be:
-- Run independently: `python dashboard_claudecode.py --port 8901`
-- Mounted as a Blueprint: `app.register_blueprint(bp_claudecode, url_prefix='/claudecode')`
-- Deployed at `clawmetry.com/claudecode`
 
 Key differences from the OpenClaw data source:
 | Aspect | OpenClaw | Claude Code |
@@ -168,7 +163,7 @@ No environment variables, no config files, no database setup. If OpenClaw is run
 
 ## The Dashboard — What You See
 
-ClawMetry serves a single-page web app (embedded HTML/CSS/JS in the Python file) with these views:
+ClawMetry serves a single-page web app (frontend in `clawmetry/static/` + `clawmetry/templates/`) with these views:
 
 ### Overview (`/api/overview`)
 The main dashboard. Aggregates:
@@ -296,6 +291,9 @@ cloud-only paths.
 builds canary URLs from endpoint names, and fails with guidance when an
 event-data response omits `_source` or reports anything other than
 `local_store`.
+
+### Entitlements & open-core
+ClawMetry is open-core. `clawmetry/entitlements.py` is the single source of truth for what an install is allowed to do; `clawmetry/license.py` verifies self-hosted license keys offline with Ed25519 (using the `cryptography` dep, no new packages); `routes/entitlement.py` exposes the resolved entitlement plus the preview/diff family at `/api/entitlement*`. The resolver currently runs in GRACE mode (every `allows_*` check answers "allowed" regardless of tier), so wiring the gate in changes no behaviour today. See [`docs/ENTITLEMENTS.md`](docs/ENTITLEMENTS.md) for the FREE vs paid split, per-tier feature/capacity matrix, resolution order, and the `clawmetry license` CLI.
 
 ### Dependencies
 Minimal by design:

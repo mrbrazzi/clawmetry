@@ -26,13 +26,14 @@ mechanical move — zero behaviour change.
 
 import json
 import os
-import select
+import re
 import sqlite3
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, Response, jsonify, request
+from clawmetry._gate import gate
 from clawmetry.config import is_local_store_read_enabled, hide_clawmetry_session
 
 bp_logs = Blueprint('logs', __name__)
@@ -69,10 +70,11 @@ def resolve_gateway_log_path():
     # don't depend on glob's stat behaviour, then pick the most recent by
     # mtime — falling back to filename order if mtime can't be read.
     tmp_dir = "/tmp/openclaw"
+    _default_log_re = re.compile(r"openclaw-\d{4}-\d{2}-\d{2}\.log$")
     try:
         names = [
             n for n in os.listdir(tmp_dir)
-            if n.startswith("openclaw-") and n.endswith(".log")
+            if _default_log_re.search(n)
         ]
     except Exception:
         names = []
@@ -92,6 +94,16 @@ bp_config = Blueprint('config', __name__)
 
 @bp_logs.route("/api/logs")
 def api_logs():
+    # Runtime-aware dispatch: ?runtime=<rt> for any non-openclaw runtime is
+    # served via the adapter registry's log_sources() contract. Absent or
+    # 'openclaw' -> the legacy dated-file path below, byte-for-byte
+    # backward compatible.
+    runtime = (request.args.get("runtime") or "").strip().lower()
+    if runtime and runtime != "openclaw":
+        from helpers.logs import read_runtime_logs
+        lines_count = int(request.args.get("lines", 100))
+        return jsonify(read_runtime_logs(runtime, lines_count))
+
     import dashboard as _d
     lines_count = int(request.args.get("lines", 100))
     date_str = request.args.get("date", datetime.now().strftime("%Y-%m-%d"))
@@ -874,47 +886,306 @@ def api_flow_lanes():
     })
 
 
+def _generate_openclaw_json_logs(started_at, sse_max_seconds, release_fn):
+    """Yield SSE events from ``openclaw logs --follow --json``.
+
+    OpenClaw's JSON log stream emits type-tagged records that include
+    rotation/truncation notices (type ``notice``), file/service metadata
+    (type ``meta``), parsed log entries (type ``log``), raw unparsed lines
+    (type ``raw``), and gateway errors (type ``error``).  Surfacing the
+    ``notice`` records lets the UI warn users when lines were dropped due
+    to log rotation — something ``tail -f`` on a fixed path cannot detect.
+
+    Non-JSON lines are forwarded as-is (forward-compat with future plain
+    text output).  Callers must check ``shutil.which("openclaw")`` before
+    calling; this generator assumes the binary is available.
+    """
+    import shutil as _shutil
+
+    from clawmetry.process_control import PipeLineReader
+
+    # Resolve through which(): on Windows the openclaw CLI is an npm
+    # ``openclaw.cmd`` wrapper, and CreateProcess only launches it when
+    # given the full name with extension — a bare "openclaw" argv raised
+    # FileNotFoundError (WinError 2) mid-stream, after headers were sent.
+    proc = subprocess.Popen(
+        [_shutil.which("openclaw") or "openclaw", "logs", "--follow", "--json"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    # select() on a pipe is POSIX-only; the reader thread is portable.
+    reader = PipeLineReader(proc.stdout)
+    try:
+        while True:
+            if time.time() - started_at > sse_max_seconds:
+                yield 'event: done\ndata: {"reason":"max_duration_reached"}\n\n'
+                break
+            raw_line = reader.readline(1.0)
+            if raw_line is None:
+                if reader.eof:
+                    yield 'event: done\ndata: {"reason":"stream_ended"}\n\n'
+                    break
+                continue
+            raw = raw_line.rstrip()
+            try:
+                record = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                yield f"data: {json.dumps({'line': raw})}\n\n"
+                continue
+            rec_type = record.get("type", "")
+            if rec_type == "notice":
+                # Rotation / truncation hint — emit as a named event so the
+                # frontend can surface "log rotated — some lines may be missing"
+                yield f"event: log-notice\ndata: {json.dumps(record)}\n\n"
+            elif rec_type == "meta":
+                # File/service metadata (file, source, sourceKind, service …)
+                yield f"event: log-meta\ndata: {json.dumps(record)}\n\n"
+            elif rec_type == "error":
+                msg = record.get("message") or record.get("error") or raw
+                yield f"data: {json.dumps({'line': msg, 'error': True})}\n\n"
+            else:
+                # log, raw, unknown — forward the human-readable message field
+                msg = record.get("message") or record.get("line") or raw
+                yield f"data: {json.dumps({'line': msg})}\n\n"
+    except GeneratorExit:
+        pass
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        release_fn()
+
+
+def _generate_runtime_log_stream(runtime, started_at, sse_max_seconds, release_fn):
+    """SSE generator for /api/logs-stream?runtime=<rt> (non-openclaw).
+
+    Source preference:
+      1. file source        -> initial tail (last 50) + pure-Python follow
+      2. follow_command     -> Popen + PipeLineReader (docker logs -f style)
+      3. command w/ path    -> poll-tail the file (same as 1)
+      4. nothing            -> ONE honest {"available": false, "reason"} event,
+                               then a clean ``done`` — never an HTTP error.
+    Event shapes:
+      event: log-meta  data: {"runtime", "available": true, "label", "source"}
+      data: {"line": "..."}                       (each log line)
+      data: {"available": false, "runtime", "reason"}   (no source case)
+      event: done      data: {"reason": "..."}
+    """
+    from helpers.logs import (
+        _read_source_tail,
+        _source_display,
+        resolve_runtime_log_sources,
+    )
+
+    try:
+        adapter, sources, reason = resolve_runtime_log_sources(runtime)
+        if not sources:
+            yield "data: " + json.dumps(
+                {"available": False, "runtime": runtime, "reason": reason}
+            ) + "\n\n"
+            yield 'event: done\ndata: {"reason":"no_log_source"}\n\n'
+            return
+
+        # Pick the followable source per the preference order above.
+        file_src = next(
+            (
+                s for s in sources
+                if s.kind == "file" and s.path and os.path.isfile(s.path)
+            ),
+            None,
+        )
+        cmd_src = next((s for s in sources if s.follow_command), None)
+        path_fallback = next(
+            (s for s in sources if s.path and os.path.isfile(s.path)), None
+        )
+
+        if file_src is not None or (cmd_src is None and path_fallback is not None):
+            src = file_src or path_fallback
+            yield "event: log-meta\ndata: " + json.dumps(
+                {
+                    "runtime": runtime,
+                    "available": True,
+                    "label": src.label,
+                    "source": src.path,
+                    "format": src.format,
+                }
+            ) + "\n\n"
+            initial = _read_source_tail(src, 50) or []
+            for line in initial:
+                yield f"data: {json.dumps({'line': line})}\n\n"
+            try:
+                fh = open(src.path, "r", encoding="utf-8", errors="replace")
+            except OSError:
+                yield 'event: done\ndata: {"reason":"log_file_unreadable"}\n\n'
+                return
+            fh.seek(0, 2)
+            try:
+                while True:
+                    if time.time() - started_at > sse_max_seconds:
+                        yield 'event: done\ndata: {"reason":"max_duration_reached"}\n\n'
+                        break
+                    line = fh.readline()
+                    if not line:
+                        time.sleep(1.0)
+                        continue
+                    yield f"data: {json.dumps({'line': line.rstrip()})}\n\n"
+            finally:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+            return
+
+        if cmd_src is not None:
+            from clawmetry.process_control import PipeLineReader
+
+            yield "event: log-meta\ndata: " + json.dumps(
+                {
+                    "runtime": runtime,
+                    "available": True,
+                    "label": cmd_src.label,
+                    "source": _source_display(cmd_src),
+                    "format": cmd_src.format,
+                }
+            ) + "\n\n"
+            try:
+                proc = subprocess.Popen(
+                    list(cmd_src.follow_command),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,  # docker logs writes to stderr
+                    text=True,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                yield "data: " + json.dumps(
+                    {
+                        "available": False,
+                        "runtime": runtime,
+                        "reason": f"follow command failed to start: {exc}",
+                    }
+                ) + "\n\n"
+                yield 'event: done\ndata: {"reason":"follow_command_failed"}\n\n'
+                return
+            reader = PipeLineReader(proc.stdout)
+            try:
+                while True:
+                    if time.time() - started_at > sse_max_seconds:
+                        yield 'event: done\ndata: {"reason":"max_duration_reached"}\n\n'
+                        break
+                    raw_line = reader.readline(1.0)
+                    if raw_line is None:
+                        if reader.eof:
+                            yield 'event: done\ndata: {"reason":"stream_ended"}\n\n'
+                            break
+                        continue
+                    yield f"data: {json.dumps({'line': raw_line.rstrip()})}\n\n"
+            finally:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            return
+
+        # Sources exist on paper but nothing is followable right now.
+        yield "data: " + json.dumps(
+            {
+                "available": False,
+                "runtime": runtime,
+                "reason": "log source(s) present but not followable "
+                          "(no readable file, no follow-style command)",
+            }
+        ) + "\n\n"
+        yield 'event: done\ndata: {"reason":"no_followable_source"}\n\n'
+    except GeneratorExit:
+        pass
+    finally:
+        release_fn()
+
+
 @bp_logs.route("/api/logs-stream")
 def api_logs_stream():
     """SSE endpoint - streams new log lines in real-time."""
+    import shutil
+
+    # Runtime-aware dispatch: any non-openclaw runtime streams via its
+    # adapter's log_sources(). Kept ahead of the openclaw fast path so the
+    # legacy behaviour (absent / 'openclaw') is untouched.
+    runtime = (request.args.get("runtime") or "").strip().lower()
+    if runtime and runtime != "openclaw":
+        try:
+            import dashboard as _d
+            if not _d._acquire_stream_slot("log"):
+                return jsonify({"error": "Too many active log streams"}), 429
+            _release = lambda: _d._release_stream_slot("log")  # noqa: E731
+            _max_secs = _d.SSE_MAX_SECONDS
+        except Exception:
+            # Hermetic contexts (blueprint mounted without dashboard):
+            # degrade to no slot accounting rather than 500.
+            _release = lambda: None  # noqa: E731
+            _max_secs = 3600
+        return Response(
+            _generate_runtime_log_stream(
+                runtime, time.time(), _max_secs, _release
+            ),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     import dashboard as _d
     if not _d._acquire_stream_slot("log"):
         return jsonify({"error": "Too many active log streams"}), 429
 
+    started_at = time.time()
+    release = lambda: _d._release_stream_slot("log")  # noqa: E731
+
+    # Prefer the structured JSON stream when the openclaw CLI is available;
+    # it handles log rotation transparently and surfaces truncation notices.
+    if shutil.which("openclaw"):
+        return Response(
+            _generate_openclaw_json_logs(started_at, _d.SSE_MAX_SECONDS, release),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # Fallback: tail the log file directly (no JSON framing, no rotation signal)
     today = datetime.now().strftime("%Y-%m-%d")
     log_file = _d._find_log_file(today)
 
     def generate():
-        started_at = time.time()
         if not log_file:
             yield 'data: {"line":"No log file found"}\n\n'
-            _d._release_stream_slot("log")
+            release()
             return
-        proc = subprocess.Popen(
-            ["tail", "-f", "-n", "0", log_file],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        # Pure-Python follow (tail -f -n 0 semantics: only new lines).
+        # ``tail`` does not exist on Windows and select() on a pipe is
+        # POSIX-only, so the subprocess approach broke this stream there;
+        # reading the file directly needs neither.
+        try:
+            fh = open(log_file, "r", encoding="utf-8", errors="replace")
+        except OSError:
+            yield 'data: {"line":"Cannot open log file"}\n\n'
+            release()
+            return
+        fh.seek(0, 2)
         try:
             while True:
                 if time.time() - started_at > _d.SSE_MAX_SECONDS:
                     yield 'event: done\ndata: {"reason":"max_duration_reached"}\n\n'
                     break
-                ready, _, _ = select.select([proc.stdout], [], [], 1.0)
-                if not ready:
+                line = fh.readline()
+                if not line:
+                    time.sleep(1.0)
                     continue
-                line = proc.stdout.readline()
-                if line:
-                    yield f"data: {json.dumps({'line': line.rstrip()})}\n\n"
+                yield f"data: {json.dumps({'line': line.rstrip()})}\n\n"
         except GeneratorExit:
             pass
         finally:
             try:
-                proc.kill()
+                fh.close()
             except Exception:
                 pass
-            _d._release_stream_slot("log")
+            release()
 
     return Response(
         generate(),
@@ -1493,9 +1764,20 @@ def api_memory_access():
 
 @bp_security.route("/api/security/threats")
 def api_security_threats():
-    """Scan recent agent activity for security threats using built-in signatures."""
+    """Live signature scan over recent agent activity.
+
+    Findings persisted by a connected agent-EDR (numbat) are a separate,
+    durable feed served by ``/api/security-threats`` and rendered by the
+    "Recorded findings" panel — they are deliberately NOT merged here, so the
+    same finding never appears twice on one screen. The page-level verdict
+    (tiles + all-clear line) combines both; see ``loadSecurityPage``.
+
+    ``?runtime=<id>`` scopes the scan to one runtime; without it the response
+    is node-wide and says so via ``scope``.
+    """
     import dashboard as _d
     from routes.brain import api_brain_history
+    runtime = (request.args.get("runtime") or "").strip().lower() or None
     try:
         # Call brain-history endpoint internally
         brain_resp = api_brain_history()
@@ -1504,7 +1786,7 @@ def api_security_threats():
     except Exception:
         events = []
 
-    threats, counts = _d._scan_events_for_threats(events)
+    threats, counts = _d._scan_events_for_threats(events, runtime=runtime)
 
     # Fire alerts for critical/high threats (with cooldown via _fire_alert)
     for t in threats:
@@ -1542,8 +1824,108 @@ def api_security_threats():
             pass
 
     return jsonify(
-        {"threats": threats, "counts": counts, "scanned_events": len(events)}
+        {
+            "threats": threats,
+            "counts": counts,
+            "scanned_events": len(events),
+            "scope": runtime or "node",
+        }
     )
+
+
+@bp_security.route("/api/numbat/ingest", methods=["POST"])
+def api_numbat_ingest():
+    """Receive Perplexity numbat NDJSON records over HTTP.
+
+    numbat (github.com/perplexityai/numbat) POSTs application/x-ndjson
+    batches from its HTTP sink; any 2xx acknowledges. Wire it with:
+
+        numbat hook install --agent all --emit all --output file \\
+            --output http --http-url http://127.0.0.1:8900/api/numbat/ingest
+
+    Loopback needs no numbat auth flags; for remote delivery use numbat's
+    ``--http-auth bearer`` with NUMBAT_HTTP_TOKEN set to the gateway token —
+    the global /api/* before_request check validates it. Duplicate batches
+    are expected (numbat retries); all mapped ids are deterministic and the
+    store upserts, so replays are no-ops. finding → security_events,
+    enforcement → guardrail_events (mapper: clawmetry/numbat_ingest.py).
+    The durable path is the daemon's file tail (sync_numbat_events) — this
+    endpoint is the low-latency supplement, and the two dedupe by id.
+    """
+    import dashboard as _d
+    from clawmetry import numbat_ingest as _ni
+
+    raw = request.get_data(cache=False)
+    if not raw:
+        return jsonify({"ok": True, "ingested": 0, "note": "empty body"})
+    if len(raw) > 32 * 1024 * 1024:
+        return jsonify({"error": "body too large"}), 413
+    if (request.headers.get("Content-Encoding") or "").lower() == "gzip":
+        import gzip as _gzip
+        try:
+            raw = _gzip.decompress(raw)
+        except Exception:
+            return jsonify({"error": "bad gzip body"}), 400
+
+    records, bad_lines = _ni.parse_records(raw.decode("utf-8", errors="replace"))
+    mapped = _ni.map_records(records)  # no node_id: shadow rows are daemon-side
+
+    ingested = 0
+    errors = 0
+    try:
+        from routes.local_query import local_store_via_daemon
+        from clawmetry import local_store as _ls_mod
+
+        def _write(method: str, ev: dict) -> None:
+            nonlocal ingested, errors
+            try:
+                result = local_store_via_daemon(method, event=ev)
+                if result is None:
+                    getattr(_ls_mod.get_store(), method)(ev)
+                ingested += 1
+            except Exception:
+                errors += 1
+
+        for sec in mapped["security_events"]:
+            _write("ingest_security_event", sec)
+        for gr in mapped["guardrail_events"]:
+            _write("ingest_guardrail_event", gr)
+    except Exception:
+        errors += len(mapped["security_events"]) + len(mapped["guardrail_events"])
+
+    # Critical/high findings ping the operator now (cooldown via _fire_alert),
+    # mirroring /api/security/threats. Rule-based alerting over shadow rows
+    # covers the file-tail path; this covers HTTP-only setups.
+    for rec in mapped["findings_raw"]:
+        # Live findings only: a `numbat scan` backfill of historical
+        # transcripts can emit thousands at once and must never page.
+        if rec.get("severity") in ("critical", "high") and _ni.is_live_finding(rec):
+            try:
+                _d._fire_alert(
+                    rule_id=f"numbat_{rec.get('rule_id', 'finding')}",
+                    alert_type="numbat_finding",
+                    message=(
+                        f"🛡️ numbat: {str(rec.get('severity', '')).upper()} — "
+                        f"{rec.get('title', rec.get('rule_id', 'finding'))}"
+                        f" [{rec.get('source_agent', '?')}]"
+                    ),
+                    channels=["banner", "telegram"],
+                )
+            except Exception:
+                pass
+
+    return jsonify({
+        "ok": errors == 0,
+        "ingested": ingested,
+        "findings": len(mapped["security_events"]),
+        "enforcements": len(mapped["guardrail_events"]),
+        "skipped_events": mapped["skipped_events"],
+        "skipped_schema": mapped["skipped_schema"],
+        "skipped_other": mapped["skipped_other"],
+        "bad_lines": bad_lines,
+        "errors": errors,
+        "_source": "local_store",
+    })
 
 
 @bp_security.route("/api/security/signatures")
@@ -1568,11 +1950,17 @@ def api_security_signatures():
 
 @bp_security.route("/api/security/posture")
 def api_security_posture():
-    """Scan OpenClaw configuration for security misconfigurations and return a posture score."""
-    import dashboard as _d
+    """Runtime-aware security posture scan.
+
+    ``?runtime=<rt>`` selects the provider (clawmetry.security_posture
+    registry); absent -> 'openclaw' for backward compatibility. Runtimes
+    without a provider return an honest ``status: not_available`` envelope
+    with HTTP 200 — "no checks yet" is a state, not an error.
+    """
+    runtime = (request.args.get("runtime") or "openclaw").strip().lower()
     try:
-        result = _d._scan_security_posture()
-        return jsonify(result)
+        from clawmetry.security_posture import get_posture
+        return jsonify(get_posture(runtime))
     except Exception as e:
         return jsonify({"error": str(e), "score": "U", "checks": []}), 500
 
@@ -1649,13 +2037,19 @@ def _integrity_status() -> dict:
         }
     status = raw.get("status") or "unknown"
     return {
-        # ``ok`` is True only when the chain verified, False when broken,
-        # None when there's nothing stamped yet (empty / unknown).
+        # ``ok`` is True only when the chain verified end to end, False when a
+        # record was altered or removed, None otherwise — including the
+        # "degraded" verdict (every event matches its own hash, but some could
+        # not be placed in one ordered chain). None is the safe value for a
+        # stale cached frontend: it renders the neutral state rather than
+        # shouting "Tampered" about a linkage artefact.
         "ok": True if status == "valid" else (False if status == "invalid" else None),
         "status": status,
         "chain_length": int(raw.get("checked") or 0),
         "pre_chain": int(raw.get("pre_chain") or 0),
         "first_break": raw.get("broken_at"),
+        "unlinked": int(raw.get("unlinked") or 0),
+        "fork_points": int(raw.get("fork_points") or 0),
         "error": raw.get("error"),
     }
 
@@ -1677,12 +2071,17 @@ def api_security_integrity():
 
 
 @bp_security.route("/api/security/audit")
+@gate("audit_logs")
 def api_security_audit():
     """Recent Enterprise audit-log activity for the Security tab.
 
-    Thin mirror of ``/api/audit-log`` (entitlement-gated there) scoped to a
-    small recent window for the tab's recent-activity feed. Never raises —
-    an empty list paints an honest "nothing recorded yet" state."""
+    Thin mirror of ``/api/audit-log`` scoped to a small recent window for
+    the tab's recent-activity feed. Gated on ``audit_logs`` because it
+    reads the same store and returns the same rows — leaving it open
+    would let a Free/Starter/Pro caller sidestep the ``@gate`` on
+    ``routes/audit.py`` by hitting the mirror URL instead. Grace mode
+    (the default) still lets the request through. Never raises — an
+    empty list paints an honest "nothing recorded yet" state."""
     try:
         from clawmetry import audit as _audit
         try:
@@ -1773,8 +2172,16 @@ def api_llmfit():
 
 
 @bp_config.route("/api/cost-optimizer")
+@gate("cost_optimizer")
 def api_cost_optimizer():
-    """Enhanced cost optimizer: llmfit recommendations + task-level suggestions."""
+    """Enhanced cost optimizer: llmfit recommendations + task-level suggestions.
+
+    Gated on the ``cost_optimizer`` entitlement (Pro-only). In grace mode
+    the gate is transparent so free installs continue to see the current
+    behaviour; in enforce mode this route 402s with the standard
+    ``upgrade_required`` envelope shared with every other ``@gate``d paid
+    feature.
+    """
     import dashboard as _d
     import shutil
 
@@ -1981,8 +2388,15 @@ def api_cost_optimizer():
 
 
 @bp_config.route("/api/cost-optimization")
+@gate("cost_optimizer")
 def api_cost_optimization():
     """Cost optimization analysis and local model fallback recommendations.
+
+    Gated on the ``cost_optimizer`` entitlement (Pro-only). Sibling of
+    ``/api/cost-optimizer``; both endpoints render slices of the same
+    cost-optimizer surface, so they share one feature key. Grace-mode
+    default keeps the current OSS behaviour unchanged; enforce mode 402s
+    with the standard ``upgrade_required`` envelope.
 
     Tier-1 DuckDB fast path (refs #1565): the legacy ``_get_cost_summary``
     / ``_get_expensive_operations`` helpers read ``dashboard._metrics_store``

@@ -14,16 +14,16 @@ name: Apply required E2E status checks (C6 -- one-shot)
 #                      local clone, no gh CLI, no secret setup needed.
 #                      The token is masked via ::add-mask:: before use.
 #
-#   push to main -- self-healing: re-verifies checks on every merge.
-#     GITHUB_TOKEN path: read-only verify + exit 1 if not configured
-#                        (red badge = forcing signal), exit 0 when done.
-#     E2E_ADMIN_PAT set: applies and verifies branch protection.
+#   push to main -- runs apply_required_status_checks.py.
+#     With only GITHUB_TOKEN (ghs_): read-only verify path in the script
+#     (exits 0 if C6 configured, exits 1 if not -- no admin rights needed).
+#     With E2E_ADMIN_PAT: full apply + verify.
+#     On failure, posts a notification comment on tracking issue #4552.
 #
 # TOKEN PATHS (priority order):
 #   1. inputs.pat_token  -- PAT typed into the Run workflow dialog
 #   2. secrets.E2E_ADMIN_PAT -- pre-stored repo secret
-#   3. github.token (ghs_) -- read-only fallback; exits 1 until C6 is
-#                              closed, then self-heals to exit 0 (green).
+#   3. github.token (ghs_) -- read-only verify via public branch endpoint
 #
 # NOTE: administration:write is intentionally absent from permissions.
 #   It is NOT a valid GITHUB_TOKEN permission in Actions; requesting it
@@ -37,7 +37,7 @@ name: Apply required E2E status checks (C6 -- one-shot)
 #   clawmetry-landing.
 #
 # Idempotent: running multiple times is safe.
-# Tracking: vivekchand/clawmetry#2146 (C6)
+# Tracking: vivekchand/clawmetry#4552
 
 on:
   workflow_dispatch:
@@ -58,9 +58,11 @@ on:
     branches: [main]
 
 # contents:read is required for actions/checkout.
+# issues:write is required for the C6 gap notification step.
 # administration:write is intentionally absent (see note above).
 permissions:
   contents: read
+  issues: write
 
 jobs:
   apply-required-checks:
@@ -83,23 +85,21 @@ jobs:
             echo "    clawmetry, clawmetry-cloud, clawmetry-landing"
           elif [ -n "${{ inputs.pat_token }}" ]; then
             echo "  Using pat_token input -- will apply to all 3 repos:"
-            echo "  clawmetry         : OSS golden path (wheel + OpenClaw + 9 tabs)"
-            echo "  clawmetry         : Cross-repo handoff (C4)"
-            echo "  clawmetry         : MOAT Keystone (13-endpoint bar)"
-            echo "  clawmetry         : E2E Browser Tests (critical subset)"
+            echo "  clawmetry         : E2E Gate (required)"
             echo "  clawmetry-cloud   : Cloud golden-path browser E2E"
             echo "  clawmetry-landing : Landing golden path (C3)"
           else
             echo "  Using E2E_ADMIN_PAT secret -- will apply to all 3 repos:"
-            echo "  clawmetry         : OSS golden path (wheel + OpenClaw + 9 tabs)"
-            echo "  clawmetry         : Cross-repo handoff (C4)"
-            echo "  clawmetry         : MOAT Keystone (13-endpoint bar)"
-            echo "  clawmetry         : E2E Browser Tests (critical subset)"
+            echo "  clawmetry         : E2E Gate (required)"
             echo "  clawmetry-cloud   : Cloud golden-path browser E2E"
             echo "  clawmetry-landing : Landing golden path (C3)"
           fi
           echo ""
           echo "  Deprecated checks removed if present:"
+          echo "  clawmetry : OSS golden path (wheel + OpenClaw + 9 tabs)"
+          echo "  clawmetry : Cross-repo handoff (C4)"
+          echo "  clawmetry : MOAT Keystone (13-endpoint bar)"
+          echo "  clawmetry : E2E Browser Tests (critical subset)"
           echo "  clawmetry : visual-diff (paths: filter -- stalls non-UI PRs)"
           echo ""
           echo "Re-run with confirm=APPLY to apply."
@@ -109,8 +109,62 @@ jobs:
         run: echo "::add-mask::${{ inputs.pat_token }}"
 
       - name: Apply required status checks
+        id: c6_verify
         if: github.event_name == 'push' || github.event.inputs.confirm == 'APPLY'
         env:
           GITHUB_TOKEN: ${{ inputs.pat_token || secrets.E2E_ADMIN_PAT || github.token }}
           CONFIRM_INPUT: ${{ inputs.confirm || '' }}
         run: python3 scripts/apply_required_status_checks.py
+
+      # When the C6 read-only verify exits 1 (checks not yet configured on main),
+      # post or update a comment on the E2E Robustness tracking issue #4552 so the
+      # repo admin receives a GitHub notification.
+      #
+      # Only fires on push-to-main (the automated verify path), NOT on manual
+      # workflow_dispatch runs (those already have the confirm/pat_token UI in-scope).
+      # Also skips if checkout failed (c6_verify would be skipped, not failed).
+      - name: Notify tracking issue when C6 checks are missing
+        if: failure() && github.event_name == 'push' && steps.c6_verify.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          MARKER="<!-- c6-notify-bot -->"
+          RUN_URL="https://github.com/${REPO}/actions/runs/${{ github.run_id }}"
+          BODY="${MARKER}
+          ## C6: Required status checks not configured on clawmetry/main
+
+          The [apply-required-checks workflow](${RUN_URL}) detected that required E2E status checks are NOT configured on \`clawmetry/main\`. PRs can currently merge without E2E passing.
+
+          **Missing check (1 name to add in GitHub Settings):**
+          - \`E2E Gate (required)\`
+
+          **Fix option A (60 seconds, no PAT needed -- GitHub Settings UI):**
+          Go to: https://github.com/vivekchand/clawmetry/settings/branches
+          Edit main > Require status checks > add the name above.
+
+          **Fix option B (30 seconds, terminal):**
+          \`\`\`bash
+          bash scripts/close-c6.sh
+          \`\`\`
+
+          **Fix option C (Actions one-shot, fine-grained PAT with Administration read+write):**
+          Actions > 'Apply required E2E status checks (C6 -- one-shot)' > Run workflow
+          confirm=APPLY, pat_token=paste-token-here
+
+          Once any option above is done, the next push to main self-heals to green."
+
+          # Upsert: update existing comment if present, otherwise create new.
+          existing_id=$(gh api -X GET \
+            "repos/${REPO}/issues/4552/comments" \
+            --jq 'map(select(.body | startswith("<!-- c6-notify-bot -->"))) | .[0].id // empty' \
+            2>/dev/null || echo "")
+          if [ -n "${existing_id}" ]; then
+            gh api -X PATCH "repos/${REPO}/issues/comments/${existing_id}" \
+              -f body="${BODY}" > /dev/null
+            echo "Updated existing C6 notification on #4552 (comment ${existing_id})"
+          else
+            gh api -X POST "repos/${REPO}/issues/4552/comments" \
+              -f body="${BODY}" > /dev/null
+            echo "Posted new C6 notification on #4552"
+          fi

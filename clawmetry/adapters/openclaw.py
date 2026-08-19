@@ -1,5 +1,4 @@
-"""OpenClawAdapter — thin wrapper around existing dashboard.py helpers.
-
+"""
 This adapter does NOT re-implement OpenClaw session parsing. It delegates
 to the long-standing helpers in ``dashboard.py`` via a late import, the
 same way ``routes/*.py`` modules do. The point of this file is to expose
@@ -12,16 +11,28 @@ identical to the pre-refactor dashboard.
 """
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import logging
 import os
+import re
+import tempfile
 import time as _time
 from typing import List, Optional, Set
 
 from .base import AgentAdapter, Capability, DetectResult, Event, Session
 
 logger = logging.getLogger("clawmetry.adapters.openclaw")
+
+# Gateway log filename patterns (#4055, #4056):
+#   default profile          : openclaw-YYYY-MM-DD.log
+#   named profiles (#4055)   : openclaw-{name}-YYYY-MM-DD.log
+#   rotation archives (#4056): openclaw-YYYY-MM-DD.N.log
+#   named + rotated          : openclaw-{name}-YYYY-MM-DD.N.log
+# (.+-)? matches named profiles; (\.\d+)? matches rotation archives; the date
+# anchor excludes unrelated files (openclaw-debug.log, etc.).
+_DEFAULT_LOG_RE = re.compile(r"openclaw-(.+-)?\d{4}-\d{2}-\d{2}(\.\d+)?\.log$")
 
 # NeMo Guardrails compact tool-catalog injects these three meta-tool names into
 # the JSONL transcript when NEMOCLAW_TOOL_CATALOG is active. They are guardrail
@@ -78,7 +89,13 @@ def _d():
 
 def _gateway_live() -> bool:
     """True only if the OpenClaw gateway is actually up (pid alive or port
-    18789 listening). Never raises."""
+    18789 listening). Never raises.
+
+    When ``OPENCLAW_SUPERVISOR_MODE=external`` is set, a ``False`` return
+    during a restart-handoff is an expected transient, not a failure.
+    Callers should check ``gatewayInRestartHandoff`` in
+    ``DetectResult.meta`` (set by ``detect()``) for the full picture.
+    """
     home = os.environ.get("OPENCLAW_HOME") or os.path.expanduser("~/.openclaw")
     pid_file = os.path.join(home, "gateway", "gateway.pid")
     try:
@@ -86,8 +103,12 @@ def _gateway_live() -> bool:
             with open(pid_file) as fh:
                 pid = int((fh.read() or "0").strip())
             if pid > 0:
-                os.kill(pid, 0)
-                return True
+                # Portable probe: os.kill(pid, 0) never raises on Windows,
+                # so a stale gateway.pid would read as "running" forever.
+                from clawmetry.process_control import is_alive as _pid_alive
+
+                if _pid_alive(pid):
+                    return True
     except (OSError, ValueError):
         pass
     try:
@@ -359,6 +380,24 @@ def _resolve_minimax_base_url() -> str:
     return val or "https://api.minimax.chat/v1"
 
 
+def _resolve_llamacpp_base_url() -> str:
+    """Return the active llama.cpp server base URL from env var or the default.
+
+    LLAMA_CPP_HOST overrides; falls back to the llama.cpp server default port.
+    """
+    val = os.environ.get("LLAMA_CPP_HOST", "").strip()
+    return val or "http://localhost:8080/v1"
+
+
+def _resolve_lmstudio_base_url() -> str:
+    """Return the active LM Studio server base URL from env var or the default.
+
+    LMSTUDIO_HOST overrides; falls back to LM Studio's default port.
+    """
+    val = os.environ.get("LMSTUDIO_HOST", "").strip()
+    return val or "http://localhost:1234/v1"
+
+
 def _list_ollama_models(host: str) -> list:
     """Return available Ollama model names. Never raises; returns [] on failure.
 
@@ -449,6 +488,231 @@ def _openshell_sandbox_ocsf_enabled(name: str) -> dict:
         return {}
 
 
+def _read_logging_file_config() -> str:
+    """Read ``logging.file`` from openclaw.json and return the path string.
+
+    openclaw.json can redirect gateway log output to an arbitrary path via
+    ``{"logging": {"file": "/custom/path/openclaw.log"}}``.  Returns the
+    string value when present, empty string otherwise.  Never raises (#4054).
+    """
+    try:
+        home = os.environ.get("OPENCLAW_HOME") or os.path.expanduser("~/.openclaw")
+        cfg_path = os.path.join(home, "openclaw.json")
+        if not os.path.isfile(cfg_path):
+            alt = os.path.expanduser("~/.clawdbot/openclaw.json")
+            if os.path.isfile(alt):
+                cfg_path = alt
+            else:
+                return ""
+        with open(cfg_path) as _fh:
+            cfg = json.load(_fh)
+        if not isinstance(cfg, dict):
+            return ""
+        logging_cfg = cfg.get("logging")
+        if not isinstance(logging_cfg, dict):
+            return ""
+        log_file = logging_cfg.get("file")
+        return str(log_file) if log_file else ""
+    except Exception:
+        return ""
+
+
+def _gateway_log_files() -> list:
+    """Return the newest-5 rotating gateway log files across known candidate dirs.
+
+    The gateway writes dated, rotating JSONL logs to ``{log_dir}/openclaw-YYYY-MM-DD.log``
+    (rotates at 100 MB, keeps up to 5 archives). Candidate directories mirror the
+    log_dir resolution logic in ``sync.py``'s ``_get_paths()``.
+    Never raises; returns an empty list when no log files are found.
+    """
+    openclaw_dir = os.environ.get(
+        "CLAWMETRY_OPENCLAW_DIR", os.path.expanduser("~/.openclaw")
+    )
+    candidates = [
+        "/tmp/openclaw",
+        os.path.join(openclaw_dir, "logs"),
+    ]
+
+    # If openclaw.json sets logging.file, check that path's parent directory
+    # first so installs with a custom log location are visible (#4054).
+    custom_log_file = _read_logging_file_config()
+    if custom_log_file:
+        custom_dir = os.path.dirname(os.path.abspath(custom_log_file))
+        if custom_dir not in candidates:
+            candidates.insert(0, custom_dir)
+
+    # On Windows and on hosts where /tmp/openclaw is unsafe the gateway writes
+    # to a user-scoped openclaw-* directory under the OS temp dir instead.
+    tmp_base = tempfile.gettempdir()
+    for entry in sorted(glob.glob(os.path.join(tmp_base, "openclaw-*"))):
+        if os.path.isdir(entry):
+            candidates.append(entry)
+    for d in candidates:
+        matches = sorted(
+            m for m in glob.glob(os.path.join(d, "openclaw-*.log"))
+            if _DEFAULT_LOG_RE.search(os.path.basename(m))
+        )
+        if matches:
+            return matches[-5:]
+
+    # Fallback: if logging.file points to a single file that doesn't match the
+    # rotation naming pattern, return it directly so callers still see events.
+    if custom_log_file and os.path.isfile(custom_log_file):
+        return [custom_log_file]
+
+    return []
+
+
+def _gateway_log_meta() -> dict:
+    """Return gateway log metadata for detect(): dir, archive count, current file size.
+
+    Surfaces ``gatewayLogDir``, ``gatewayLogArchiveCount``, and
+    ``gatewayLogCurrentSizeKb`` so the dashboard can show log location and
+    rotation state for plain OpenClaw installs. Returns ``{}`` when no log
+    files are present (non-OpenClaw host or gateway never started).
+    Never raises.
+    """
+    try:
+        files = _gateway_log_files()
+        if not files:
+            return {}
+        result: dict = {
+            "gatewayLogDir": os.path.dirname(files[0]),
+            "gatewayLogArchiveCount": len(files),
+        }
+        try:
+            result["gatewayLogCurrentSizeKb"] = round(
+                os.path.getsize(files[-1]) / 1024, 1
+            )
+        except OSError:
+            pass
+        return result
+    except Exception:
+        return {}
+
+
+def _gateway_log_events(count: int = 50) -> list:
+    """Return the last ``count`` structured events from the gateway log file.
+
+    The gateway writes line-delimited JSON to rotating ``openclaw-*.log`` files
+    (same paths as ``_gateway_log_files()``).  Each line carries at minimum
+    ``level`` and ``msg``; most also carry ``subsystem`` and a timestamp field
+    (``time``, ``ts``, or ``timestamp``).
+
+    Falls back to the ``gateway.logs`` WebSocket RPC when no local log files
+    are accessible (remote / containerised gateway with no shared filesystem).
+    Closes #4057.
+
+    Returns a list of event dicts, newest-first.  Returns ``[]`` when no log
+    file exists, on any parse error, or on non-OpenClaw hosts.  Never raises.
+
+    Closes #3991.
+    """
+    try:
+        files = _gateway_log_files()
+        if not files:
+            return _gateway_log_events_rpc(count)
+        log_path = files[-1]
+        # Read a trailing chunk large enough to hold ``count`` typical lines
+        # (~300 bytes each) without loading the full (potentially large) log.
+        chunk_size = max(8192, count * 300)
+        try:
+            with open(log_path, "rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - chunk_size))
+                raw_bytes = fh.read()
+        except OSError:
+            return _gateway_log_events_rpc(count)
+        lines = raw_bytes.decode("utf-8", "replace").splitlines()
+        events: list = []
+        for raw in reversed(lines):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            evt: dict = {}
+            # Timestamp — accept any common key name.
+            for _ts_key in ("time", "ts", "timestamp"):
+                _ts_val = obj.get(_ts_key)
+                if _ts_val is not None:
+                    evt["ts"] = _ts_val
+                    break
+            for _field, _key in (
+                ("level", "level"),
+                ("msg", "msg"),
+                ("message", "msg"),
+                ("subsystem", "subsystem"),
+            ):
+                _val = obj.get(_field)
+                if _val is not None and _key not in evt:
+                    evt[_key] = _val
+            if evt:
+                events.append(evt)
+            if len(events) >= count:
+                break
+        return events or _gateway_log_events_rpc(count)
+    except Exception:
+        return []
+
+
+def _gateway_log_events_rpc(count: int = 50) -> list:
+    """Return the last ``count`` gateway log events via WebSocket RPC.
+
+    Calls ``gateway.logs`` with ``{"count": count}``; the response payload is
+    expected to carry an ``events`` (or ``lines`` / ``entries`` / ``logs``) list
+    of structured event dicts.  Used as a fallback by ``_gateway_log_events``
+    when no local log files are accessible (remote / containerised gateway).
+    Closes #4057.  Never raises; returns ``[]`` on any failure.
+    """
+    try:
+        rpc = getattr(_d(), "_gw_ws_rpc", None)
+        if rpc is None:
+            return []
+        payload = rpc("gateway.logs", {"count": count})
+        if not isinstance(payload, dict):
+            return []
+        raw_events = None
+        for _key in ("events", "lines", "entries", "logs"):
+            _val = payload.get(_key)
+            if isinstance(_val, list):
+                raw_events = _val
+                break
+        if not raw_events:
+            return []
+        events: list = []
+        for obj in raw_events:
+            if not isinstance(obj, dict):
+                continue
+            evt: dict = {}
+            for _ts_key in ("time", "ts", "timestamp"):
+                _ts_val = obj.get(_ts_key)
+                if _ts_val is not None:
+                    evt["ts"] = _ts_val
+                    break
+            for _field, _key in (
+                ("level", "level"),
+                ("msg", "msg"),
+                ("message", "msg"),
+                ("subsystem", "subsystem"),
+            ):
+                _val = obj.get(_field)
+                if _val is not None and _key not in evt:
+                    evt[_key] = _val
+            if evt:
+                events.append(evt)
+            if len(events) >= count:
+                break
+        return events
+    except Exception:
+        return []
+
+
 def _openshell_sandbox_logs(name: str, count: int = 20) -> list:
     """Retrieve OCSF JSON audit log lines for a NemoClaw sandbox.
 
@@ -485,25 +749,31 @@ def _openshell_sandbox_logs(name: str, count: int = 20) -> list:
             except Exception:
                 pass
         # For container-backed (non-terminal) sandboxes the harness also tails
-        # /tmp/gateway.log (asserted in test/sandbox-logs-terminal.test.ts).
-        # Read runtime kind via the existing phase-policy helper and merge when
-        # the sandbox is not terminal-kind.
+        # the gateway log. The gateway writes rotating dated files at
+        # {log_dir}/openclaw-YYYY-MM-DD.log, not a static /tmp/gateway.log.
+        # Use _gateway_log_files() so we find the actual current log regardless
+        # of host layout; fall back to OPENSHELL_GATEWAY_LOG for test overrides.
         phase_info = _openshell_sandbox_phase_policy(name)
         if phase_info.get("sandboxRuntimeKind", "").lower() != "terminal":
-            _gw_log = os.environ.get("OPENSHELL_GATEWAY_LOG", "/tmp/gateway.log")
-            try:
-                with open(_gw_log, "r", encoding="utf-8", errors="replace") as _gf:
-                    _gw_lines = _gf.readlines()[-count:]
-                for _gw_line in _gw_lines:
-                    _gw_line = _gw_line.strip()
-                    if not _gw_line:
-                        continue
-                    try:
-                        events.append(json.loads(_gw_line))
-                    except Exception:
-                        pass
-            except OSError:
-                pass
+            _gw_log_override = os.environ.get("OPENSHELL_GATEWAY_LOG")
+            _gw_candidates = (
+                [_gw_log_override] if _gw_log_override else _gateway_log_files()
+            )
+            _gw_log_path = _gw_candidates[-1] if _gw_candidates else None
+            if _gw_log_path:
+                try:
+                    with open(_gw_log_path, "r", encoding="utf-8", errors="replace") as _gf:
+                        _gw_lines = _gf.readlines()[-count:]
+                    for _gw_line in _gw_lines:
+                        _gw_line = _gw_line.strip()
+                        if not _gw_line:
+                            continue
+                        try:
+                            events.append(json.loads(_gw_line))
+                        except Exception:
+                            pass
+                except OSError:
+                    pass
         return events
     except Exception:
         return []
@@ -624,6 +894,8 @@ def _sandbox_inference_configs() -> list:
                 or (entry.get("runtime") or {}).get("kind")
                 or ""
             )
+            # Read sandboxGpuProof before entry is reassigned (gap #3994).
+            raw_gpu_proof = entry.get("sandboxGpuProof")
             base_url = _MANAGED_URL
             if provider == "openai-api":
                 provider_key = "openai"
@@ -658,12 +930,24 @@ def _sandbox_inference_configs() -> list:
                 entry.update(_sandbox_egress_denied_count(name))
                 if json_runtime_kind and "sandboxRuntimeKind" not in entry:
                     entry["sandboxRuntimeKind"] = json_runtime_kind
+                if isinstance(raw_gpu_proof, dict):
+                    entry["sandboxGpuProof"] = raw_gpu_proof
                 out.append(entry)
                 continue
             elif provider in ("minimax", "minimax-api"):
                 provider_key = "minimax"
                 primary = f"minimax/{model}" if model else ""
                 base_url = _resolve_minimax_base_url()
+                compat = "openai"
+            elif provider == "llama.cpp":
+                provider_key = "llama-cpp"
+                primary = f"llama-cpp/{model}" if model else ""
+                base_url = _resolve_llamacpp_base_url()
+                compat = "openai"
+            elif provider in ("lmstudio", "lm-studio"):
+                provider_key = "lmstudio"
+                primary = f"lmstudio/{model}" if model else ""
+                base_url = _resolve_lmstudio_base_url()
                 compat = "openai"
             else:
                 provider_key = _MANAGED
@@ -685,6 +969,8 @@ def _sandbox_inference_configs() -> list:
             entry.update(_sandbox_egress_denied_count(name))
             if json_runtime_kind and "sandboxRuntimeKind" not in entry:
                 entry["sandboxRuntimeKind"] = json_runtime_kind
+            if isinstance(raw_gpu_proof, dict):
+                entry["sandboxGpuProof"] = raw_gpu_proof
             out.append(entry)
         except Exception:
             continue
@@ -753,6 +1039,49 @@ def _sandbox_inference_configs() -> list:
                 _te.update(_openshell_sandbox_phase_policy(_sb))
                 _te.update(_openshell_sandbox_ocsf_enabled(_sb))
                 _te.update(_sandbox_egress_denied_count(_sb))
+                # dcode session-supervisor feasibility (#3675): the supervisor
+                # (dcode-session-supervisor.py) requires Linux + an OpenShell
+                # sandbox and exits immediately with a fail-closed diagnostic
+                # otherwise.  Surface a flag so unsupervised dcode sessions are
+                # distinguishable from healthy ones.  True means both conditions
+                # are met (Linux platform AND openshell phase data present),
+                # matching the supervisor's own gate exactly.
+                if "deepagents-code" in _sb.lower() or _sb.lower() == "dcode":
+                    import sys as _sys
+                    import shutil as _shutil
+                    _platform_ok = _sys.platform.startswith("linux")
+                    _openshell_ok = bool(_shutil.which("openshell"))
+                    _te["dcodeSupervisionFeasible"] = (
+                        _platform_ok and bool(_te.get("sandboxPhase"))
+                    )
+                    _te["dcodeSupervisionPlatformOk"] = _platform_ok
+                    _te["dcodeOpenshellAvailable"] = _openshell_ok
+                    if not _platform_ok:
+                        _te["dcodeSupervisionFailReason"] = "non-linux platform"
+                    elif not _openshell_ok:
+                        _te["dcodeSupervisionFailReason"] = "openshell absent"
+                    else:
+                        _te["dcodeSupervisionFailReason"] = None
+                    # dcode proxy-env activation (#4810): the dcode login
+                    # profile sources /tmp/nemoclaw-proxy-env.sh before any
+                    # managed exec command, routing sandbox traffic through
+                    # the managed proxy.  A missing or empty file means the
+                    # sandbox may run unrouted/unguarded even when supervision
+                    # is otherwise feasible.
+                    _proxy_env = "/tmp/nemoclaw-proxy-env.sh"
+                    _proxy_env_present = os.path.isfile(_proxy_env)
+                    _proxy_env_nonempty = (
+                        _proxy_env_present
+                        and os.path.getsize(_proxy_env) > 0
+                    )
+                    _te["dcodeProxyEnvPresent"] = _proxy_env_present
+                    _te["dcodeProxyEnvNonEmpty"] = _proxy_env_nonempty
+                    if not _proxy_env_present:
+                        _te["dcodeProxyEnvFailReason"] = "env file absent"
+                    elif not _proxy_env_nonempty:
+                        _te["dcodeProxyEnvFailReason"] = "env file empty"
+                    else:
+                        _te["dcodeProxyEnvFailReason"] = None
                 out.append(_te)
     except Exception:
         pass
@@ -909,6 +1238,45 @@ def _model_router_health_ok(port: int) -> bool:
         return False
 
 
+def _model_router_launch_log(tail_lines: int = 50) -> Optional[str]:
+    """Read the NemoClaw model-router launch log (#3721).
+
+    The provisioning path writes a startup log during harness onboarding
+    (``readRouterLaunchLog`` in the harness test helper). ClawMetry surfaces
+    the last ``tail_lines`` lines so a failed startup is diagnosable from the
+    dashboard rather than just showing a binary not-running verdict.
+
+    Path resolution (first match wins):
+    1. ``NEMOCLAW_MODEL_ROUTER_LOG`` env var override.
+    2. ``<venv>/model-router.log`` (same directory as fingerprint + proxy-config
+       files — the canonical NemoClaw model-router directory).
+    3. ``~/.nemoclaw/model-router.log`` (home-directory fallback).
+
+    Returns the last ``tail_lines`` as a stripped string, or ``None`` when no
+    log file is found. Never raises.
+    """
+    venv = os.environ.get("NEMOCLAW_MODEL_ROUTER_VENV") or os.path.expanduser(
+        os.path.join("~", ".nemoclaw", "model-router-venv")
+    )
+    candidates = [
+        os.environ.get("NEMOCLAW_MODEL_ROUTER_LOG", ""),
+        os.path.join(venv, "model-router.log"),
+        os.path.expanduser(os.path.join("~", ".nemoclaw", "model-router.log")),
+    ]
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+            return "".join(lines[-tail_lines:]).strip() or None
+        except OSError:
+            continue
+        except Exception:
+            continue
+    return None
+
+
 def _model_router_live() -> dict:
     """Runtime-liveness signal for the NemoClaw model-router proxy (#2795).
 
@@ -917,13 +1285,28 @@ def _model_router_live() -> dict:
     healthy one. This discovers the live proxy and polls its ``/health``
     endpoint, surfacing the distinct liveness signal on ``DetectResult.meta``.
 
+    When the router is not running, includes ``modelRouterLaunchLog`` (last 50
+    lines of the startup log, #3721) so a failed start is diagnosable from the
+    dashboard. The key is absent when no log file exists.
+
     Returns ``{"modelRouterRunning": bool}`` (plus ``modelRouterPort`` when the
-    listening port is discoverable). Read-only, best-effort, never raises.
+    listening port is discoverable, and ``modelRouterLaunchLog`` when a log
+    file is present). Read-only, best-effort, never raises.
     """
     port = _discover_model_router_port()
     if port is None:
-        return {"modelRouterRunning": False}
-    return {"modelRouterPort": port, "modelRouterRunning": _model_router_health_ok(port)}
+        result: dict = {"modelRouterRunning": False}
+        log = _model_router_launch_log()
+        if log is not None:
+            result["modelRouterLaunchLog"] = log
+        return result
+    running = _model_router_health_ok(port)
+    result = {"modelRouterPort": port, "modelRouterRunning": running}
+    if not running:
+        log = _model_router_launch_log()
+        if log is not None:
+            result["modelRouterLaunchLog"] = log
+    return result
 
 
 def _parse_proxy_config_model_list(content: str) -> Optional[List[str]]:
@@ -1179,11 +1562,19 @@ def _gateway_plugin_health() -> dict:
     its ``state`` (``"loaded"`` / ``"errored"`` / ``"disabled"``), and an
     optional ``type`` field (``"channel"`` / ``"provider"``).
 
-    Returns a dict with two keys when any plugin data is present:
-    - ``"gatewayPluginHealth"`` — the raw list of plugin entries
-      (``[{"name": str, "state": str, "type": str|None}, ...]``).
-    - ``"gatewayPluginHealthSummary"`` — a ``{state: count}`` tally for quick
-      health assessment (e.g. ``{"loaded": 3, "errored": 1}``).
+    As of harness 2026.7.21 (#3883), the shared plugin-SDK monitor introduces a
+    ``phase`` field per plugin entry (``"admission"``, ``"claim-identity"``,
+    ``"adoption-handoff"``, ``"pruning"``, ``"polling"``, ``"shutdown"``) so a
+    plugin stuck mid-admission is distinguishable from a healthy ``"loaded"``
+    one.  Per-step detail flags (``admission``, ``claim_identity``,
+    ``adoption_handoff``, ``pruning``, ``polling``, ``shutdown``) are forwarded
+    when present (#4058).
+
+    Returns a dict with keys when any plugin data is present:
+    - ``"gatewayPluginHealth"`` — the raw list of plugin entries.
+    - ``"gatewayPluginHealthSummary"`` — a ``{state: count}`` tally.
+    - ``"gatewayPluginPhaseSummary"`` — a ``{phase: count}`` tally (only present
+      when at least one entry carries a ``phase`` field).
 
     Returns ``{}`` when the gateway RPC returns nothing, the response contains
     no ``plugins`` key, or the list is empty. Never raises.
@@ -1201,6 +1592,7 @@ def _gateway_plugin_health() -> dict:
             return {}
         plugins = []
         summary: dict = {}
+        phase_summary: dict = {}
         for entry in raw_plugins:
             if not isinstance(entry, dict):
                 continue
@@ -1209,11 +1601,27 @@ def _gateway_plugin_health() -> dict:
             ptype = entry.get("type") or entry.get("kind") or None
             if not name or not state:
                 continue
-            plugins.append({"name": name, "state": state, **({"type": ptype} if ptype else {})})
+            plugin: dict = {"name": name, "state": state}
+            if ptype:
+                plugin["type"] = ptype
+            # Lifecycle phase from the shared plugin-SDK monitor (#3883)
+            phase = entry.get("phase") or None
+            if phase:
+                plugin["phase"] = str(phase).lower()
+                phase_summary[plugin["phase"]] = phase_summary.get(plugin["phase"], 0) + 1
+            # Per-step lifecycle detail flags (forwarded when present)
+            for detail_key in ("admission", "claim_identity", "adoption_handoff", "pruning", "polling", "shutdown"):
+                val = entry.get(detail_key)
+                if val is not None:
+                    plugin[detail_key] = val
+            plugins.append(plugin)
             summary[state] = summary.get(state, 0) + 1
         if not plugins:
             return {}
-        return {"gatewayPluginHealth": plugins, "gatewayPluginHealthSummary": summary}
+        result: dict = {"gatewayPluginHealth": plugins, "gatewayPluginHealthSummary": summary}
+        if phase_summary:
+            result["gatewayPluginPhaseSummary"] = phase_summary
+        return result
     except Exception:
         return {}
 
@@ -1226,14 +1634,16 @@ def _gateway_host_status() -> dict:
     details alongside the existing ``plugins`` list.
 
     Returns a dict with whichever fields are present:
-    - ``"gatewayHostName"``       — machine hostname
-    - ``"gatewayNetworkAddress"`` — primary network address / IP
-    - ``"gatewayHostOS"``         — OS name or platform string
-    - ``"gatewayHostRuntime"``    — runtime identifier (e.g. Node version)
-    - ``"gatewayHostUptime"``     — uptime in seconds
-    - ``"gatewayHostCPU"``        — CPU usage value or dict
-    - ``"gatewayHostMemory"``     — memory info (bytes or dict)
-    - ``"gatewayHostDisk"``       — disk info (bytes or dict)
+    - ``"gatewayHostName"``            — machine hostname
+    - ``"gatewayNetworkAddress"``      — primary network address / IP
+    - ``"gatewayHostOS"``              — OS name or platform string
+    - ``"gatewayHostRuntime"``         — runtime identifier (e.g. Node version)
+    - ``"gatewayHostUptime"``          — uptime in seconds
+    - ``"gatewayHostCPU"``             — CPU usage value or dict
+    - ``"gatewayHostMemory"``          — memory info (bytes or dict)
+    - ``"gatewayHostDisk"``            — disk info (bytes or dict)
+    - ``"gatewaySupervisorMode"``      — supervisor mode (e.g. ``"external"``)
+    - ``"gatewaySupervisorModeVersion"`` — restart-handoff contract version
 
     Returns ``{}`` when the RPC is unavailable or the response carries no
     host fields. Never raises.
@@ -1297,7 +1707,373 @@ def _gateway_host_status() -> dict:
         )
         if disk is not None:
             result["gatewayHostDisk"] = disk
+        supervisor_mode = (
+            payload.get("supervisorMode")
+            or payload.get("supervisor_mode")
+        )
+        if supervisor_mode:
+            result["gatewaySupervisorMode"] = str(supervisor_mode)
+        supervisor_mode_version = (
+            payload.get("supervisorModeVersion")
+            or payload.get("supervisor_mode_version")
+        )
+        if supervisor_mode_version:
+            result["gatewaySupervisorModeVersion"] = str(supervisor_mode_version)
         return result
+    except Exception:
+        return {}
+
+
+def _gateway_supervisor_mode_env() -> dict:
+    """Read OpenClaw external-supervisor mode from the local environment (#4023).
+
+    ``OPENCLAW_SUPERVISOR_MODE`` is set by the operator when an external lifecycle
+    owner (e.g. OCM) supervises the gateway.  When the gateway is down during a
+    supervised restart handoff, ``_gateway_host_status()`` is not called (it
+    requires a live RPC connection), so the supervisor context is invisible.
+
+    This helper reads the env var unconditionally as a baseline fallback.  When
+    the gateway IS live, ``_gateway_host_status()`` overwrites these keys with
+    the authoritative RPC value.
+
+    Returns ``{"gatewaySupervisorMode": ...}`` (and optionally
+    ``"gatewaySupervisorModeVersion"``) when the env var is set, ``{}`` otherwise.
+    Never raises.
+    """
+    try:
+        mode = os.environ.get("OPENCLAW_SUPERVISOR_MODE")
+        if not mode:
+            return {}
+        result: dict = {"gatewaySupervisorMode": str(mode)}
+        version = os.environ.get("OPENCLAW_SUPERVISOR_MODE_VERSION")
+        if version:
+            result["gatewaySupervisorModeVersion"] = str(version)
+        return result
+    except Exception:
+        return {}
+
+
+def _gateway_is_in_restart_handoff(supervisor_mode: str, gateway_live: bool) -> bool:
+    """True when the gateway is briefly offline during an externally-supervised
+    restart-handoff (#4302).
+
+    An external lifecycle owner (e.g. OCM) manages gateway restarts when
+    ``OPENCLAW_SUPERVISOR_MODE=external``.  A ``False`` result from
+    ``_gateway_live()`` is then an expected transient — the supervisor will
+    bring the gateway back.  Callers surface "restarting (supervised)" rather
+    than "gateway offline" in the UI.
+
+    Never raises.
+    """
+    try:
+        return supervisor_mode == "external" and not gateway_live
+    except Exception:
+        return False
+
+
+def _gateway_presence_roster() -> dict:
+    """Who's-online presence roster from the OpenClaw gateway.status RPC (#3884).
+
+    As of the Control UI who's-online roster release, the gateway.status response
+    includes a list of currently-connected users under a ``connectedUsers`` (or
+    ``onlineUsers`` / ``presence``) key.  Each entry carries at minimum an
+    ``email`` field; ``displayName`` and ``avatar`` (or ``avatarUrl``) are
+    included when the user's profile is populated.
+
+    Returns a dict with:
+    - ``"gatewayPresenceRoster"`` — list of normalized user dicts, each with
+      ``email`` (str), and optionally ``displayName`` (str) and ``avatar`` (str).
+    - ``"gatewayPresenceCount"`` — number of online users.
+
+    Returns ``{}`` when the RPC is unavailable, carries no user list, or the
+    list is empty. Never raises.
+    """
+    try:
+        d = _d()
+        rpc = getattr(d, "_gw_ws_rpc", None)
+        if rpc is None:
+            return {}
+        payload = rpc("gateway.status")
+        if not isinstance(payload, dict):
+            return {}
+        raw_users = (
+            payload.get("connectedUsers")
+            or payload.get("connected_users")
+            or payload.get("onlineUsers")
+            or payload.get("online_users")
+            or payload.get("presence")
+        )
+        if not isinstance(raw_users, list) or not raw_users:
+            return {}
+        roster = []
+        for entry in raw_users:
+            if not isinstance(entry, dict):
+                continue
+            email = (
+                entry.get("email")
+                or entry.get("emailAddress")
+                or entry.get("email_address")
+            )
+            if not email:
+                continue
+            user: dict = {"email": str(email)}
+            display_name = (
+                entry.get("displayName")
+                or entry.get("display_name")
+                or entry.get("name")
+            )
+            if display_name:
+                user["displayName"] = str(display_name)
+            avatar = (
+                entry.get("avatar")
+                or entry.get("avatarUrl")
+                or entry.get("avatar_url")
+                or entry.get("photoUrl")
+                or entry.get("photo_url")
+            )
+            if avatar:
+                user["avatar"] = str(avatar)
+            roster.append(user)
+        if not roster:
+            return {}
+        return {"gatewayPresenceRoster": roster, "gatewayPresenceCount": len(roster)}
+    except Exception:
+        return {}
+
+
+def _gateway_mcp_app_widgets() -> dict:
+    """Pinned MCP app dashboard widgets from the OpenClaw gateway.status RPC (#3882).
+
+    OpenClaw's Dashboard MCP apps feature (CHANGELOG.md 'Unreleased: Dashboard MCP
+    apps') lets MCP app views be pinned as persistent dashboard widgets from an
+    originating session.  Each widget has a view-lease that renews periodically and
+    tool interactivity gated behind revision-bound grants.
+
+    When the gateway exposes widget state the response carries the list under one of
+    the candidate keys below.  Each entry is normalised to:
+    - ``"widgetId"``               — stable widget identifier
+    - ``"sessionId"``              — originating session that pinned the widget
+    - ``"type"``                   — widget type / MCP app identifier (when present)
+    - ``"leaseState"``             — ``"active"``, ``"expired"``, or ``"pending"``
+    - ``"grantRevision"``          — revision token for the tool-interactivity grant
+    - ``"toolInteractivityEnabled"`` — bool; whether tool calls are currently allowed
+
+    Returns a dict with:
+    - ``"gatewayMcpAppWidgets"``    — list of normalised widget dicts
+    - ``"gatewayMcpAppWidgetCount"`` — total widget count
+    - ``"gatewayMcpAppWidgetSummary"`` — ``{leaseState: count}`` tally
+
+    Returns ``{}`` when the RPC is unavailable, carries no widget list, or the list
+    is empty.  Never raises.
+    """
+    try:
+        d = _d()
+        rpc = getattr(d, "_gw_ws_rpc", None)
+        if rpc is None:
+            return {}
+        payload = rpc("gateway.status")
+        if not isinstance(payload, dict):
+            return {}
+        raw_widgets = (
+            payload.get("mcp_app_widgets")
+            or payload.get("mcpAppWidgets")
+            or payload.get("dashboard_widgets")
+            or payload.get("dashboardWidgets")
+            or payload.get("pinned_widgets")
+            or payload.get("pinnedWidgets")
+        )
+        if not isinstance(raw_widgets, list) or not raw_widgets:
+            return {}
+        widgets = []
+        lease_summary: dict = {}
+        for entry in raw_widgets:
+            if not isinstance(entry, dict):
+                continue
+            widget_id = (
+                entry.get("widgetId")
+                or entry.get("widget_id")
+                or entry.get("id")
+            )
+            if not widget_id:
+                continue
+            widget: dict = {"widgetId": str(widget_id)}
+            session_id = entry.get("sessionId") or entry.get("session_id")
+            if session_id:
+                widget["sessionId"] = str(session_id)
+            widget_type = entry.get("type") or entry.get("appId") or entry.get("app_id")
+            if widget_type:
+                widget["type"] = str(widget_type)
+            lease_state = str(
+                entry.get("leaseState")
+                or entry.get("lease_state")
+                or entry.get("lease")
+                or ""
+            ).lower() or None
+            if lease_state:
+                widget["leaseState"] = lease_state
+                lease_summary[lease_state] = lease_summary.get(lease_state, 0) + 1
+            grant_rev = entry.get("grantRevision") or entry.get("grant_revision")
+            if grant_rev is not None:
+                widget["grantRevision"] = grant_rev
+            tool_ok = entry.get("toolInteractivityEnabled")
+            if tool_ok is None:
+                tool_ok = entry.get("tool_interactivity_enabled")
+            if tool_ok is not None:
+                widget["toolInteractivityEnabled"] = bool(tool_ok)
+            widgets.append(widget)
+        if not widgets:
+            return {}
+        result: dict = {
+            "gatewayMcpAppWidgets": widgets,
+            "gatewayMcpAppWidgetCount": len(widgets),
+        }
+        if lease_summary:
+            result["gatewayMcpAppWidgetSummary"] = lease_summary
+        return result
+    except Exception:
+        return {}
+
+
+def _gateway_trusted_proxy_devices() -> dict:
+    """Trusted-proxy device pairing state from the OpenClaw gateway (#3885).
+
+    As of OpenClaw CHANGELOG (Unreleased: 'Trusted-proxy browser pairing'),
+    devices (Control UI, WebChat) can be auto-approved from allowlisted
+    trusted-proxy identities with non-admin scope caps, distinct from
+    manually-approved existing-device upgrades.
+
+    Tries two sources in order:
+    1. ``gateway.status`` payload -- looks for a ``devices``,
+       ``trustedDevices``, ``pairedDevices``, or ``trustedProxies`` list.
+    2. A dedicated ``gateway.devices`` RPC as a fallback (anticipated in a
+       future harness release alongside the status key).
+
+    Returns a dict with keys when paired devices are present:
+    - ``"gatewayTrustedProxyDevices"`` -- list of dicts with ``id``,
+      ``autoApproved``, and optional ``label``, ``scopeCap``, ``approvedAt``.
+    - ``"gatewayTrustedProxyDeviceSummary"`` -- ``{auto: N, manual: N}`` tally.
+
+    Returns ``{}`` when the RPC is unavailable, returns no device data, or
+    the harness hasn't shipped the pairing surface yet. Never raises.
+    """
+    try:
+        d = _d()
+        rpc = getattr(d, "_gw_ws_rpc", None)
+        if rpc is None:
+            return {}
+
+        raw_devices = None
+        # Primary: gateway.status (avoids an extra round-trip)
+        payload = rpc("gateway.status")
+        if isinstance(payload, dict):
+            raw_devices = (
+                payload.get("devices")
+                or payload.get("trustedDevices")
+                or payload.get("pairedDevices")
+                or payload.get("trustedProxies")
+                or payload.get("proxyDevices")
+            )
+        # Fallback: dedicated gateway.devices RPC (future harness release)
+        if not raw_devices:
+            devices_payload = rpc("gateway.devices")
+            if isinstance(devices_payload, list):
+                raw_devices = devices_payload
+            elif isinstance(devices_payload, dict):
+                raw_devices = (
+                    devices_payload.get("devices")
+                    or devices_payload.get("items")
+                    or devices_payload.get("trustedDevices")
+                )
+
+        if not isinstance(raw_devices, list) or not raw_devices:
+            return {}
+
+        devices = []
+        summary: dict = {"auto": 0, "manual": 0}
+        for entry in raw_devices:
+            if not isinstance(entry, dict):
+                continue
+            device_id = str(
+                entry.get("id")
+                or entry.get("deviceId")
+                or entry.get("device_id")
+                or ""
+            )
+            if not device_id:
+                continue
+            auto_approved = bool(
+                entry.get("autoApproved")
+                or entry.get("auto_approved")
+                or entry.get("trustedProxy")
+                or entry.get("trusted_proxy")
+            )
+            device: dict = {"id": device_id, "autoApproved": auto_approved}
+            label = str(
+                entry.get("label")
+                or entry.get("name")
+                or entry.get("displayName")
+                or ""
+            )
+            if label:
+                device["label"] = label
+            scope_cap = entry.get("scopeCap") or entry.get("scope_cap") or entry.get("scopes")
+            if scope_cap is not None:
+                device["scopeCap"] = scope_cap
+            approved_at = (
+                entry.get("approvedAt")
+                or entry.get("approved_at")
+                or entry.get("createdAt")
+                or entry.get("created_at")
+            )
+            if approved_at is not None:
+                device["approvedAt"] = approved_at
+            devices.append(device)
+            if auto_approved:
+                summary["auto"] += 1
+            else:
+                summary["manual"] += 1
+
+        if not devices:
+            return {}
+        return {
+            "gatewayTrustedProxyDevices": devices,
+            "gatewayTrustedProxyDeviceSummary": summary,
+        }
+    except Exception:
+        return {}
+
+
+def _workshop_approval_config() -> dict:
+    """Read Skill Workshop approval-policy from openclaw.json (#3992).
+
+    Surfaces ``skills.workshop.approvalPolicy`` in the adapter's detect()
+    metadata so cloud-synced fleet views can show whether agent-initiated
+    skill apply/reject/quarantine actions are gated by human approval.
+
+    Returns ``{"workshopApprovalPolicy": <value>}`` when the key is present,
+    ``{}`` otherwise. Never raises.
+    """
+    try:
+        import json as _json
+        home = os.environ.get("OPENCLAW_HOME") or os.path.expanduser("~/.openclaw")
+        cfg_path = os.path.join(home, "openclaw.json")
+        if not os.path.isfile(cfg_path):
+            alt = os.path.expanduser("~/.clawdbot/openclaw.json")
+            if os.path.isfile(alt):
+                cfg_path = alt
+            else:
+                return {}
+        with open(cfg_path) as fh:
+            cfg = _json.load(fh)
+        if not isinstance(cfg, dict):
+            return {}
+        workshop = (cfg.get("skills") or {}).get("workshop")
+        if not isinstance(workshop, dict):
+            return {}
+        policy = workshop.get("approvalPolicy")
+        if policy is None:
+            return {}
+        return {"workshopApprovalPolicy": str(policy)}
     except Exception:
         return {}
 
@@ -1371,6 +2147,18 @@ class OpenClawAdapter(AgentAdapter):
             # from ~/.nemoclaw/agents.yaml (written by harness onboarding,
             # commit 01e5525).
             meta.update(_nemoclaw_agents_manifest())
+            # External-supervisor mode env-var fallback (#4023): surface
+            # OPENCLAW_SUPERVISOR_MODE even when the gateway is down (e.g. during
+            # a supervised restart handoff). _gateway_host_status() below will
+            # overwrite with the live RPC value when the gateway is up.
+            meta.update(_gateway_supervisor_mode_env())
+            # During an externally-supervised restart-handoff the gateway is
+            # briefly down; flag this so callers show "restarting (supervised)"
+            # rather than "gateway offline" (#4302).
+            if _gateway_is_in_restart_handoff(
+                meta.get("gatewaySupervisorMode", ""), running
+            ):
+                meta["gatewayInRestartHandoff"] = True
             # Gateway plugin health (#3200): per-plugin state (loaded/errored/
             # disabled) added to gateway.status in harness 2026.6.9 (#93395).
             # Only meaningful — and safe to query — when the gateway is live.
@@ -1379,6 +2167,16 @@ class OpenClawAdapter(AgentAdapter):
                 # Gateway host/system status (#3551): host name, OS, runtime,
                 # uptime, CPU, memory, disk from the same gateway.status RPC.
                 meta.update(_gateway_host_status())
+                # Who's-online presence roster (#3884): connected users from the
+                # Control UI facepile, via the same gateway.status RPC.
+                meta.update(_gateway_presence_roster())
+                # Pinned MCP app dashboard widgets (#3882): widget list, lease
+                # state, and revision-bound tool-grant status from the same RPC.
+                # Returns {} on installs predating the Dashboard MCP apps release.
+                meta.update(_gateway_mcp_app_widgets())
+                # Trusted-proxy device pairing (#3885): paired/approved devices,
+                # scope caps, and auto- vs manual-approval state.
+                meta.update(_gateway_trusted_proxy_devices())
             # Docker runtime health (#3390): the NemoClaw harness treats Docker
             # daemon liveness as a distinct signal from gateway liveness. Only
             # written when docker CLI is present so non-Docker environments are
@@ -1400,6 +2198,22 @@ class OpenClawAdapter(AgentAdapter):
             _cr = _clawrouter_detect()
             if _cr:
                 meta.update(_cr)
+            # Gateway log location + rotation state (#3836): surface the
+            # rotating log directory, archive count, and current file size so
+            # the dashboard can show log presence for plain OpenClaw installs.
+            # Runs unconditionally — log files exist even when the gateway is
+            # not currently live. Returns {} gracefully when absent.
+            _gw_log = _gateway_log_meta()
+            if _gw_log:
+                meta.update(_gw_log)
+            _gw_events = _gateway_log_events()
+            if _gw_events:
+                meta["gatewayLogEvents"] = _gw_events
+            # Skill Workshop approval-policy (#3992): surfaces
+            # skills.workshop.approvalPolicy from openclaw.json so cloud-synced
+            # fleet views know whether autonomous skill actions are gated by
+            # human approval.  Returns {} on installs without the key.
+            meta.update(_workshop_approval_config())
             return DetectResult(
                 name=self.name,
                 display_name=self.display_name,
@@ -1490,6 +2304,31 @@ class OpenClawAdapter(AgentAdapter):
             )
             if _fb_runtime is not None:
                 extra["fallbackRuntime"] = _fb_runtime
+            # Atomic runtime alias (#3672): CHANGELOG #98021 "GPT-5.6 Ultra
+            # and runtime switching" added Sol/Terra/Luna as named runtime
+            # variants switched atomically with model and thinking via /model
+            # and fallback.  Capture the selected alias so cost/model
+            # attribution can distinguish which variant served the session.
+            _rt_alias = (
+                s.get("runtimeAlias")
+                or s.get("selectedRuntimeAlias")
+                or s.get("modelRuntimeAlias")
+            )
+            if _rt_alias is not None:
+                extra["runtimeAlias"] = _rt_alias
+            # Thinking-mode selection (#3672): atomic alongside runtimeAlias;
+            # surface as-is (bool or string) so the dashboard can show whether
+            # extended thinking was active.  Use is-not-None guards so
+            # thinkingMode=False (thinking disabled) is never silently dropped.
+            _thinking_mode = s.get("thinkingMode")
+            if _thinking_mode is None:
+                _thinking_mode = s.get("isThinkingEnabled")
+            if _thinking_mode is None:
+                _thinking_mode = s.get("thinkingEnabled")
+            if _thinking_mode is not None:
+                extra["thinkingMode"] = (
+                    _thinking_mode if isinstance(_thinking_mode, str) else bool(_thinking_mode)
+                )
             # /think reasoning-level tier (#3324): PR #94067 stores the active
             # level (light/medium/deep) on session records; surface when present.
             _think_level = s.get("thinkLevel") or s.get("reasoningLevel")
@@ -1538,6 +2377,27 @@ class OpenClawAdapter(AgentAdapter):
             _cdcont = s.get("cronDeliveredContent") or s.get("deliveredContent")
             if _cdcont is not None:
                 extra["cronDeliveredContent"] = str(_cdcont)
+            # PTY relay state (#3839): PR #107335 ('macOS paired-node terminals')
+            # and PR #107086 ('Control UI catalog terminals') stamp relay state,
+            # resume command, viewer preference, and paired-node identity on
+            # session records so the Control UI can open native terminal sessions.
+            # All four reads silently no-op when the fields are absent.
+            _pty = s.get("ptyRelayState") or s.get("ptyRelay")
+            if _pty is not None:
+                extra["ptyRelayState"] = str(_pty)
+            _rc = s.get("resumeCommand") or s.get("resumeCmd")
+            if _rc is not None:
+                extra["resumeCommand"] = str(_rc)
+            _vp = s.get("viewerPreference") or s.get("terminalPreference")
+            if _vp is not None:
+                extra["viewerPreference"] = str(_vp)
+            _pn = (
+                s.get("pairedNodeId")
+                or s.get("pairNodeId")
+                or s.get("pairedNode")
+            )
+            if _pn is not None:
+                extra["pairedNodeId"] = str(_pn)
             # On-exit cron trigger kind (#3526): OpenClaw 2026.7.1 (#92037)
             # stamps the schedule kind that triggered this session delivery
             # ("on-exit", "every", "interval", "cron", …) so callers can
@@ -1663,6 +2523,19 @@ class OpenClawAdapter(AgentAdapter):
                 )
                 if _vad is not None:
                     extra["vadMode"] = str(_vad)
+            # Session classification facts (#4591): harness commit 2a0bbd23
+            # (#106832) attaches per-session classification metadata describing
+            # session type, purpose, and behavioural characteristics. Silently
+            # no-ops when absent so existing sessions are unaffected.
+            _clf = (
+                s.get("classificationFacts")
+                or s.get("classification_facts")
+                or s.get("sessionClassification")
+                or s.get("session_classification")
+                or s.get("sessionFacts")
+            )
+            if _clf is not None:
+                extra["classificationFacts"] = _clf
             tok_total = int(s.get("totalTokens") or 0)
             tok_in = int(s.get("inputTokens") or 0)
             tok_out = int(s.get("outputTokens") or 0)
@@ -1838,6 +2711,29 @@ class OpenClawAdapter(AgentAdapter):
                             _abytes = obj.get("audio_bytes") or obj.get("audioBytes")
                             if _abytes is not None:
                                 extra["audio_bytes"] = _abytes
+                            # Fish Audio TTS fields (#4429): S2.1 hosted streaming
+                            # synthesis and S2 Pro local reference-voice. Aliases
+                            # follow harness naming conventions; isLocal routes S2
+                            # Pro events to the $0 cost path in providers_pricing.
+                            _fa_stream = (
+                                obj.get("streamState")
+                                or obj.get("streaming_state")
+                                or obj.get("isStreaming")
+                            )
+                            if _fa_stream is not None:
+                                extra["streamState"] = _fa_stream
+                            _fa_tel = (
+                                obj.get("telephonyCallId")
+                                or obj.get("telephony_call_id")
+                            )
+                            if _fa_tel is not None:
+                                extra["telephonyCallId"] = _fa_tel
+                            _fa_model = obj.get("ttsModel") or obj.get("fishModel")
+                            if _fa_model is not None:
+                                extra["ttsModel"] = _fa_model
+                            _fa_local = obj.get("isLocal") or obj.get("is_local")
+                            if _fa_local is not None:
+                                extra["isLocal"] = bool(_fa_local)
                             # Fast-mode state (#3322): PR #85104 emits fastMode on
                             # event blobs; try all three spellings in precedence order.
                             for _fmkey in ("fastMode", "isFastMode", "talkFastMode"):
@@ -1998,6 +2894,92 @@ class OpenClawAdapter(AgentAdapter):
                                     ]
                                     if _tr_details:
                                         extra["tool_result_details"] = _tr_details
+                            # Cloud workspace conflict fields (#4747): sync.py stores
+                            # conflictedPaths / resolution / stagedRef in the data blob
+                            # but list_events never extracted them, so Event.extra was
+                            # empty for these rows and transcript callers saw nothing.
+                            if str(r[1] or "") == "workspace.conflict":
+                                _wc_paths = (
+                                    obj.get("conflictedPaths")
+                                    or obj.get("conflicted_paths")
+                                    or []
+                                )
+                                if isinstance(_wc_paths, list):
+                                    extra["conflictedPaths"] = _wc_paths
+                                _wc_res = (
+                                    obj.get("resolution")
+                                    or obj.get("resolutionAction")
+                                    or obj.get("resolution_action")
+                                )
+                                if _wc_res is not None:
+                                    extra["resolution"] = _wc_res
+                                _wc_sr = obj.get("stagedRef") or obj.get("staged_ref")
+                                if _wc_sr is not None:
+                                    extra["stagedRef"] = _wc_sr
+                                _wc_kept = (
+                                    obj.get("keptLocalPaths")
+                                    or obj.get("kept_local_paths")
+                                    or obj.get("cloudWorkerKeptLocal")
+                                    or obj.get("cloud_worker_kept_local")
+                                    or []
+                                )
+                                if isinstance(_wc_kept, list) and _wc_kept:
+                                    extra["keptLocalPaths"] = _wc_kept
+                                _wc_path_str = (
+                                    ", ".join(_wc_paths)
+                                    if isinstance(_wc_paths, list) and _wc_paths
+                                    else "(no paths)"
+                                )
+                                content_text = f"Cloud workspace conflict: {_wc_path_str}"
+                                if _wc_res:
+                                    content_text += f" — {_wc_res}"
+                            # Canvas dashboard pin state (#4864): harness PR #124044
+                            # surfaces failed pin events; extract pin state and failure
+                            # reason so the dashboard can show them instead of leaving
+                            # failed pins invisible. Covers camelCase + snake_case aliases
+                            # since the harness has used both in adjacent features.
+                            _canvas_pin_state = (
+                                obj.get("canvasPinState")
+                                or obj.get("canvas_pin_state")
+                                or obj.get("pinState")
+                            )
+                            if _canvas_pin_state is not None:
+                                extra["canvasPinState"] = _canvas_pin_state
+                            _canvas_pin_id = (
+                                obj.get("canvasPinId")
+                                or obj.get("canvas_pin_id")
+                                or obj.get("pinId")
+                                or obj.get("dashboardPinId")
+                            )
+                            if _canvas_pin_id is not None:
+                                extra["canvasPinId"] = str(_canvas_pin_id)
+                            _canvas_pin_reason = (
+                                obj.get("canvasPinFailureReason")
+                                or obj.get("pinFailureReason")
+                                or obj.get("canvas_pin_failure_reason")
+                            )
+                            if _canvas_pin_reason is not None:
+                                extra["canvasPinFailureReason"] = _canvas_pin_reason
+                            _canvas_id = (
+                                obj.get("canvasId")
+                                or obj.get("canvas_id")
+                                or obj.get("dashboardId")
+                            )
+                            if _canvas_id is not None:
+                                extra["canvasId"] = str(_canvas_id)
+                            # Construct a readable content_text for canvas.* events so
+                            # the Brain tab and transcript view show a useful label
+                            # instead of an empty row.
+                            _ev_type_str = str(r[1] or "")
+                            if not content_text and _ev_type_str.startswith("canvas."):
+                                if _canvas_pin_state == "failed":
+                                    content_text = "Canvas pin failed"
+                                    if _canvas_pin_id:
+                                        content_text += f" ({_canvas_pin_id})"
+                                    if _canvas_pin_reason:
+                                        content_text += f": {_canvas_pin_reason}"
+                                elif _canvas_pin_state:
+                                    content_text = f"Canvas pin: {_canvas_pin_state}"
                     except Exception:
                         pass
                 # #2794: DB token_count derives from input+output and under-counts
@@ -2046,7 +3028,9 @@ class OpenClawAdapter(AgentAdapter):
         return hashlib.sha256(session_id.encode()).hexdigest()[:32]
 
     @staticmethod
-    def _build_spans_from_events(events: list, session_id: str) -> list:
+    def _build_spans_from_events(
+        events: list, session_id: str, agent_type: str = "openclaw"
+    ) -> list:
         """Map raw JSONL objects to OTel-shaped span dicts.
 
         Mapping per issue #1010:
@@ -2059,6 +3043,15 @@ class OpenClawAdapter(AgentAdapter):
         - ``subagent_spawn``           → agent.spawn span (INTERNAL, link to child trace)
         - ``commentary`` / ``progress`` → commentary/progress span (INTERNAL,
           child of root) preserving the narration text + subtype (#3015).
+
+        ``agent_type`` stamps every span's runtime identity (Agent Graph
+        WS-A). It defaults to ``'openclaw'`` but callers ingesting the same
+        transcript shape for another runtime (NemoClaw sandbox batches via
+        ``sync._flush_session_batch(..., agent_type='nemoclaw')``) pass their
+        own id so the Agent Graph doesn't mislabel their nodes. Spawn spans
+        additionally carry ``agent_id=<child label>`` (subagent/agent label
+        off the spawn event, fallback ``'subagent'``) so the graph's
+        ``main → child`` edge survives the ``src == dst`` self-edge filter.
 
         Span IDs are deterministic SHA-256 prefixes so re-ingesting is idempotent.
         """
@@ -2095,7 +3088,7 @@ class OpenClawAdapter(AgentAdapter):
                     "kind": "INTERNAL",
                     "start_ts": ts,
                     "session_id": session_id,
-                    "agent_type": "openclaw",
+                    "agent_type": agent_type,
                     "attributes": {"session.version": obj.get("version"), "session.id": session_id},
                 })
 
@@ -2229,7 +3222,7 @@ class OpenClawAdapter(AgentAdapter):
                     "kind": "CLIENT",
                     "start_ts": ts,
                     "session_id": session_id,
-                    "agent_type": "openclaw",
+                    "agent_type": agent_type,
                     "model": model or None,
                     "tokens_input": tok_in or None,
                     "tokens_output": tok_out or None,
@@ -2281,7 +3274,7 @@ class OpenClawAdapter(AgentAdapter):
                             "kind": "CLIENT",
                             "start_ts": ts,
                             "session_id": session_id,
-                            "agent_type": "openclaw",
+                            "agent_type": agent_type,
                             "tool_name": tool_name,
                             "input": blk_input,
                             "attributes": attrs or None,
@@ -2296,6 +3289,26 @@ class OpenClawAdapter(AgentAdapter):
                     obj.get("subagent_id") or obj.get("agentId") or obj.get("agent_id") or ""
                 )
                 child_trace = hashlib.sha256(sub_id.encode()).hexdigest()[:32] if sub_id else ""
+                # Child agent label (Agent Graph WS-A): the spawn span must
+                # carry a DIFFERENT agent_id than the parent's 'main' or the
+                # graph's src==dst filter drops the edge and the runtime
+                # renders as one self-node. Prefer an explicit subagent/agent
+                # type label off the event; fall back to the literal
+                # 'subagent' — never the raw sub_id UUID (one node per spawn
+                # would explode the graph).
+                _child_label = (
+                    obj.get("subagent_type") or obj.get("subagentType")
+                    or obj.get("agentType") or obj.get("agent")
+                    or obj.get("label") or ""
+                )
+                _child_label = (
+                    str(_child_label).strip()
+                    if isinstance(_child_label, str) and _child_label.strip()
+                    else "subagent"
+                )
+                _spawn_attrs: dict = {"subagent.label": _child_label}
+                if sub_id:
+                    _spawn_attrs["subagent_id"] = sub_id
                 spans.append({
                     "span_id": _sid("spawn", session_id, str(raw_ts), sub_id),
                     "trace_id": trace_id,
@@ -2304,9 +3317,10 @@ class OpenClawAdapter(AgentAdapter):
                     "kind": "INTERNAL",
                     "start_ts": ts,
                     "session_id": session_id,
-                    "agent_type": "openclaw",
+                    "agent_type": agent_type,
+                    "agent_id": _child_label,
                     "links": [{"trace_id": child_trace, "span_id": "0" * 16}] if child_trace else None,
-                    "attributes": {"subagent_id": sub_id} if sub_id else None,
+                    "attributes": _spawn_attrs,
                 })
 
             elif t in ("commentary", "progress"):
@@ -2344,7 +3358,7 @@ class OpenClawAdapter(AgentAdapter):
                     "kind": "INTERNAL",
                     "start_ts": ts,
                     "session_id": session_id,
-                    "agent_type": "openclaw",
+                    "agent_type": agent_type,
                     "attributes": comment_attrs,
                 })
 
@@ -2376,7 +3390,7 @@ class OpenClawAdapter(AgentAdapter):
                     "kind": "INTERNAL",
                     "start_ts": ts,
                     "session_id": session_id,
-                    "agent_type": "openclaw",
+                    "agent_type": agent_type,
                     "attributes": fa_attrs or None,
                 })
 
@@ -2415,7 +3429,7 @@ class OpenClawAdapter(AgentAdapter):
                     "kind": "INTERNAL",
                     "start_ts": ts,
                     "session_id": session_id,
-                    "agent_type": "openclaw",
+                    "agent_type": agent_type,
                     "attributes": comp_attrs,
                 })
 
@@ -2450,8 +3464,49 @@ class OpenClawAdapter(AgentAdapter):
                     "kind": "INTERNAL",
                     "start_ts": ts,
                     "session_id": session_id,
-                    "agent_type": "openclaw",
+                    "agent_type": agent_type,
                     "attributes": retry_attrs,
+                })
+
+            elif t == "workspace.conflict":
+                # Cloud workspace conflict span (#4747): surface in the Tracing
+                # tab so the conflict marker appears at the right point in the
+                # session timeline (same pattern as compaction/retry spans).
+                _wc_paths = (
+                    obj.get("conflictedPaths")
+                    or obj.get("conflicted_paths")
+                    or []
+                )
+                wc_attrs: dict = {"event.kind": "workspace.conflict"}
+                if isinstance(_wc_paths, list) and _wc_paths:
+                    wc_attrs["conflict.paths"] = _wc_paths
+                    wc_attrs["conflict.path_count"] = len(_wc_paths)
+                _wc_res = obj.get("resolution") or obj.get("resolutionAction")
+                if _wc_res is not None:
+                    wc_attrs["conflict.resolution"] = _wc_res
+                _wc_sr = obj.get("stagedRef") or obj.get("staged_ref")
+                if _wc_sr is not None:
+                    wc_attrs["conflict.staged_ref"] = _wc_sr
+                _wc_kept = (
+                    obj.get("keptLocalPaths")
+                    or obj.get("kept_local_paths")
+                    or obj.get("cloudWorkerKeptLocal")
+                    or obj.get("cloud_worker_kept_local")
+                    or []
+                )
+                if isinstance(_wc_kept, list) and _wc_kept:
+                    wc_attrs["conflict.kept_local"] = _wc_kept
+                    wc_attrs["conflict.kept_local_count"] = len(_wc_kept)
+                spans.append({
+                    "span_id": _sid("workspace.conflict", session_id, str(raw_ts)),
+                    "trace_id": trace_id,
+                    "parent_span_id": session_span_id,
+                    "name": "workspace.conflict",
+                    "kind": "INTERNAL",
+                    "start_ts": ts,
+                    "session_id": session_id,
+                    "agent_type": agent_type,
+                    "attributes": wc_attrs,
                 })
 
         return spans

@@ -111,6 +111,26 @@ def is_cloud_disabled() -> bool:
         return False
 
 
+def cloud_egress_enabled(config: dict = None) -> bool:
+    """Cloud egress is OPT-IN — True only when the user explicitly linked an
+    account AND has not opted out.
+
+    Product rule (founder, 2026-07-31): a default install is SELF-HOSTED —
+    nothing leaves the machine until the user runs `clawmetry login` /
+    `clawmetry connect` (or picks the managed/cloud onboarding path), all of
+    which persist an ``api_key``. Before this, gating was opt-OUT only
+    (the nocloud marker), so a self-hosted node with a license key but no
+    account heart-beat ``X-Api-Key: ""`` to ingest every cycle and logged a
+    wall of 401 warnings (found live on a Windows node, 2026-07-31).
+
+    The nocloud marker / CLAWMETRY_NO_CLOUD still hard-disable egress even
+    when a key exists.
+    """
+    if is_cloud_disabled():
+        return False
+    return bool((config or {}).get("api_key"))
+
+
 def enable_cloud() -> bool:
     """Clear the local-only marker so the daemon resumes cloud sync.
 
@@ -130,6 +150,30 @@ def enable_cloud() -> bool:
     except Exception:
         pass
     return False
+
+
+def disable_cloud() -> bool:
+    """Write the ``~/.clawmetry/nocloud`` marker so the daemon pauses cloud
+    sync on the next iteration. Mirror of :func:`enable_cloud`; used by the
+    dashboard header's sync toggle so users can pause sync without dropping
+    to the CLI. The marker survives updates and daemon restarts.
+
+    Returns True if a marker was newly written; False if one already
+    existed or if the write failed (best-effort, never raises).
+
+    Does NOT alter the ``CLAWMETRY_NO_CLOUD`` env var — that stays whatever
+    the operator set it to. The marker is persistent local state; the env
+    var is per-run/container config; either one activates local-only mode.
+    """
+    try:
+        if os.path.isfile(NOCLOUD_MARKER_PATH):
+            return False
+        os.makedirs(os.path.dirname(NOCLOUD_MARKER_PATH), exist_ok=True)
+        with open(NOCLOUD_MARKER_PATH, "w") as f:
+            f.write("")
+        return True
+    except Exception:
+        return False
 
 
 @dataclass

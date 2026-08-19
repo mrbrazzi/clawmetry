@@ -218,6 +218,11 @@ _EVENT_TYPE_MAP: dict[str, str] = {
     "TOOL_END":    "tool.result",
     "tool_end":    "tool.result",
     "tool_result": "tool.result",
+    # Advisor/session-runner tool execution (pi-coding-agent SDK, #3720)
+    "TOOL_EXECUTION_START": "tool.call",
+    "tool_execution_start": "tool.call",
+    "TOOL_EXECUTION_END":   "tool.result",
+    "tool_execution_end":   "tool.result",
 }
 
 # Stable ordered list of unique ClawMetry event_types this adapter can emit.
@@ -621,6 +626,22 @@ class NeMoAdapter:
                 "is_error": row["data"]["is_error"],
                 "error": error,
             })
+            # Advisor retry-outcome fields (#3720): isError is an explicit bool
+            # (False is meaningful — not equivalent to absent error text), so
+            # _first's is-not-None guard correctly preserves it.
+            _is_err_explicit = _first(attrs, "isError", "is_error")
+            if _is_err_explicit is not None:
+                inner["is_error"] = bool(_is_err_explicit)
+                row["data"]["is_error"] = inner["is_error"]
+            _outcome = _first(attrs, "retryOutcome", "retry_outcome")
+            if _outcome:
+                inner["retry_outcome"] = str(_outcome)
+            _attempt = _first(attrs, "attemptNumber", "attempt_number")
+            if _attempt is not None:
+                try:
+                    inner["attempt_number"] = int(_attempt)
+                except (TypeError, ValueError):
+                    pass
 
         # Stamp the discriminator the dashboard's read path looks for
         # (routes/sessions.py::_is_openclaw_event), and nest the
@@ -1115,6 +1136,22 @@ class NemoClawAdapter(AgentAdapter):
                                     if _val is not None:
                                         extra[_field] = _val
                                 extra["ocsf"] = True
+                            elif r[1] in (
+                                "analysis_error", "ANALYSIS_ERROR",
+                                "commit_prose",   "COMMIT_PROSE",
+                                "repair_prose",   "REPAIR_PROSE",
+                            ):
+                                # Advisor-session run output-state classification
+                                # (#3840): emitAnalysisError / emitCommitProse /
+                                # emitRepairProse each produce a distinct event
+                                # so the dashboard can tell apart the three
+                                # advisor outcomes.
+                                _ot = (
+                                    obj.get("outputType")
+                                    or obj.get("output_type")
+                                    or r[1].lower()
+                                )
+                                extra["output_type"] = str(_ot)
                             # Advisor-session tool-execution retry/exhaustion
                             # lifecycle (#3650): tool_execution_start /
                             # tool_execution_end events carry attempt number,

@@ -30,6 +30,10 @@ Flask app, not a Blueprint, so it stays in ``dashboard.py``.
 Pure mechanical move — zero behaviour change.
 """
 
+from clawmetry.gateway_protocol import (
+    GATEWAY_MAX_PROTOCOL as _GW_MAX_PROTO,
+    GATEWAY_MIN_PROTOCOL as _GW_MIN_PROTO,
+)
 import collections
 import hashlib
 import html
@@ -44,6 +48,7 @@ from datetime import datetime, timezone
 
 from flask import Blueprint, jsonify, make_response, render_template_string, request
 from clawmetry.config import is_local_store_read_enabled
+from clawmetry.otlp_json import OtlpProtobufUnavailable
 
 bp_version = Blueprint('version', __name__)
 bp_gateway = Blueprint('gateway', __name__)
@@ -351,6 +356,48 @@ def api_version():
     return {"current": current, "latest": latest, "update_available": update_available}
 
 
+def _win_cleanup_old_exe_stubs() -> None:
+    """Remove clawmetry*.exe.old stubs left by a previous Windows update attempt."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import sysconfig
+        from pathlib import Path
+        scripts = Path(sysconfig.get_path("scripts"))
+        for stub in scripts.glob("clawmetry*.exe.old"):
+            try:
+                stub.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _win_rename_exe_before_pip():
+    """On Windows, rename clawmetry.exe -> clawmetry.exe.old before pip runs.
+
+    pip's uninstall-then-install tries to overwrite clawmetry.exe while it may
+    be held open by a running dashboard process, causing WinError 32. Renaming
+    an open .exe is allowed on Windows even when overwriting it is not, so pip
+    then writes the new .exe without touching the in-use file.
+
+    Returns (orig_path, renamed_path) on success, or (None, None) otherwise.
+    """
+    if not sys.platform.startswith("win"):
+        return None, None
+    try:
+        import sysconfig
+        from pathlib import Path
+        exe = Path(sysconfig.get_path("scripts")) / "clawmetry.exe"
+        if not exe.exists():
+            return None, None
+        old = exe.with_name("clawmetry.exe.old")
+        exe.rename(old)
+        return exe, old
+    except Exception:
+        return None, None
+
+
 def perform_self_update(reason: str = "manual", restart: bool = True,
                         target_version=None):
     """Core self-update: ``pip install -U clawmetry`` then schedule a process
@@ -396,6 +443,39 @@ def perform_self_update(reason: str = "manual", restart: bool = True,
         # If ensurepip itself isn't available the pip call below will surface
         # a real error message via capture_output, which we now return verbatim.
         pass
+    # Windows: rename clawmetry.exe -> clawmetry.exe.old before pip runs.
+    # pip's uninstall-then-install would otherwise try to overwrite the running
+    # .exe (WinError 32). Renaming is allowed for open .exe files on Windows;
+    # pip then writes the new launcher without touching the in-use file.
+    # Also clean up any .exe.old stubs from a prior failed attempt first.
+    _win_cleanup_old_exe_stubs()
+    _exe_orig, _exe_old = _win_rename_exe_before_pip()
+    def _restore_old_install():
+        # Roll the node back to a known-good state after a failed/killed pip.
+        # Windows: restore the renamed exe so the launcher still works. All
+        # platforms: pip-reinstall the old version so the node is never left
+        # with zero working installs. A pip KILLED mid-install (timeout below)
+        # lays down the new wheel's files but never generates the console
+        # scripts — site-packages then claims "latest" while bin/clawmetry is
+        # gone, and every later plain `pip install --upgrade` no-ops on that
+        # metadata (ghost-install, seen live 2026-07-30). --force-reinstall
+        # regenerates the entry points regardless of what metadata claims.
+        if _exe_old is not None:
+            try:
+                if _exe_old.exists() and not _exe_orig.exists():
+                    _exe_old.rename(_exe_orig)
+            except Exception:
+                pass
+        try:
+            _sp.run(
+                [py, "-m", "pip", "install", "--no-cache-dir",
+                 "--force-reinstall", "--no-deps",
+                 f"clawmetry=={old_version}"],
+                timeout=180, capture_output=True, text=True,
+            )
+        except Exception:
+            pass
+
     try:
         proc = _sp.run(
             # --no-cache-dir dodges the uv-cache-stale-after-[RELEASE] race
@@ -408,11 +488,15 @@ def perform_self_update(reason: str = "manual", restart: bool = True,
             # Surface pip's actual last lines so the banner is actionable —
             # the old code swallowed everything into DEVNULL.
             tail = ((proc.stdout or "") + (proc.stderr or "")).strip()[-800:]
+            _restore_old_install()
             return {"ok": False,
                     "error": f"pip exit {proc.returncode}: {tail or '(no output)'}"}, 500
     except _sp.TimeoutExpired:
+        # The killed pip may have left a scriptless half-install — roll back.
+        _restore_old_install()
         return {"ok": False, "error": "pip install timed out after 180s"}, 500
     except Exception as exc:
+        _restore_old_install()
         return {"ok": False, "error": str(exc)}, 500
     # Re-read new version from pip metadata
     new_version = old_version
@@ -425,6 +509,18 @@ def perform_self_update(reason: str = "manual", restart: bool = True,
             if line.startswith("Version:"):
                 new_version = line.split(":", 1)[1].strip()
                 break
+    except Exception:
+        pass
+
+    # Prune stale dist-info dirs the upgrade may have left behind (pip's
+    # uninstall of the old version half-fails when a sibling process holds
+    # .pyd/.exe files open — the normal Windows case). Keep the version pip
+    # just installed: the OLD version's dist-info is the stale one here, and
+    # leftover stale metadata makes importlib.metadata (and pip's own
+    # installed-version resolution) report the oldest dist-info present.
+    try:
+        from clawmetry.distinfo_cleanup import cleanup_stale_dist_info
+        cleanup_stale_dist_info(keep_version=new_version)
     except Exception:
         pass
 
@@ -585,8 +681,8 @@ def api_gw_config():
                     "id": "validate",
                     "method": "connect",
                     "params": {
-                        "minProtocol": 3,
-                        "maxProtocol": 3,
+                        "minProtocol": _GW_MIN_PROTO,
+                        "maxProtocol": _GW_MAX_PROTO,
                         "client": {
                             "id": "cli",
                             "version": _d.__version__,
@@ -709,6 +805,17 @@ def api_auth_check():
     # needsSetup:true when the token was correctly injected via env.
     gateway_token = _d.GATEWAY_TOKEN or os.environ.get("OPENCLAW_GATEWAY_TOKEN", "").strip()
     if not gateway_token:
+        # needsSetup is informational only now (the legacy mandatory setup
+        # modal it used to drive was removed — onboarding.js owns first-run
+        # UX, and a real OpenClaw gateway is configured opt-in from the
+        # Developer tab). Distinguish "no OpenClaw install at all" from "one
+        # exists but has no token" purely for that signal's accuracy.
+        try:
+            openclaw_present = bool(_d._detect_openclaw_install())
+        except Exception:
+            openclaw_present = False
+        if not openclaw_present:
+            return jsonify({"authRequired": False, "valid": True, "needsSetup": False})
         return jsonify({"authRequired": True, "valid": False, "needsSetup": True})
     token = request.headers.get("Authorization", "").replace("Bearer ", "").strip()
     if not token:
@@ -924,6 +1031,11 @@ def _anon_forward_cloud(payload: dict) -> None:
     OSS side starts feeding live data without another release.
     """
     try:
+        from clawmetry.endpoints import is_custom_endpoint as _is_custom_ep
+        if _is_custom_ep():
+            # Self-hosted / enterprise: anonymous analytics must not leave
+            # the deployment. The local JSONL remains the durable record.
+            return
         import urllib.request as _ur
         req = _ur.Request(
             "https://app.clawmetry.com/api/admin/anon-event",
@@ -1075,116 +1187,70 @@ def index():
 
 
 # ── OTLP receiver routes ──────────────────────────────────────────────────────────────────
+#
+# All three signals share one body (#4781). The old shape pre-checked
+# ``_HAS_OTEL_PROTO`` and answered 501 for EVERY request when the ``otel`` extra
+# was missing, which is the default install -- so the receiver we advertise was
+# off for most users. Now the decoder decides: OTLP/JSON goes through the
+# dependency-free path in ``clawmetry.otlp_json``, and only a payload that
+# genuinely needs protobuf raises ``OtlpProtobufUnavailable`` -> 501.
+
+
+def _otlp_receive(signal, process):
+    """Shared OTLP/HTTP receive path. ``process`` is the dashboard mapper."""
+    import dashboard as _d
+    if _d._budget_paused:
+        return jsonify(
+            {"error": "Budget limit exceeded - intake paused", "paused": True}
+        ), 429
+    try:
+        process(
+            request.get_data(),
+            content_encoding=request.headers.get("Content-Encoding"),
+            content_type=request.headers.get("Content-Type"),
+        )
+        return "{}", 200, {"Content-Type": "application/json"}
+    except OtlpProtobufUnavailable as e:
+        return jsonify(
+            {
+                "error": "opentelemetry-proto not installed",
+                "message": "Install OTLP support: pip install clawmetry[otel]  "
+                "or: pip install opentelemetry-proto protobuf",
+                "hint": str(e),
+            }
+        ), 501
+    except Exception as e:
+        try:
+            import logging as _lg
+            _lg.getLogger("clawmetry.dashboard").warning(
+                "OTLP /v1/%s rejected malformed payload: %s", signal, e
+            )
+        except Exception:
+            pass
+        return jsonify({"error": str(e)}), 400
 
 
 @bp_otel.route("/v1/metrics", methods=["POST"])
 def otlp_metrics():
-    """OTLP/HTTP receiver for metrics (protobuf)."""
+    """OTLP/HTTP receiver for metrics (protobuf; JSON needs the otel extra)."""
     import dashboard as _d
-    if _d._budget_paused:
-        return jsonify(
-            {"error": "Budget limit exceeded - intake paused", "paused": True}
-        ), 429
-    if not _d._HAS_OTEL_PROTO:
-        return jsonify(
-            {
-                "error": "opentelemetry-proto not installed",
-                "message": "Install OTLP support: pip install clawmetry[otel]  "
-                "or: pip install opentelemetry-proto protobuf",
-            }
-        ), 501
-
-    try:
-        pb_data = request.get_data()
-        _d._process_otlp_metrics(
-            pb_data,
-            content_encoding=request.headers.get("Content-Encoding"),
-            content_type=request.headers.get("Content-Type"),
-        )
-        return "{}", 200, {"Content-Type": "application/json"}
-    except Exception as e:
-        try:
-            import logging as _lg
-            _lg.getLogger("clawmetry.dashboard").warning(
-                "OTLP /v1/metrics rejected malformed payload: %s", e
-            )
-        except Exception:
-            pass
-        return jsonify({"error": str(e)}), 400
+    return _otlp_receive("metrics", _d._process_otlp_metrics)
 
 
 @bp_otel.route("/v1/traces", methods=["POST"])
 def otlp_traces():
-    """OTLP/HTTP receiver for traces (protobuf)."""
+    """OTLP/HTTP receiver for traces (protobuf or OTLP/JSON)."""
     import dashboard as _d
-    if _d._budget_paused:
-        return jsonify(
-            {"error": "Budget limit exceeded - intake paused", "paused": True}
-        ), 429
-    if not _d._HAS_OTEL_PROTO:
-        return jsonify(
-            {
-                "error": "opentelemetry-proto not installed",
-                "message": "Install OTLP support: pip install clawmetry[otel]  "
-                "or: pip install opentelemetry-proto protobuf",
-            }
-        ), 501
-
-    try:
-        pb_data = request.get_data()
-        _d._process_otlp_traces(
-            pb_data,
-            content_encoding=request.headers.get("Content-Encoding"),
-            content_type=request.headers.get("Content-Type"),
-        )
-        return "{}", 200, {"Content-Type": "application/json"}
-    except Exception as e:
-        try:
-            import logging as _lg
-            _lg.getLogger("clawmetry.dashboard").warning(
-                "OTLP /v1/traces rejected malformed payload: %s", e
-            )
-        except Exception:
-            pass
-        return jsonify({"error": str(e)}), 400
+    return _otlp_receive("traces", _d._process_otlp_traces)
 
 
 @bp_otel.route("/v1/logs", methods=["POST"])
 def otlp_logs():
-    """OTLP/HTTP receiver for logs (protobuf). Ingests the agent EVENT stream
-    that Claude Code / Codex export as OTel logs (cost/token/model per record),
-    mapping them into the cost + usage tiles. Closes obs-gap #2596."""
+    """OTLP/HTTP receiver for logs (protobuf or OTLP/JSON). Ingests the agent
+    EVENT stream that Claude Code / Codex export as OTel logs (cost/token/model
+    per record), mapping them into the cost + usage tiles. Closes obs-gap #2596."""
     import dashboard as _d
-    if _d._budget_paused:
-        return jsonify(
-            {"error": "Budget limit exceeded - intake paused", "paused": True}
-        ), 429
-    if not _d._HAS_OTEL_PROTO:
-        return jsonify(
-            {
-                "error": "opentelemetry-proto not installed",
-                "message": "Install OTLP support: pip install clawmetry[otel]  "
-                "or: pip install opentelemetry-proto protobuf",
-            }
-        ), 501
-
-    try:
-        pb_data = request.get_data()
-        _d._process_otlp_logs(
-            pb_data,
-            content_encoding=request.headers.get("Content-Encoding"),
-            content_type=request.headers.get("Content-Type"),
-        )
-        return "{}", 200, {"Content-Type": "application/json"}
-    except Exception as e:
-        try:
-            import logging as _lg
-            _lg.getLogger("clawmetry.dashboard").warning(
-                "OTLP /v1/logs rejected malformed payload: %s", e
-            )
-        except Exception:
-            pass
-        return jsonify({"error": str(e)}), 400
+    return _otlp_receive("logs", _d._process_otlp_logs)
 
 
 @bp_otel.route("/api/otel-status")
@@ -1203,7 +1269,13 @@ def api_otel_status():
         pass
     return jsonify(
         {
-            "available": _d._HAS_OTEL_PROTO,
+            # The receiver is always up now (#4781): OTLP/JSON traces + logs
+            # need no extra. ``protobuf`` reports whether the binary encoding
+            # (and OTLP/JSON metrics) is also available, which is what
+            # ``available`` used to mean on its own.
+            "available": True,
+            "protobuf": _d._HAS_OTEL_PROTO,
+            "jsonIngest": ["traces", "logs"],
             "hasData": _d._has_otel_data(),
             "lastReceived": _d._otel_last_received,
             "counts": counts,

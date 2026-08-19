@@ -16,8 +16,10 @@ Environment variables (mirrors tests/test_e2e.py):
     CLAWMETRY_TOKEN -- gateway token (default: ci-test-token)
 """
 
+import importlib
 import json
 import os
+import pathlib
 import urllib.request
 
 import pytest
@@ -33,7 +35,7 @@ BASE_URL = os.environ.get("CLAWMETRY_URL", "http://localhost:8900")
 TOKEN = os.environ.get("CLAWMETRY_TOKEN", "ci-test-token")
 
 
-# Class-scoped page shared across all 33 parametrized tab tests.
+# Class-scoped page shared across all parametrized tab tests.
 #
 # Why class-scoped instead of function-scoped:
 #   The original fixture created a fresh browser context per test
@@ -58,11 +60,32 @@ def _overlay_page(_shared_chromium):
         "} catch(e) {}"
     )
     page = ctx.new_page()
-    # One page load for the entire 33-tab suite.
+    # One page load for the entire tab suite.
     page.goto(BASE_URL + "/", wait_until="domcontentloaded", timeout=15000)
-    # Let auth-bootstrap.js fetch /api/auth/check and gw-setup.js fetch
-    # /api/gw/config settle before any tab test checks for overlays.
-    page.wait_for_timeout(2000)
+    # Poll up to 8s for the auth overlay to disappear (replaces fixed 2s wait).
+    # A fixed wait races /api/auth/check on cold CI runners: the overlay can
+    # still be visible when switchTab() runs, causing every tab silently to
+    # land on overview with the overlay present -- the root symptom of the
+    # 2026-05-17 user report. Matches the approach in visual-diff.mjs.
+    try:
+        page.wait_for_function(
+            """() => {
+                for (const id of ['login-overlay', 'gw-setup-overlay',
+                                  'auth-overlay', 'setup-overlay']) {
+                    const el = document.getElementById(id);
+                    if (!el) continue;
+                    const cs = getComputedStyle(el);
+                    if (cs.display !== 'none' && cs.visibility !== 'hidden') return false;
+                }
+                return true;
+            }""",
+            timeout=8000,
+            polling=200,
+        )
+    except Exception:
+        # Overlay still visible after 8s -- the tab tests will report it with
+        # descriptive messages; no silent fallthrough to wrong-tab screenshots.
+        pass
     yield page
     ctx.close()
 
@@ -94,7 +117,9 @@ CANONICAL_TABS = [
     "approvals",
     "alerts",
     "notifications",
-    "context",
+    # "context" (LLM Context) merged into "context-economics" (Context usage)
+    # 2026-08-01: the old tab rendered hardcoded token estimates node-wide.
+    # switchTab('context') aliases to context-economics for old deep links.
     "limits",
     "clusters",
     "history",
@@ -113,6 +138,8 @@ CANONICAL_TABS = [
     "turn-anatomy",      # turn-anatomy.html: turn anatomy analysis
     "version-impact",    # version-impact.html: version impact view
     "context-economics", # context-economics.html: context economics
+    "agents",            # agents.html: multi-agent orchestration view
+    "evals",             # evals.html: LLM-judge scores + evaluator library
 ]
 
 # Overlay element IDs that signal the auth overlay is blocking the UI.
@@ -128,6 +155,152 @@ pytestmark = pytest.mark.skipif(
     not _PLAYWRIGHT_AVAILABLE,
     reason="playwright not installed -- pip install pytest-playwright",
 )
+
+
+def test_canonical_tabs_cover_all_templates():
+    """Every clawmetry/templates/tabs/*.html stem must be in CANONICAL_TABS.
+
+    Catches the silent-drift gap: a new tab template added to
+    clawmetry/templates/tabs/ without updating CANONICAL_TABS (and
+    pr-screenshots.yml + visual-diff.mjs) would never receive the
+    post-auth overlay sweep required by C5, and could silently ship
+    with a login overlay blocking the new tab in production.
+
+    When this test fails it lists every missing stem and names the
+    three files that need to be updated.
+    """
+    try:
+        clawmetry_mod = importlib.import_module("clawmetry")
+    except ImportError:
+        pytest.skip("clawmetry package not installed -- run 'pip install -e .'")
+
+    tabs_dir = pathlib.Path(clawmetry_mod.__file__).parent / "templates" / "tabs"
+    if not tabs_dir.exists():
+        pytest.skip(f"templates/tabs/ not found at {tabs_dir} -- check package layout")
+
+    template_stems = {p.stem for p in tabs_dir.glob("*.html")}
+    canonical_set = set(CANONICAL_TABS)
+
+    uncovered = template_stems - canonical_set
+    assert not uncovered, (
+        f"Tab template(s) in clawmetry/templates/tabs/ are NOT in CANONICAL_TABS "
+        f"and will never be post-auth swept (C5 gap): {sorted(uncovered)}. "
+        f"Add each missing name to:\n"
+        f"  1. CANONICAL_TABS in tests/test_e2e_oss_all_tabs.py\n"
+        f"  2. PR_SCREENSHOT_TABS in .github/workflows/pr-screenshots.yml\n"
+        f"  3. DEFAULT_TABS in .github/scripts/visual-diff.mjs"
+    )
+
+
+def test_pr_screenshot_tabs_match_canonical():
+    """PR_SCREENSHOT_TABS in pr-screenshots.yml must equal CANONICAL_TABS exactly.
+
+    Closes a silent-drift gap: a tab added to CANONICAL_TABS (so the
+    post-auth overlay sweep covers it) but NOT added to PR_SCREENSHOT_TABS
+    would never appear in the visual-diff screenshot run, meaning a login-
+    overlay regression on that tab would pass CI undetected.
+
+    When this test fails it names the diverging entries and the three files
+    that must be kept in sync.
+    """
+    import re
+
+    workflow_path = (
+        pathlib.Path(__file__).parent.parent
+        / ".github"
+        / "workflows"
+        / "pr-screenshots.yml"
+    )
+    if not workflow_path.exists():
+        pytest.skip(
+            f"pr-screenshots.yml not found at {workflow_path} -- not a source checkout"
+        )
+
+    content = workflow_path.read_text()
+    m = re.search(r'PR_SCREENSHOT_TABS:\s+"([^"]+)"', content)
+    if not m:
+        pytest.fail(
+            "Could not find PR_SCREENSHOT_TABS: \"...\" in "
+            ".github/workflows/pr-screenshots.yml. "
+            "Ensure the env var uses double-quoted value on one line."
+        )
+
+    pr_tabs = [t.strip() for t in m.group(1).split(",") if t.strip()]
+    canonical_set = set(CANONICAL_TABS)
+    pr_set = set(pr_tabs)
+
+    errors = []
+    only_in_canonical = canonical_set - pr_set
+    only_in_pr = pr_set - canonical_set
+    if only_in_canonical:
+        errors.append(
+            f"In CANONICAL_TABS but NOT in PR_SCREENSHOT_TABS: {sorted(only_in_canonical)}"
+        )
+    if only_in_pr:
+        errors.append(
+            f"In PR_SCREENSHOT_TABS but NOT in CANONICAL_TABS: {sorted(only_in_pr)}"
+        )
+
+    assert not errors, (
+        "Tab list mismatch -- these three sources must be identical:\n"
+        "  CANONICAL_TABS in tests/test_e2e_oss_all_tabs.py\n"
+        "  PR_SCREENSHOT_TABS in .github/workflows/pr-screenshots.yml\n"
+        "  DEFAULT_TABS in .github/scripts/visual-diff.mjs\n"
+        + "\n".join(errors)
+    )
+
+
+def test_visual_diff_default_tabs_match_canonical():
+    """DEFAULT_TABS in visual-diff.mjs must equal CANONICAL_TABS exactly.
+
+    Closes a silent-drift gap: a tab added to CANONICAL_TABS but NOT to
+    DEFAULT_TABS would never be screenshotted in the visual-diff run, so a
+    login-overlay regression on that tab would pass CI undetected.
+    """
+    import re
+
+    script_path = (
+        pathlib.Path(__file__).parent.parent
+        / ".github"
+        / "scripts"
+        / "visual-diff.mjs"
+    )
+    if not script_path.exists():
+        pytest.skip(
+            f"visual-diff.mjs not found at {script_path} -- not a source checkout"
+        )
+
+    content = script_path.read_text()
+    m = re.search(r'const DEFAULT_TABS\s*=\s*"([^"]+)"', content)
+    if not m:
+        pytest.fail(
+            "Could not find `const DEFAULT_TABS = \"...\"` in "
+            ".github/scripts/visual-diff.mjs."
+        )
+
+    vd_tabs = [t.strip() for t in m.group(1).split(",") if t.strip()]
+    canonical_set = set(CANONICAL_TABS)
+    vd_set = set(vd_tabs)
+
+    errors = []
+    only_in_canonical = canonical_set - vd_set
+    only_in_vd = vd_set - canonical_set
+    if only_in_canonical:
+        errors.append(
+            f"In CANONICAL_TABS but NOT in DEFAULT_TABS: {sorted(only_in_canonical)}"
+        )
+    if only_in_vd:
+        errors.append(
+            f"In DEFAULT_TABS but NOT in CANONICAL_TABS: {sorted(only_in_vd)}"
+        )
+
+    assert not errors, (
+        "Tab list mismatch -- these three sources must be identical:\n"
+        "  CANONICAL_TABS in tests/test_e2e_oss_all_tabs.py\n"
+        "  PR_SCREENSHOT_TABS in .github/workflows/pr-screenshots.yml\n"
+        "  DEFAULT_TABS in .github/scripts/visual-diff.mjs\n"
+        + "\n".join(errors)
+    )
 
 
 class TestAllTabsPostAuth:
@@ -164,13 +337,35 @@ class TestAllTabsPostAuth:
         only calls switchTab() and checks the overlay state. Re-navigating
         to "/" per test caused 33 sequential page loads that saturated the
         waitress WSGI queue and produced spurious TimeoutErrors.
+
+        If this test fails with AssertionError containing 'window.switchTab()
+        not available', the root cause is not the overlay itself but that
+        app.js failed to load or parse (e.g. syntax error shipped in the
+        bundle) or that auth is still blocking script execution on load.
+        Check the server log and /api/auth/check before investigating tabs.
         """
         page = _overlay_page
 
         if tab != "overview":
-            page.evaluate(
-                "typeof window.switchTab === 'function' && "
-                f"window.switchTab({json.dumps(tab)})"
+            # Use an explicit return value instead of the short-circuit bool
+            # guard ("typeof ... === 'function' && switchTab()") so that a
+            # missing switchTab fails loudly rather than silently checking the
+            # overview tab for every parametrized case.
+            result = page.evaluate(
+                "(tab) => {"
+                "  if (typeof window.switchTab !== 'function') return 'no-switchtab';"
+                "  window.switchTab(tab);"
+                "  return 'ok';"
+                "}",
+                tab,
+            )
+            assert result == "ok", (
+                f"Tab '{tab}': window.switchTab() not available on the loaded page. "
+                f"Root causes: (1) app.js failed to parse or load (404/syntax error); "
+                f"(2) auth overlay is still blocking JS execution; "
+                f"(3) page has not finished initialising. "
+                f"Ensure OPENCLAW_GATEWAY_TOKEN={TOKEN!r} matches CLAWMETRY_TOKEN "
+                f"and that {BASE_URL!r} is reachable."
             )
 
         page.wait_for_timeout(500)

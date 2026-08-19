@@ -53,6 +53,26 @@ def _zero():
     return {"agents": [], "total": 0}
 
 
+def _daemon_running() -> bool:
+    try:
+        from routes.local_query import _cached_discovery
+        return _cached_discovery() is not None
+    except Exception:
+        return False
+
+
+def _detected_runtimes() -> list:
+    try:
+        from clawmetry.adapters import registry
+        return [
+            r.to_dict()
+            for r in registry.detect_all()
+            if getattr(r, "detected", False)
+        ]
+    except Exception:
+        return []
+
+
 def _build_local_inventory():
     """Compose the node-wide roster locally, reusing the daemon's builder so the
     shape matches the snapshot byte-for-byte. Never raises; returns the
@@ -119,6 +139,18 @@ def _build_local_inventory():
     except Exception:
         node_id = ""
 
+    # Recency liveness, read from the SAME typed sessions table
+    # ``/api/live-sessions`` uses so the Agents tab and the Home hero can never
+    # disagree about what is working right now. ``None`` (not ``{}``) when the
+    # read fails, so the roster renders "unknown" instead of a confident zero.
+    live_by_rt = None
+    try:
+        rows = _ls_call("query_sessions_table", limit=200)
+        if rows is not None:
+            live_by_rt = _sync._live_counts_by_runtime(rows)
+    except Exception:
+        live_by_rt = None
+
     try:
         node_wide, _by_rt = _sync._build_agent_inventory(
             runtime_summary,
@@ -129,6 +161,7 @@ def _build_local_inventory():
             detected,
             agent_meta,
             node_id,
+            live_by_rt=live_by_rt,
         )
         return node_wide
     except Exception:
@@ -147,11 +180,38 @@ def api_inventory():
         node_wide = _build_local_inventory()
     except Exception:
         node_wide = None
-    if not node_wide or not isinstance(node_wide, dict):
-        return jsonify(_zero())
-    # Empty roster: return the bare zero shape (the cold-fallthrough contract)
-    # so cloud / store-less renders an honest empty state, not a stray nodeId.
-    if not node_wide.get("agents"):
+    if not node_wide or not isinstance(node_wide, dict) or not node_wide.get("agents"):
+        # Local store enabled but roster empty — surface detected runtimes so
+        # the UI can render an honest "daemon not ingesting yet" state instead
+        # of the misleading "No agents yet" copy (issue #3917).
+        detected = _detected_runtimes()
+        if not detected:
+            # The adapter registry only knows the runtimes whose adapters are
+            # loaded — on a fresh self-host install the pro plugin (Claude
+            # Code, Cursor, ...) is not importable yet, so a machine covered
+            # in Claude Code sessions still detected NOTHING here and the UI
+            # fell back to the generic "No agents yet" copy (live-hit
+            # 2026-08-02). The lite detector filesystem-scans instead, so it
+            # sees paid runtimes before the pro wheel lands.
+            try:
+                import dashboard as _d
+                detected = [
+                    {
+                        "name": r.get("id", ""),
+                        "displayName": r.get("label") or r.get("id", ""),
+                        "sessions": r.get("sessions", 0),
+                    }
+                    for r in (_d._detect_other_runtimes_lite() or [])
+                ]
+            except Exception:
+                detected = []
+        if detected:
+            return jsonify({
+                "agents": [],
+                "total": 0,
+                "detectedRuntimes": detected,
+                "daemonRunning": _daemon_running(),
+            })
         return jsonify(_zero())
 
     # Per-runtime no-leak: when a specific runtime is requested, return ONLY

@@ -5,6 +5,10 @@ on:
     branches: [main, master]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # ── Fast syntax check (runs in ~10s, blocks everything else) ─────────────────────
   lint:
@@ -12,35 +16,99 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.9"
       - name: Check Python syntax (all .py files, Python 3.9 compatible)
         run: |
           python3 -c "
           import ast, glob, sys
+          # dashboard.py imports every routes/*.py Blueprint at module
+          # top level, so a SyntaxError anywhere under routes/ bricks the
+          # dashboard startup end-to-end. PR #3946 corrupted
+          # routes/entitlement.py (dropped module docstring open, lost
+          # tail fn body) and rode green through this gate because the
+          # glob only covered clawmetry/**/*.py -- CI api-tests then
+          # failed for three consecutive merged PRs before anyone
+          # noticed. Include routes/**/*.py + tests/**/*.py + the
+          # top-level scripts alongside dashboard.py so this gate
+          # covers every .py the server actually loads.
           errors = 0
-          for f in ['dashboard.py'] + glob.glob('clawmetry/**/*.py', recursive=True):
+          files = (
+              ['dashboard.py', 'history.py']
+              + glob.glob('clawmetry/**/*.py', recursive=True)
+              + glob.glob('routes/**/*.py', recursive=True)
+              + glob.glob('tests/**/*.py', recursive=True)
+          )
+          seen = set()
+          checked = []
+          for f in files:
+              if f in seen:
+                  continue
+              seen.add(f)
               try:
-                  ast.parse(open(f).read(), filename=f)
+                  src = open(f).read()
+              except FileNotFoundError:
+                  continue
+              checked.append(f)
+              try:
+                  ast.parse(src, filename=f)
               except SyntaxError as e:
                   print(f'❌ {f}:{e.lineno}: {e.msg}')
                   errors += 1
           if errors:
               sys.exit(1)
-          print(f'✅ Syntax OK ({len(glob.glob(\"clawmetry/**/*.py\", recursive=True)) + 1} files)')
+          print(f'✅ Syntax OK ({len(checked)} files)')
           "
       - name: Install ruff (fast linter)
         run: pip install ruff
       - name: Lint (warnings only, don't fail)
         run: ruff check dashboard.py --select E,W --ignore E501,W503 || true
 
+      # The advertised runtime count lives in prose across the README, its
+      # translations, FLYWHEEL.md, the CLI and the desktop copy, and every one
+      # of those drifted from the catalogue before this guard existed
+      # (2026-08-15: catalogue 20, README 14, PyPI 12). setup.py derives the
+      # PyPI summary; this keeps the rest honest.
+      - name: Runtime count matches the entitlement catalogue
+        run: python3 scripts/sync_runtime_count.py --check
+
+      # Silent-CLI class guard (#3791): rebinding sys.stdout/sys.stderr to a
+      # new TextIOWrapper over the same buffer orphans the previous wrapper;
+      # its GC finalizer closes the SHARED buffer, and every later print(),
+      # argparse help, and wizard prompt dies silently (exit 0, zero bytes).
+      # reconfigure() is the only allowed spelling for stream re-encoding.
+      - name: Ban stdout/stderr TextIOWrapper rebinds (silent-CLI class, #3791)
+        run: |
+          python3 -c "
+          import glob, re, sys
+          pat = re.compile(r'sys\.(stdout|stderr)\s*=\s*io\.TextIOWrapper\(', re.S)
+          bad = []
+          for f in (
+              ['dashboard.py']
+              + glob.glob('clawmetry/**/*.py', recursive=True)
+              + glob.glob('routes/**/*.py', recursive=True)
+          ):
+              try:
+                  src = open(f, encoding='utf-8', errors='replace').read()
+              except FileNotFoundError:
+                  continue
+              for m in pat.finditer(src):
+                  line = src[:m.start()].count(chr(10)) + 1
+                  bad.append(f'{f}:{line}: use sys.{m.group(1)}.reconfigure(...) instead of a TextIOWrapper rebind')
+          if bad:
+              print('Silent-CLI class violation (see #3791):')
+              print(chr(10).join(bad))
+              sys.exit(1)
+          print('OK: no stdout/stderr TextIOWrapper rebinds')
+          "
+
       # v0.12.165 shipped clawmetry/static/js/app.js with a missing `}`
       # (PR #753). Browsers threw "Unexpected end of input" and the whole
       # dashboard JS bundle died, stranding every user on the boot
       # overlay. `node --check` catches this in <1s. Required gate.
       - name: Setup Node (for JS syntax check)
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
       - name: Check JS syntax (all clawmetry/static/js/*.js)
@@ -51,11 +119,19 @@ jobs:
           done
           echo "✅ JS Syntax OK"
 
-  # ── API tests across all 3 platforms ─────────────────────────────────────────────
+  # ── API tests across all 3 platforms ─────────────────────────────────────────────────────────────────────────────────────────
   api-tests:
     name: API Tests (${{ matrix.os }})
     needs: lint
     runs-on: ${{ matrix.os }}
+    # Trial-end hard block is default-ON in code (clawmetry/trial_enforcement.py).
+    # CI has no license file, so every non-allowlisted request would 402 and the
+    # dashboard readiness probe would time out. These jobs test unrelated
+    # feature APIs (channels/health/sessions/…) — dedicated hard-block coverage
+    # lives in tests/test_trial_hard_block.py. Opt out at the job level so both
+    # the pre-pytest server boot AND the pytest conftest spawn see it.
+    env:
+      CLAWMETRY_HARD_BLOCK: '0'
     strategy:
       fail-fast: false
       matrix:
@@ -70,7 +146,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -115,9 +191,12 @@ jobs:
         env:
           CLAWMETRY_URL: http://localhost:8900
           CLAWMETRY_TOKEN: ci-test-token
-        run: python3 -m pytest tests/test_api.py -v --tb=short
+        # -m 'not quarantine': skip any tests listed in tests/quarantine.txt
+        # (marked by conftest.py:pytest_collection_modifyitems via quarantine.txt).
+        # Quarantined tests still run daily in quarantine-sweep.yml.
+        run: python3 -m pytest tests/test_api.py -v --tb=short -m 'not quarantine'
 
-  # ── MOAT verifier (hermetic, hard-fail) ────────────────────────────────────────────────────
+  # ── MOAT verifier (hermetic, hard-fail) ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   # Issue #1491 / PRD #1133 invariant #3: "A regression in either direction
   # is caught BEFORE merge." These files exercise the
   # OpenClaw → DuckDB → API surface contract end-to-end, plus the lint
@@ -131,7 +210,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -155,6 +234,7 @@ jobs:
             tests/test_channel_event_chokepoint.py \
             tests/test_no_direct_get_store_in_routes.py \
             tests/test_moat_bug_class_v3_event_shape_gate.py \
+            tests/test_runtime_count_copy_sync.py \
             tests/test_local_query_api.py \
             tests/test_local_query_dispatch_edge_cases.py \
             tests/test_query_contract_drift.py \
@@ -165,20 +245,23 @@ jobs:
             tests/test_family_runtime_ingest.py \
             tests/test_phase4_adapter_move.py \
             tests/test_openclaw_detection_real.py \
+            tests/test_hooks_claude_code.py \
             -q
 
-  # ── Entitlement API test suite (~2700 hermetic tests) ─────────────────────
+  # ── Entitlement API test suite (~2700+ hermetic tests) ─────────────────────────────────────────────
   # Covers every helper in clawmetry/entitlements.py and every endpoint
   # under routes/entitlement.py via Flask test client. No live server, no
-  # gateway, no network. Runtime ~60s. HARD-FAIL: no continue-on-error.
+  # gateway, no network. Runtime ~8-16min on CI runners (suite has grown
+  # as stacked PRs added test files; timeout raised 5 -> 10 -> 20 to stop
+  # mid-suite cancellations). HARD-FAIL: no continue-on-error.
   entitlement-tests:
     name: Entitlement API tests
     needs: lint
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -192,9 +275,10 @@ jobs:
             tests/test_required_tier_canonical.py \
             tests/test_tier_catalog.py \
             tests/test_tier_cli.py \
+            tests/test_license_scalar_accessors.py \
             -q
 
-  # ── Compression / cache-safety eval (Tier-1, deterministic) ──────────────
+  # ── Compression / cache-safety eval (Tier-1, deterministic) ──────────────────────────────
   # Issue #2844 (epic #2837): port Headroom's eval rigor so we can claim
   # "compression-safe" with proof. This Tier-1 gate is pure-Python and spends
   # ZERO API budget — it proves CCR payload compression is byte-for-byte
@@ -209,7 +293,7 @@ jobs:
     timeout-minutes: 3
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -218,7 +302,7 @@ jobs:
       - name: Run compression/cache-safety eval suite
         run: python3 -m pytest tests/test_compression_safety_eval.py -q
 
-  # ── MOAT keystone (DuckDB-first invariant, 13-endpoint bar) ──────────────
+  # ── MOAT keystone (DuckDB-first invariant, 13-endpoint bar) ──────────────────────────────
   # Implements `docs/MOAT_BAR.md` Section 5 acceptance criterion #1:
   # `keystone_e2e.py --no-drive` exits 0 on every PR. The keystone is the
   # canonical 13-endpoint verifier (PR #1672) that asserts every
@@ -245,7 +329,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -331,10 +415,14 @@ jobs:
     name: E2E Browser Tests (critical subset)
     needs: lint
     runs-on: ubuntu-latest
+    timeout-minutes: 12
+    # Trial-end hard block is default-ON in code — see api-tests job.
+    env:
+      CLAWMETRY_HARD_BLOCK: '0'
 
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install dependencies
@@ -342,6 +430,13 @@ jobs:
         # event store; without it the server crashes on import and the
         # health check silently times out.
         run: pip install flask pytest pytest-playwright requests duckdb
+      - name: Cache Playwright browsers
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('setup.py', 'requirements.txt') }}
+          restore-keys: |
+            playwright-chromium-${{ runner.os }}-
       - name: Install Playwright browsers
         run: python3 -m playwright install chromium --with-deps
       - name: Start server
@@ -380,13 +475,28 @@ jobs:
         env:
           CLAWMETRY_URL: http://localhost:8900
           CLAWMETRY_TOKEN: ci-test-token
+        # -m 'not quarantine': skip any tests listed in tests/quarantine.txt
+        # (marked by conftest.py:pytest_collection_modifyitems). This lets
+        # a flaky test be quarantined without blocking all PRs. Quarantined
+        # tests still run daily in quarantine-sweep.yml and hard-fail if
+        # they go permanently broken (not just intermittent).
         run: |
           python3 -m pytest \
             tests/test_e2e.py::TestTabsLoad \
-            tests/test_e2e_oss_all_tabs.py::TestAllTabsPostAuth \
-            -v --tb=short
+            tests/test_e2e_oss_all_tabs.py \
+            -v --tb=short -m 'not quarantine' \
+            --junitxml=/tmp/junit-e2e-critical.xml
 
-  # ── pip install smoke test across platforms ─────────────────────────────────────────
+      - name: Upload JUnit test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-e2e-critical-${{ github.run_id }}
+          path: /tmp/junit-e2e-critical.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ── pip install smoke test across platforms ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   pip-install:
     name: pip install (${{ matrix.os }})
     needs: lint
@@ -397,17 +507,42 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install from source
         run: pip install flask .
-      - name: Smoke test - help works
-        run: python3 -c "import dashboard" || python3 dashboard.py --version 2>/dev/null || echo 'import OK'
-        continue-on-error: true
-      - name: Smoke test - syntax valid
-        run: python3 -c "import dashboard; print('✅ Import OK')"
-        continue-on-error: true  # May fail if dashboard has top-level side effects
+      # These used to be continue-on-error with a `|| echo` fallback, which
+      # means they could never fail. The 5-week silent-Windows-CLI regression
+      # (#3791) sailed through them: exit code 0, zero bytes of output. The
+      # replacement asserts on stdout CONTENT via the real console script the
+      # user gets, on all 3 OS. Exit-code-only CLI checks are banned.
+      - name: Import must not kill stdout (#3791)
+        shell: python
+        run: |
+          import gc, subprocess, sys
+          code = (
+              "import gc, sys\n"
+              "import dashboard\n"
+              "gc.collect()\n"
+              "assert not sys.stdout.closed, 'dashboard import closed sys.stdout'\n"
+              "print('STDOUT_ALIVE')\n"
+          )
+          p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300)
+          assert p.returncode == 0, p.stderr[-2000:]
+          assert "STDOUT_ALIVE" in p.stdout, f"stdout dead after import: {p.stdout!r}"
+          print("import smoke OK")
+      - name: CLI smoke - output must not be silent (#3791)
+        shell: python
+        run: |
+          import subprocess
+          checks = [(["clawmetry", "--version"], "clawmetry"), (["clawmetry", "--help"], "usage")]
+          for cmd, must in checks:
+              p = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+              assert p.returncode == 0, (cmd, p.returncode, p.stderr[-2000:])
+              out = (p.stdout or "").lower()
+              assert must in out, f"{cmd}: expected {must!r} in stdout, got {p.stdout!r} (silent-CLI regression, see #3791)"
+          print("CLI smoke OK: --version and --help print real output")
 
   # ── Wheel-install verification: routes/, helpers/, static/, templates/ ────
   # This catches packaging regressions that source-checkout tests miss.
@@ -421,7 +556,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Build wheel
@@ -462,7 +597,7 @@ jobs:
           fi
           echo "✅ /static/js/app.js served from installed wheel"
 
-  # ── Eval suite gate (Phase 2 evals, refs #1619 / PR #1626) ──────────────
+  # ── Eval suite gate (Phase 2 evals, refs #1619 / PR #1626) ──────────────────────────────
   # Runs ClawMetry's own golden suite (tests/data/golden_ci.yaml) through
   # the `clawmetry eval` CLI on every PR. Catches regressions in:
   #   * eval_suite_runner.py YAML parsing / runner loop
@@ -477,7 +612,7 @@ jobs:
   # community PRs) the job emits an explicit "SKIPPED" warning and exits
   # 0. The gate hard-fails only when the secret IS set AND any test
   # fails. This keeps green-checks-only test runs unblocked while still
-  # gating the merge for maintainer-owned PRs.
+  # gating the merge for maintainer-approved PRs.
   #
   # To disable the gate temporarily (e.g. during a known-broken judge
   # provider outage), set the repo variable `CLAWMETRY_EVALS_GATE` to
@@ -490,7 +625,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -551,7 +686,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  # ── Live OpenClaw E2E ──────────────────────────────────────────────────────
+  # ── Live OpenClaw E2E ────────────────────────────────────────────────────────────────────────────────────────────────────────
   # Closes #1544. Boots a real openclaw gateway, sends a real message
   # through `openclaw agent --local`, drives the daemon's
   # sync_sessions_recent over the on-disk JSONL, and asserts every
@@ -580,7 +715,7 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Setup OpenClaw

@@ -14,6 +14,10 @@ https://github.com/vivekchand/clawmetry
 MIT License
 """
 
+from clawmetry.gateway_protocol import (
+    GATEWAY_MAX_PROTOCOL as _GW_MAX_PROTO,
+    GATEWAY_MIN_PROTOCOL as _GW_MIN_PROTO,
+)
 import hmac
 import os
 import sys
@@ -25,17 +29,18 @@ import sys
 # CI (issue surfaced by the bp_sessions refactor).
 sys.modules.setdefault("dashboard", sys.modules[__name__])
 
-# Force UTF-8 output on Windows (emoji in BANNER would crash with cp1252)
+# Force UTF-8 output on Windows (emoji in BANNER would crash with cp1252).
+# Must be reconfigure(), not a new TextIOWrapper around sys.stdout.buffer:
+# this block runs twice (the module header is duplicated inside this file),
+# and when the second wrapper replaces the first, the orphaned wrapper is
+# garbage-collected and closes the shared underlying buffer — leaving
+# sys.stdout closed for the rest of the process (silent --help, dead prints).
 if sys.platform == "win32":
     import io
 
     try:
-        sys.stdout = io.TextIOWrapper(
-            sys.stdout.buffer, encoding="utf-8", errors="replace"
-        )
-        sys.stderr = io.TextIOWrapper(
-            sys.stderr.buffer, encoding="utf-8", errors="replace"
-        )
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
 
@@ -103,12 +108,17 @@ from routes.health import bp_health
 from routes.alerts import bp_alerts, bp_budget
 from routes.channels import bp_channels
 from routes.overview import bp_overview
+from routes.trial import bp_trial
+from routes.onboarding import bp_onboarding
 from routes.components import bp_components
 from routes.fleet_history import bp_fleet
 from routes.infra import bp_logs, bp_memory, bp_security, bp_config
 from routes.meta import bp_auth, bp_cloud_relay, bp_gateway, bp_otel, bp_otlp_traces, bp_version, bp_version_impact
+from routes.compliance import bp_compliance
+from routes.org_analytics import bp_org_analytics
 from routes.nemoclaw import bp_nemoclaw
 from routes.skills import bp_skills
+from routes.runtime_memory import bp_runtime_memory
 from routes.heartbeat import bp_heartbeat
 from routes.autonomy import bp_autonomy
 from routes.selfconfig import bp_selfconfig
@@ -124,6 +134,7 @@ from routes.bootstrap import bp_bootstrap
 from routes.insights import bp_insights
 from routes.review import bp_review
 from routes.evals import bp_evals
+from routes.quality import bp_quality
 from routes.dives import bp_dives
 from routes.reports import bp_reports
 from routes.scheduler import bp_scheduler
@@ -131,6 +142,7 @@ from routes.policy import bp_policy
 from routes.turn_anatomy import bp_turn_anatomy
 from routes.tool_catalog import bp_tool_catalog
 from routes.context_economics import bp_context_economics
+from routes.spend_flow import bp_spend_flow
 from routes.entitlement import bp_entitlement
 from routes.extensions import bp_extensions
 from routes.otel_export import bp_otel_export
@@ -139,6 +151,8 @@ from routes.runtime_ingest import bp_runtime_ingest
 from routes.audit import bp_audit
 from routes.sla import bp_sla
 from routes.hitl import bp_hitl
+from routes.rules import bp_rules
+from routes.attention import bp_attention
 from helpers.openapi import bp_openapi
 
 # History / time-series module
@@ -222,6 +236,59 @@ def _otlp_decode(pb_data, proto_msg, content_encoding=None, content_type=None):
     return proto_msg
 
 
+def _otlp_request(pb_data, kind, content_encoding=None, content_type=None):
+    """Decode an OTLP body for ``kind`` ('traces' | 'logs' | 'metrics').
+
+    Issue #4781. ``opentelemetry-proto`` is behind the ``otel`` extra, so on a
+    default install every OTLP POST used to answer 501 and the advertised
+    receiver was simply off. Binary bodies still decode with protobuf exactly as
+    before; JSON bodies go through the stdlib decoder in
+    ``clawmetry.otlp_json``, which returns objects that duck-type the protobuf
+    message API -- so ``_process_otlp_*`` and ``_otel_to_row`` run unchanged
+    over either format and there is no second mapping path to drift.
+
+    Raises ``OtlpProtobufUnavailable`` when the payload genuinely needs the
+    extra (a protobuf body, or JSON metrics); the HTTP layer turns that into
+    501 with the install hint. Malformed bodies still raise (caller -> 400).
+
+    OTLP/JSON traces and logs go through the stdlib decoder even when protobuf
+    IS installed. That is deliberate, and it fixes a silent corruption: protobuf
+    JSON maps ``bytes`` fields from BASE64, but the OTLP/JSON spec overrides
+    that for ``traceId`` / ``spanId`` / ``parentSpanId``, which are lowercase
+    HEX. ``json_format.Parse`` therefore base64-decoded every id and we stored
+    the garbage. Measured against a live dashboard: span id ``3333333333333333``
+    persisted as ``df7df7df7df7df7df7df7df7``, and every id in the batch was
+    mangled the same way, so ids never matched the user's own trace ids or any
+    other backend they correlate with.
+    """
+    ct = (content_type or "").lower()
+    if ("application/json" in ct or "application/x-ndjson" in ct) and kind in (
+        "traces", "logs",
+    ):
+        from clawmetry.otlp_json import decode as _json_decode
+        return _json_decode(pb_data, kind, content_encoding=content_encoding)
+
+    if _HAS_OTEL_PROTO:
+        factories = {
+            "traces": lambda: trace_service_pb2.ExportTraceServiceRequest(),
+            "logs": lambda: logs_service_pb2.ExportLogsServiceRequest(),
+            "metrics": lambda: metrics_service_pb2.ExportMetricsServiceRequest(),
+        }
+        factory = factories.get(kind)
+        if factory is None:
+            raise ValueError(f"unknown OTLP kind: {kind}")
+        return _otlp_decode(pb_data, factory(), content_encoding, content_type)
+
+    # No protobuf, and this is either a binary body or JSON metrics (whose
+    # mapper still reaches into sum/gauge/histogram point types).
+    from clawmetry.otlp_json import OtlpProtobufUnavailable
+
+    raise OtlpProtobufUnavailable(
+        "this payload needs opentelemetry-proto; OTLP/JSON traces and logs "
+        "work without it (send Content-Type: application/json)"
+    )
+
+
 def _otlp_service_name_to_agent_type(service_name):
     """Map an OTLP resource ``service.name`` onto a ClawMetry ``agent_type``.
 
@@ -259,7 +326,7 @@ def _otlp_service_name_to_agent_type(service_name):
     return slug or "custom"
 
 
-__version__ = "0.12.554"
+__version__ = "0.12.727"
 
 # Extensions (Phase 2): import the plugin host now, but defer the actual
 # load_plugins() call until after the Flask app is created below so we can
@@ -276,16 +343,16 @@ except ImportError:
         pass  # noqa
 
 
-app = Flask(
-    __name__,
-    static_folder=os.path.join(os.path.dirname(__file__), 'clawmetry', 'static'),
-    template_folder=os.path.join(os.path.dirname(__file__), 'clawmetry', 'templates'),
-)
-
-# Plugins (e.g. ``clawmetry-pro``) can now register Blueprints on ``app``.
-# Older plugins with ``register_all()`` (no args) keep working unchanged:
-# the loader inspects the signature and only passes ``app`` when accepted.
-_ext_load(app)
+# NOTE: the Flask app is constructed ONCE, further down this module (search
+# for ``app = Flask(``). A second, earlier construction used to live here and
+# silently orphaned every plugin Blueprint: clawmetry-pro registered its
+# routes on the early app, then the later ``app = Flask(...)`` replaced it and
+# every pro-only endpoint (nemoclaw, selfevolve, assets, compliance, ...)
+# 404'd on licensed installs while the OSS 402 stubs skipped registration
+# because ``clawmetry_pro.is_loaded()`` was True. ``_ext_load(app)`` must be
+# invoked on the app instance that actually serves — it is called immediately
+# after the real construction below. Guarded by
+# tests/test_plugin_load_on_served_app.py.
 
 # ── Cross-platform helpers ──────────────────────────────────────────────
 import re as _re
@@ -618,6 +685,7 @@ def _budget_init_db():
             channels TEXT NOT NULL,
             cooldown_min INTEGER DEFAULT 30,
             enabled INTEGER DEFAULT 1,
+            runtime TEXT DEFAULT 'all',
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         );
@@ -637,6 +705,23 @@ def _budget_init_db():
         CREATE INDEX IF NOT EXISTS idx_alert_history_rule
             ON alert_history(rule_id, fired_at DESC);
     """)
+    try:
+        # Pre-0.12.639 DBs lack the per-runtime scope column. SQLite has no
+        # IF-NOT-EXISTS for columns; the duplicate-column error is the no-op.
+        db.execute("ALTER TABLE alert_rules ADD COLUMN runtime TEXT DEFAULT 'all'")
+        db.commit()
+    except Exception:
+        pass
+    try:
+        # Pre-0.12.711 DBs drop the cloud-vocabulary ``alert_type`` the
+        # Alerts tab POSTed, keeping only the mapped local ``type``. That
+        # made a rule un-round-trippable: on update we could no longer tell
+        # WHICH cloud type an ``anomaly`` row came from, so the DuckDB mirror
+        # could not be rebuilt and the daemon evaluator stayed blind to it.
+        db.execute("ALTER TABLE alert_rules ADD COLUMN alert_type TEXT DEFAULT ''")
+        db.commit()
+    except Exception:
+        pass
     db.close()
 
 
@@ -701,10 +786,16 @@ def _set_budget_config(updates):
 
 
 def _default_alerts_webhook_config():
+    # NOTE: dashboard.py defines this trio (default/load/save) TWICE; the
+    # LATER definitions (~line 9600) win at import time and carry the full
+    # schema (pagerduty/opsgenie/telegram/min_severity). This early copy is
+    # shadowed dead code kept in sync so nobody "fixes" the wrong one again.
     return {
         "webhook_url": "",
         "slack_webhook_url": "",
         "discord_webhook_url": "",
+        "telegram_bot_token": "",
+        "telegram_chat_id": "",
         "cost_spike_alerts": True,
         "agent_error_rate_alerts": True,
         "security_posture_changes": True,
@@ -1011,25 +1102,65 @@ def _is_over_cap(scope: str):
 # rule is applied consistently from any per-feature dispatch path.
 #
 # Liveness rule used by the OSS daemon (no async cloud RPC at fire-time):
-#   * No ``cm_`` token on disk           → OSS-only           → NOT pro
-#   * Has ``cm_`` token + cached plan="cloud_pro"|"pro"|"trial" → pro
-#   * Has ``cm_`` token but no cached plan, or plan="free"     → NOT pro
+#   * Signed self-hosted license on disk with a Pro-equivalent tier   → pro
+#     (``pro``/``cloud_pro``/``trial``/``enterprise``, source=license)
+#   * No ``cm_`` token on disk (and no signed license)                → NOT pro
+#   * Has ``cm_`` token + cached plan="cloud_pro"|"pro"|"trial"       → pro
+#   * Has ``cm_`` token but no cached plan, or plan="free"            → NOT pro
 #
 # The cached plan is populated by the cloud-CTA status route the dashboard
 # already polls; we read it best-effort and fall back to the conservative
 # "not pro" answer so we never accidentally fire paid dispatch on a free
 # node. This means Cloud-Free users see the same paywall OSS users do
 # until they upgrade, which matches the strategic split.
+#
+# The self-hosted signed-license branch closes the gap called out in
+# #3755 (alerts + approvals): a $190/node/yr licensee with no ``cm_``
+# cloud token is still on a paid tier — the entitlements resolver
+# reports ``source == "license"`` and a Pro-equivalent ``tier`` — so
+# they get the same paid-dispatch surface Cloud-Pro users do (auto-
+# pause, per-agent Telegram alert fan-out, ...). Starter self-hosted
+# keys (TIER_CLOUD_STARTER) stay in the free branch: Starter does not
+# unlock Pro-only features and neither should this gate.
+_PRO_EQUIVALENT_TIERS = frozenset(
+    {"pro", "cloud_pro", "trial", "enterprise"}
+)
+
+
+def _license_grants_pro():
+    """True iff the entitlement resolver reports a signed self-hosted
+    license on a Pro-equivalent tier.
+
+    Fail-closed: any exception (entitlements module unimportable, resolver
+    raises, unexpected shape) returns False so a flaky lookup never leaks a
+    paid dispatch path onto a free node.
+    """
+    try:
+        from clawmetry import entitlements as _ent
+
+        ent = _ent.get_entitlement()
+        if getattr(ent, "source", "") != "license":
+            return False
+        return str(getattr(ent, "tier", "")).strip().lower() in _PRO_EQUIVALENT_TIERS
+    except Exception:
+        return False
+
+
 def _is_pro_user():
     """Best-effort, fail-closed Pro check used to gate paid dispatch.
 
-    Returns True only when both signals are present:
-      1. ``cm_`` cloud token resolvable on disk (user is paired), and
-      2. The cached plan tier is one of ``cloud_pro`` / ``pro`` / ``trial``.
+    Returns True when either signal is present:
+      1. A signed self-hosted license on disk resolves to a Pro-equivalent
+         tier (``pro`` / ``cloud_pro`` / ``trial`` / ``enterprise``,
+         ``source == "license"``), OR
+      2. A ``cm_`` cloud token is on disk AND the cached plan tier is one
+         of ``cloud_pro`` / ``pro`` / ``trial``.
 
     Any failure (no token, missing cache, exception) returns False so we
     never leak a Cloud-Pro dispatch path onto a free / OSS-only node.
     """
+    if _license_grants_pro():
+        return True
     try:
         token = _read_cloud_token() or ""
     except Exception:
@@ -2022,6 +2153,10 @@ def _budget_monitor_loop():
                 threshold = rule["threshold"]
                 channels = json.loads(rule.get("channels", '["banner"]'))
                 cooldown = rule.get("cooldown_min", 30) * 60
+                # Per-runtime scope: 'all' (node-wide) or one runtime id.
+                # Scoped rules read per-runtime slices from DuckDB via the
+                # daemon proxy; node-wide rules keep the legacy aggregates.
+                rt_scope = str(rule.get("runtime") or "all").lower()
 
                 last_fired = _budget_alert_cooldowns.get(rule_id, 0)
                 if now - last_fired < cooldown:
@@ -2031,8 +2166,12 @@ def _budget_monitor_loop():
                 msg = ""
 
                 if rtype == "threshold":
-                    if status["daily_spent"] >= threshold:
-                        msg = f"Daily spending ${status['daily_spent']:.2f} exceeded threshold ${threshold:.2f}"
+                    _spent = status["daily_spent"]
+                    if rt_scope != "all":
+                        _spent = _runtime_daily_spend(rt_scope)
+                    if _spent is not None and _spent >= threshold:
+                        _scope_lbl = "" if rt_scope == "all" else f" [{rt_scope}]"
+                        msg = f"Daily spending{_scope_lbl} ${_spent:.2f} exceeded threshold ${threshold:.2f}"
                         fired = True
                 elif rtype == "spike":
                     # Spike: cost in last hour > threshold x average hourly rate
@@ -2056,20 +2195,112 @@ def _budget_monitor_loop():
                         msg = f"Spending spike: ${hour_cost:.2f} in last hour ({(hour_cost / avg_hourly):.1f}x average)"
                         fired = True
                 elif rtype == "token_spike":
-                    try:
-                        vel = _compute_velocity_status()
-                    except Exception:
-                        vel = None
-                    if vel:
-                        tokens_per_min = vel.get("tokensIn2Min", 0) / 2.0
-                        if tokens_per_min >= threshold:
-                            sid = vel.get("triggeringSession") or ""
-                            sid_hint = f" (session: {sid[:12]}...)" if sid else ""
+                    if rt_scope != "all":
+                        _tpm = _runtime_tokens_per_min(rt_scope)
+                        if _tpm is not None and _tpm >= threshold:
                             msg = (
-                                f"Token spike: {int(tokens_per_min):,} tokens/min "
-                                f"(threshold: {int(threshold):,}/min){sid_hint}"
+                                f"Token spike [{rt_scope}]: {int(_tpm):,} tokens/min "
+                                f"(threshold: {int(threshold):,}/min)"
                             )
                             fired = True
+                    else:
+                        try:
+                            vel = _compute_velocity_status()
+                        except Exception:
+                            vel = None
+                        if vel:
+                            tokens_per_min = vel.get("tokensIn2Min", 0) / 2.0
+                            if tokens_per_min >= threshold:
+                                sid = vel.get("triggeringSession") or ""
+                                sid_hint = f" (session: {sid[:12]}...)" if sid else ""
+                                msg = (
+                                    f"Token spike: {int(tokens_per_min):,} tokens/min "
+                                    f"(threshold: {int(threshold):,}/min){sid_hint}"
+                                )
+                                fired = True
+                elif rtype == "agent_down":
+                    # "Agent offline > N min" (UI alert_type ``node_offline``).
+                    # Founder 2026-08-15: this rtype has been accepted by the
+                    # POST validator since the self-hosted bridge landed but
+                    # never had a branch here, so every rule created from the
+                    # tab's "Agent offline" row was a silent no-op.
+                    #
+                    # Signal is the most recent REAL agent event in DuckDB —
+                    # not OTLP (the hardcoded ``agent_down`` monitor above
+                    # keys off ``_otel_last_received``, which stays 0 on the
+                    # many installs without ``[otel]``, so it never fires
+                    # there either). ``exclude_daemon`` keeps ClawMetry's own
+                    # diagnostics from masking a dead agent as "alive".
+                    try:
+                        from datetime import datetime as _dt2, timezone as _tz2
+                        from routes.local_query import local_store_via_daemon
+                        _rows = local_store_via_daemon(
+                            "query_events", limit=1, exclude_daemon=True,
+                            **({"runtime": rt_scope} if rt_scope != "all" else {}),
+                        ) or []
+                        _last_iso = (_rows[0].get("ts") or "") if _rows else ""
+                        if _last_iso:
+                            _last = _dt2.fromisoformat(
+                                str(_last_iso).replace("Z", "+00:00")
+                            )
+                            if _last.tzinfo is None:
+                                _last = _last.replace(tzinfo=_tz2.utc)
+                            _idle_min = (
+                                _dt2.now(_tz2.utc) - _last
+                            ).total_seconds() / 60.0
+                            if _idle_min >= threshold:
+                                _scope_lbl = (
+                                    "" if rt_scope == "all" else f" [{rt_scope}]"
+                                )
+                                msg = (
+                                    f"Agent offline{_scope_lbl}: no activity for "
+                                    f"{int(_idle_min)} min "
+                                    f"(threshold: {int(threshold)} min)"
+                                )
+                                fired = True
+                    except Exception:
+                        pass
+                elif rtype == "session_cost":
+                    # "Session cost > $N" (UI alert_type ``session_cost``).
+                    # Previously mapped onto ``threshold``, which evaluates
+                    # DAILY spend — so a $5 per-session rule actually fired on
+                    # the whole day's total. This checks the costliest single
+                    # session in the last 24h, which is what the row promises.
+                    #
+                    # Cost is API-equivalent (token split x API rates), never
+                    # the user's invoice — say so, per the cost-copy honesty
+                    # pass (a Max-plan subscriber pays $0 incremental).
+                    try:
+                        from datetime import datetime as _dt3, timedelta as _td3, timezone as _tz3
+                        from routes.local_query import local_store_via_daemon
+                        _since = (_dt3.now(_tz3.utc) - _td3(hours=24)).strftime(
+                            "%Y-%m-%dT%H:%M:%SZ"
+                        )
+                        _sessions = local_store_via_daemon(
+                            "query_sessions", since=_since, limit=500,
+                        ) or []
+                        _worst = None
+                        for _s in _sessions:
+                            _sid = _s.get("session_id") or ""
+                            if rt_scope != "all" and _session_runtime_of(_sid) != rt_scope:
+                                continue
+                            try:
+                                _c = float(_s.get("cost_usd") or 0)
+                            except (TypeError, ValueError):
+                                continue
+                            if _c >= threshold and (_worst is None or _c > _worst[1]):
+                                _worst = (_sid, _c)
+                        if _worst:
+                            _scope_lbl = "" if rt_scope == "all" else f" [{rt_scope}]"
+                            msg = (
+                                f"Session cost{_scope_lbl}: session "
+                                f"{_worst[0][:12]} reached ${_worst[1]:.2f} "
+                                f"(threshold: ${threshold:.2f}) - API-equivalent, "
+                                f"not a billed amount"
+                            )
+                            fired = True
+                    except Exception:
+                        pass
                 elif rtype == "unproductive_burn":
                     # Issue #1707 — forward-progress signal. Fires when any
                     # session burns >= ``threshold`` tokens per state delta
@@ -2087,6 +2318,9 @@ def _budget_monitor_loop():
                         worst = None
                         for r in rows:
                             try:
+                                if rt_scope != "all" and _session_runtime_of(
+                                        r.get("session_id") or "") != rt_scope:
+                                    continue
                                 if float(r.get("ratio") or 0) >= float(threshold):
                                     if worst is None or r["ratio"] > worst["ratio"]:
                                         worst = r
@@ -2110,13 +2344,40 @@ def _budget_monitor_loop():
                     try:
                         with _fleet_db_lock:
                             db = _fleet_db()
-                            for ch in channels:
-                                db.execute(
-                                    "INSERT INTO alert_history (rule_id, type, message, channel, fired_at) "
-                                    "VALUES (?, ?, ?, ?, ?)",
-                                    (rule_id, rtype, msg, ch, now),
-                                )
-                            db.commit()
+                            # Belt-and-suspenders cross-evaluator dedup.
+                            # The sync daemon's _evaluate_alerts_local
+                            # writes to this SAME alert_history table but
+                            # holds a separate per-process cooldown memo,
+                            # so before this check the same rule_id could
+                            # land twice within a second (live repro
+                            # 2026-07-15: ids 3,4 rule 2f270a9c, both
+                            # channel=banner). Skip the INSERT when a fire
+                            # of the same rule_id already lives inside the
+                            # rule's own cooldown window; cooldown=0
+                            # disables the check so explicit no-cooldown
+                            # rules still fire every tick.
+                            skip_insert = False
+                            try:
+                                cd_int = int(cooldown or 0)
+                            except (TypeError, ValueError):
+                                cd_int = 0
+                            if cd_int > 0:
+                                cutoff = now - cd_int
+                                existing = db.execute(
+                                    "SELECT 1 FROM alert_history "
+                                    "WHERE rule_id = ? AND fired_at > ? "
+                                    "LIMIT 1",
+                                    (rule_id, cutoff),
+                                ).fetchone()
+                                skip_insert = existing is not None
+                            if not skip_insert:
+                                for ch in channels:
+                                    db.execute(
+                                        "INSERT INTO alert_history (rule_id, type, message, channel, fired_at) "
+                                        "VALUES (?, ?, ?, ?, ?)",
+                                        (rule_id, rtype, msg, ch, now),
+                                    )
+                                db.commit()
                             db.close()
                     except Exception:
                         pass
@@ -2193,12 +2454,7 @@ def _get_dp_attrs(dp):
 
 def _process_otlp_metrics(pb_data, content_encoding=None, content_type=None):
     """Decode OTLP metrics protobuf/JSON and store relevant data."""
-    req = _otlp_decode(
-        pb_data,
-        metrics_service_pb2.ExportMetricsServiceRequest(),
-        content_encoding,
-        content_type,
-    )
+    req = _otlp_request(pb_data, "metrics", content_encoding, content_type)
 
     for resource_metrics in req.resource_metrics:
         resource_attrs = {}
@@ -2706,12 +2962,7 @@ def _process_otlp_traces(pb_data, content_encoding=None, content_type=None):
     query historical traces. The DuckDB write is best-effort wrapped in
     try/except — a write failure must NOT break the metrics cache path.
     """
-    req = _otlp_decode(
-        pb_data,
-        trace_service_pb2.ExportTraceServiceRequest(),
-        content_encoding,
-        content_type,
-    )
+    req = _otlp_request(pb_data, "traces", content_encoding, content_type)
 
     # Resolve the local store lazily so unit tests that monkeypatch the
     # singleton in advance (or run without DuckDB) don't pay the import
@@ -2854,12 +3105,7 @@ def _process_otlp_logs(pb_data, content_encoding=None, content_type=None):
     /v1/metrics (cost / tokens / runs), so the cost + usage tiles light up.
     Best-effort: a bad record never breaks the batch.
     """
-    req = _otlp_decode(
-        pb_data,
-        logs_service_pb2.ExportLogsServiceRequest(),
-        content_encoding,
-        content_type,
-    )
+    req = _otlp_request(pb_data, "logs", content_encoding, content_type)
 
     def _f(attrs, *keys):
         for k in keys:
@@ -3028,56 +3274,6 @@ def _safe_date_ts(date_str):
     except Exception as e:
         print(f"[warn]  Warning: Unexpected error parsing date '{date_str}': {e}")
         return 0
-
-
-def validate_configuration():
-    """Validate the detected configuration and provide helpful feedback for new users."""
-    warnings = []
-    tips = []
-
-    # Check if workspace looks like a real OpenClaw setup
-    workspace_files = ["SOUL.md", "AGENTS.md", "MEMORY.md", "memory"]
-    found_files = []
-    for f in workspace_files:
-        path = os.path.join(WORKSPACE, f)
-        if os.path.exists(path):
-            found_files.append(f)
-
-    if not found_files:
-        warnings.append(f"[warn]  No OpenClaw workspace files found in {WORKSPACE}")
-        tips.append(
-            "[tip] Create SOUL.md, AGENTS.md, or MEMORY.md to set up your agent workspace"
-        )
-
-    # Check if log directory exists and has recent logs
-    if not os.path.exists(LOG_DIR):
-        warnings.append(f"[warn]  Log directory doesn't exist: {LOG_DIR}")
-        tips.append("[tip] Make sure OpenClaw/Moltbot is running to generate logs")
-    else:
-        # Check for recent log files
-        log_pattern = os.path.join(LOG_DIR, "*claw*.log")
-        recent_logs = [
-            f
-            for f in glob.glob(log_pattern)
-            if os.path.getmtime(f) > time.time() - 86400
-        ]  # Last 24h
-        if not recent_logs:
-            warnings.append(f"[warn]  No recent log files found in {LOG_DIR}")
-            tips.append("[tip] Start your OpenClaw agent to see real-time data")
-
-    # Check if sessions directory exists
-    if not SESSIONS_DIR or not os.path.exists(SESSIONS_DIR):
-        warnings.append(f"[warn]  Sessions directory not found: {SESSIONS_DIR}")
-        tips.append("[tip] Sessions will appear when your agent starts conversations")
-
-    # Check if OpenClaw binary is available
-    try:
-        subprocess.run(["openclaw", "--version"], capture_output=True, timeout=10)
-    except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
-        warnings.append("[warn]  OpenClaw binary not found in PATH")
-        tips.append("[tip] Install OpenClaw: https://github.com/openclaw/openclaw")
-
-    return warnings, tips
 
 
 def _auto_detect_data_dir():
@@ -4636,7 +4832,6 @@ function clawmetryLogout(){
     </button>
     <div id="workspace-switcher-menu" style="display:none;position:absolute;top:calc(100% + 6px);left:0;min-width:240px;max-height:320px;overflow-y:auto;background:var(--bg-card,#1c2333);border:1px solid var(--border-color,rgba(255,255,255,0.1));border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,0.35);z-index:200;padding:4px;"></div>
   </div>
-  <div class="theme-toggle" onclick="var o=document.getElementById('gw-setup-overlay');o.dataset.mandatory='false';document.getElementById('gw-setup-close').style.display='';o.style.display='flex'" title="Gateway settings" style="cursor:pointer;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></div>
   <div class="theme-toggle" id="alerts-bell-btn" onclick="switchTab('alerts')" title="Active alerts" style="cursor:pointer;position:relative;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg><span id="alerts-bell-badge" style="display:none;position:absolute;top:-4px;right:-4px;background:#ef4444;color:#fff;border-radius:10px;padding:0 4px;font-size:9px;font-weight:700;min-width:14px;line-height:14px;text-align:center;">0</span></div>
 
   <div class="theme-toggle" id="logout-btn" onclick="clawmetryLogout()" title="Logout" style="display:none;cursor:pointer;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg></div>
@@ -4652,7 +4847,7 @@ function clawmetryLogout(){
     <div class="nav-tab" onclick="switchTab('approvals')" title="Cloud-mediated approval queue">Approvals <span id="nav-approvals-badge" style="display:none;background:#ef4444;color:#fff;border-radius:10px;padding:1px 6px;font-size:10px;font-weight:700;margin-left:4px;">0</span></div>
     <div class="nav-tab" onclick="switchTab('alerts')" title="Get notified when something goes wrong">Alerts <span id="nav-alerts-badge" style="display:none;background:#ef4444;color:#fff;border-radius:10px;padding:1px 6px;font-size:10px;font-weight:700;margin-left:4px;">0</span></div>
     <div class="nav-tab" onclick="switchTab('notifications')" title="Slack / Email / PagerDuty / Telegram channels">Notifications</div>
-    <div class="nav-tab" onclick="switchTab('context')" title="See what context the LLM receives each turn">Context</div>
+    <div class="nav-tab" onclick="switchTab('context-economics')" title="Context-window usage from real per-turn readings">Context</div>
     <div class="nav-tab" onclick="switchTab('usage')">Tokens</div>
     <div class="nav-tab" id="crons-tab" onclick="switchTab('crons')">Crons</div>
     <div class="nav-tab" onclick="switchTab('memory')">Memory</div>
@@ -8513,12 +8708,18 @@ MIT License
 import os
 import sys
 
-# Force UTF-8 output on Windows (emoji in BANNER would crash with cp1252)
+# Force UTF-8 output on Windows (emoji in BANNER would crash with cp1252).
+# reconfigure(), not a new TextIOWrapper — see the matching block at the top
+# of this file: a second wrapper orphans the first, whose GC finalizer closes
+# the shared buffer and kills sys.stdout for the whole process.
 if sys.platform == "win32":
     import io
 
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 import threading
 from datetime import timezone, timedelta
@@ -8559,6 +8760,14 @@ app = Flask(
     static_folder=os.path.join(os.path.dirname(__file__), 'clawmetry', 'static'),
     template_folder=os.path.join(os.path.dirname(__file__), 'clawmetry', 'templates'),
 )
+
+# Plugins (e.g. ``clawmetry-pro``) register their Blueprints on ``app`` HERE —
+# this must stay immediately after the one-and-only Flask() construction (see
+# the note near the top of this module: a second construction once orphaned
+# every plugin route). Older plugins with ``register_all()`` (no args) keep
+# working unchanged: the loader inspects the signature and only passes
+# ``app`` when accepted.
+_ext_load(app)
 
 # Cap request body size (DoS guard). OTLP/JSON batches and config posts are
 # small; a 32 MB ceiling lets Flask reject oversized bodies (413) before they
@@ -8781,14 +8990,17 @@ def _get_heartbeat_status():
     }
 
 
-# ── Agent-presence detection (no-agent empty-state, sibling of #1604) ──
+# ── Agent-presence detection (sibling of #1604) ──
 # Distinct from ``_get_heartbeat_status``:
 #   * heartbeat-status answers "has THIS install's daemon checked in yet?"
 #     (transient race, resolves in ~30s — drives #1631's onboarding banner)
 #   * detect_agent_install() answers "is there any underlying agent at
-#     all?" (persistent until the user installs one — drives the
-#     "No OpenClaw or NemoClaw detected" page-level empty-state).
-# Cached 60s so every tab switch doesn't re-stat 4+ paths and shell out
+#     all?" — served at /api/agent-presence and mirrored into heartbeats
+#     (sync.py) for the cloud's install-state aggregation. The dashboard
+#     banner this used to drive ("No OpenClaw or NVIDIA NemoClaw
+#     detected") was removed once ClawMetry grew past two runtimes; the
+#     detection API stays for cloud consumers.
+# Cached 60s so polling consumers don't re-stat 4+ paths and shell out
 # to ``shutil.which``.
 _agent_presence_cache = {"ts": 0.0, "value": None}
 _AGENT_PRESENCE_TTL_SEC = 60
@@ -8804,8 +9016,12 @@ def _openclaw_gateway_running():
             with open(pid_path) as fh:
                 pid = int((fh.read() or "0").strip())
             if pid > 0:
-                os.kill(pid, 0)
-                return True
+                # Portable probe: os.kill(pid, 0) never raises on Windows,
+                # so a stale gateway.pid would read as "running" forever.
+                from clawmetry.process_control import is_alive as _pid_alive
+
+                if _pid_alive(pid):
+                    return True
     except (OSError, ValueError):
         pass
     try:
@@ -8904,9 +9120,38 @@ def _detect_any_local_data():
     return False
 
 
+def _detect_other_runtimes_lite():
+    """Best-effort list of NON-free runtimes with data on this machine
+    (Claude Code, Codex, Cursor, …), each ``{id, label, sessions}``.
+    Delegates to the free-tier lite detector in ``clawmetry.sync`` so the
+    empty-state banner and the Fleet teaser can never disagree about what
+    is installed. Never raises."""
+    try:
+        from clawmetry.sync import _detect_runtimes_lite
+        return list(_detect_runtimes_lite() or [])
+    except Exception:
+        return []
+
+
+def _entitled_runtime_ids(runtime_ids):
+    """Subset of ``runtime_ids`` the current plan actually covers. Uses
+    ``entitled_runtime`` (plan membership), NOT ``allows_runtime`` — grace
+    mode answers True for everything, which would hide the trial pitch from
+    every free-tier user. Never raises."""
+    try:
+        from clawmetry.entitlements import get_entitlement
+        ent = get_entitlement()
+        return [rid for rid in runtime_ids if ent.entitled_runtime(rid)]
+    except Exception:
+        return []
+
+
 def detect_agent_install():
     """Return ``{openclaw_detected, nemoclaw_detected, any_data, signals}``
-    answering "is there an underlying agent producing data?".
+    answering "is there an underlying agent producing data?", plus
+    ``detected_runtimes`` — non-free runtimes found on disk, each carrying an
+    ``entitled`` flag so the no-agent banner can pitch a Pro trial instead of
+    telling a Claude Code / Cursor user to install a second agent.
 
     Cached for ``_AGENT_PRESENCE_TTL_SEC`` (60s) — every tab switch on the
     dashboard polls this; the underlying filesystem state changes on the
@@ -8920,6 +9165,18 @@ def detect_agent_install():
     openclaw_running = bool(_openclaw_gateway_running()) if openclaw else False
     nemoclaw = bool(_detect_nemoclaw_install())
     any_data = bool(_detect_any_local_data())
+    others = _detect_other_runtimes_lite()
+    entitled = set(_entitled_runtime_ids([r.get("id") for r in others]))
+    detected_runtimes = [
+        {
+            "id": r.get("id"),
+            "label": r.get("label") or r.get("id"),
+            "sessions": int(r.get("sessions") or 0),
+            "entitled": r.get("id") in entitled,
+        }
+        for r in others
+        if r.get("id")
+    ]
     signals = []
     if openclaw:
         signals.append("openclaw")
@@ -8933,7 +9190,12 @@ def detect_agent_install():
         "nemoclaw_detected": nemoclaw,
         "any_data": any_data,
         "signals": signals,
+        # Unchanged on purpose: "no agent WE ARE OBSERVING" — a detected but
+        # unentitled Claude Code install still needs the banner (in its
+        # upgrade variant), so it must not clear no_agent.
         "no_agent": not (openclaw or nemoclaw or any_data),
+        "detected_runtimes": detected_runtimes,
+        "upgrade_candidate": any(not r["entitled"] for r in detected_runtimes),
     }
     _agent_presence_cache["ts"] = now
     _agent_presence_cache["value"] = payload
@@ -9368,6 +9630,7 @@ def _budget_init_db():
             channels TEXT NOT NULL,
             cooldown_min INTEGER DEFAULT 30,
             enabled INTEGER DEFAULT 1,
+            runtime TEXT DEFAULT 'all',
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         );
@@ -9387,6 +9650,23 @@ def _budget_init_db():
         CREATE INDEX IF NOT EXISTS idx_alert_history_rule
             ON alert_history(rule_id, fired_at DESC);
     """)
+    try:
+        # Pre-0.12.639 DBs lack the per-runtime scope column. SQLite has no
+        # IF-NOT-EXISTS for columns; the duplicate-column error is the no-op.
+        db.execute("ALTER TABLE alert_rules ADD COLUMN runtime TEXT DEFAULT 'all'")
+        db.commit()
+    except Exception:
+        pass
+    try:
+        # Pre-0.12.711 DBs drop the cloud-vocabulary ``alert_type`` the
+        # Alerts tab POSTed, keeping only the mapped local ``type``. That
+        # made a rule un-round-trippable: on update we could no longer tell
+        # WHICH cloud type an ``anomaly`` row came from, so the DuckDB mirror
+        # could not be rebuilt and the daemon evaluator stayed blind to it.
+        db.execute("ALTER TABLE alert_rules ADD COLUMN alert_type TEXT DEFAULT ''")
+        db.commit()
+    except Exception:
+        pass
     db.close()
 
 
@@ -9466,6 +9746,35 @@ def _default_alerts_webhook_config():
         "opsgenie_api_key": "",
         # Optional EU host override for OpsGenie ("https://api.eu.opsgenie.com").
         "opsgenie_api_url": "",
+        # Telegram bot delivery (self-hosted Notifications tab). Both keys
+        # required for a send. The /api/alert-channels ROUTE accepted these
+        # since the notifications-local work, but this schema (and the save
+        # allowlist below) silently dropped them — a "saved" Telegram channel
+        # never persisted, so its card stayed on "Connect" forever.
+        "telegram_bot_token": "",
+        "telegram_chat_id": "",
+        # WhatsApp — Meta Cloud API (token + phone_id) or Twilio's WhatsApp
+        # channel (twilio_* below). ``whatsapp_template`` is the fallback
+        # used when Meta's 24-hour service window has closed.
+        "whatsapp_to": "",
+        "whatsapp_token": "",
+        "whatsapp_phone_id": "",
+        "whatsapp_template": "",
+        "whatsapp_lang": "",
+        # Twilio — voice calls for approvals, and the WhatsApp sender when
+        # Meta isn't configured.
+        "twilio_account_sid": "",
+        "twilio_auth_token": "",
+        "twilio_from": "",
+        "twilio_whatsapp_from": "",
+        "phone_number": "",
+        # Local SMTP so a self-hosted (nocloud) node can still email.
+        "email_address": "",
+        "smtp_host": "",
+        "smtp_port": 587,
+        "smtp_user": "",
+        "smtp_password": "",
+        "smtp_from": "",
         "cost_spike_alerts": True,
         "agent_error_rate_alerts": True,
         "security_posture_changes": True,
@@ -9495,6 +9804,16 @@ def _save_alerts_webhook_config(updates):
     allowed = {
         "webhook_url", "slack_webhook_url", "discord_webhook_url",
         "pagerduty_routing_key", "opsgenie_api_key", "opsgenie_api_url",
+        "telegram_bot_token", "telegram_chat_id",
+        # Keep in lockstep with _default_alerts_webhook_config above — a key
+        # in the schema but not here saves as a no-op (the exact bug the
+        # telegram comment there documents).
+        "whatsapp_to", "whatsapp_token", "whatsapp_phone_id",
+        "whatsapp_template", "whatsapp_lang",
+        "twilio_account_sid", "twilio_auth_token", "twilio_from",
+        "twilio_whatsapp_from", "phone_number",
+        "email_address", "smtp_host", "smtp_port", "smtp_user",
+        "smtp_password", "smtp_from",
         "cost_spike_alerts", "agent_error_rate_alerts", "security_posture_changes",
         "min_severity",
     }
@@ -9584,11 +9903,14 @@ def _send_discord_alert(message, severity="warning", title="ClawMetry Alert"):
     _send_webhook_alert(url, payload, payload_type="generic")
 
 
-def _dispatch_alert(title, message, severity="warning", alert_type=None):
+def _dispatch_alert(title, message, severity="warning", alert_type=None, only=None):
     """Dispatch an alert to all configured channels (Slack, Discord, generic webhook).
 
     Respects the global min_severity filter and per-type toggles.
     Called automatically from _fire_alert() so all alerts reach webhook channels.
+    ``only`` (a set of channel ids) restricts the fan-out to those sinks —
+    built-in monitors pass their resolved channel set so the Alerts tab's
+    pills and the actual delivery are the same list.
     """
     if not _severity_passes_filter(severity):
         return
@@ -9598,6 +9920,13 @@ def _dispatch_alert(title, message, severity="warning", alert_type=None):
     generic_url = str(cfg.get("webhook_url", "")).strip()
     slack_url = str(cfg.get("slack_webhook_url", "")).strip()
     discord_url = str(cfg.get("discord_webhook_url", "")).strip()
+    if only is not None:
+        if "webhook" not in only:
+            generic_url = ""
+        if "slack" not in only:
+            slack_url = ""
+        if "discord" not in only:
+            discord_url = ""
 
     if generic_url:
         payload = {
@@ -9629,10 +9958,161 @@ def _dispatch_configured_webhooks(alert_type, payload):
         _send_webhook_alert(discord_url, payload, payload_type="discord")
 
 
-def _fire_alert(rule_id, alert_type, message, channels=None, severity="warning"):
-    """Fire an alert with cooldown check and dispatch to configured webhook channels."""
+# ── Built-in monitor delivery ──────────────────────────────────────────────
+#
+# Founder 2026-08-17: the Alerts tab showed every always-on monitor with an
+# "In-app · telegram" pill on a node where Telegram was never configured.
+# The pills came from a hardcoded ``channels=["banner", "telegram"]`` on each
+# ``_fire_alert`` call site; delivery then read Telegram creds from a store
+# the Notifications tab never writes and fell back to an undefined gateway
+# helper — so "telegram" delivered nothing and the pill was a fabrication.
+#
+# One resolver now answers "where does this monitor deliver?" for BOTH the
+# Alerts tab (``/api/alerts/builtins``) and ``_fire_alert``. A channel is
+# offered only when this process can actually deliver to it right now, so
+# what the tab shows and what fires cannot drift. Operators can also mute a
+# monitor or pin its channels; prefs live in ~/.clawmetry so they survive
+# upgrades and are not tied to an OpenClaw install.
+_BUILTIN_MONITOR_PREFS_FILE = os.path.expanduser("~/.clawmetry/builtin_monitors.json")
+_BUILTIN_CHANNEL_META = {
+    # In-app is the floor: it is always deliverable and never removable
+    # (to silence a monitor you disable it, not strip its last channel).
+    "banner":   ("In-app",   "Red banner + bell in this dashboard"),
+    "telegram": ("Telegram", "Direct Bot API message"),
+    "slack":    ("Slack",    "Incoming webhook"),
+    "discord":  ("Discord",  "Channel webhook"),
+    "webhook":  ("Webhook",  "POST JSON to your endpoint"),
+}
+
+
+def _builtin_alert_types():
+    try:
+        from routes.alerts import BUILTIN_MONITORS
+        return {m["alert_type"] for m in BUILTIN_MONITORS}
+    except Exception:
+        return set()
+
+
+def _telegram_creds():
+    """(bot_token, chat_id) from either store.
+
+    Legacy budget config (SQLite) came first; the Notifications tab writes
+    the alert-channels file. Delivery must honour both or a user who
+    "connected" Telegram in the tab still gets nothing.
+    """
+    for loader in (_load_alerts_webhook_config, _get_budget_config):
+        try:
+            cfg = loader()
+            tok = str(cfg.get("telegram_bot_token", "") or "").strip()
+            cid = str(cfg.get("telegram_chat_id", "") or "").strip()
+            if tok and cid:
+                return tok, cid
+        except Exception:
+            continue
+    return "", ""
+
+
+def _builtin_channels_available():
+    """Channels a built-in monitor CAN deliver to from this process right now.
+
+    Never advertises a destination that has no working sender behind it:
+    email / phone / WhatsApp are cloud-delivered and have no local sender,
+    so they are absent here even when creds are saved.
+    """
+    out = [{"id": "banner", "label": "In-app",
+            "detail": _BUILTIN_CHANNEL_META["banner"][1], "configured": True}]
+    tok, cid = _telegram_creds()
+    if tok and cid:
+        out.append({"id": "telegram", "label": "Telegram",
+                    "detail": f"Bot API to chat {cid[-4:].rjust(len(cid), '*')}",
+                    "configured": True})
+    try:
+        cfg = _load_alerts_webhook_config()
+    except Exception:
+        cfg = {}
+    for cid_, key in (("slack", "slack_webhook_url"),
+                      ("discord", "discord_webhook_url"),
+                      ("webhook", "webhook_url")):
+        if str(cfg.get(key, "") or "").strip():
+            lbl, det = _BUILTIN_CHANNEL_META[cid_]
+            out.append({"id": cid_, "label": lbl, "detail": det, "configured": True})
+    return out
+
+
+def _load_builtin_monitor_prefs():
+    try:
+        with open(_BUILTIN_MONITOR_PREFS_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_builtin_monitor_pref(alert_type, enabled=None, channels=None):
+    """Persist one monitor's prefs. ``channels=None`` keeps the current
+    value; ``channels=[]`` or a list pins them; the string ``"auto"`` clears
+    the pin (back to every available channel)."""
+    prefs = _load_builtin_monitor_prefs()
+    cur = dict(prefs.get(alert_type) or {})
+    if enabled is not None:
+        cur["enabled"] = bool(enabled)
+    if channels == "auto":
+        cur.pop("channels", None)
+    elif isinstance(channels, list):
+        known = set(_BUILTIN_CHANNEL_META)
+        cur["channels"] = sorted({str(c) for c in channels if str(c) in known} | {"banner"})
+    prefs[alert_type] = cur
+    os.makedirs(os.path.dirname(_BUILTIN_MONITOR_PREFS_FILE), exist_ok=True)
+    tmp = _BUILTIN_MONITOR_PREFS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(prefs, f, indent=2)
+    os.replace(tmp, _BUILTIN_MONITOR_PREFS_FILE)
+    return cur
+
+
+def _resolve_builtin_delivery(alert_type):
+    """The single answer for "is this monitor on, and where does it go?".
+
+    Returns ``{"enabled", "channels", "mode"}`` where ``channels`` is the
+    exact list ``_fire_alert`` will deliver to: pinned channels intersected
+    with what is deliverable now (a pinned-but-unconfigured channel is
+    dropped, not shown), or every available channel in ``auto`` mode.
+    """
+    prefs = _load_builtin_monitor_prefs().get(alert_type) or {}
+    available = [c["id"] for c in _builtin_channels_available()]
+    pinned = prefs.get("channels")
+    if isinstance(pinned, list):
+        chans = [c for c in available if c in pinned or c == "banner"]
+        mode = "custom"
+    else:
+        chans, mode = list(available), "auto"
+    return {"enabled": bool(prefs.get("enabled", True)),
+            "channels": chans, "mode": mode}
+
+
+def _fire_alert(rule_id, alert_type, message, channels=None, severity="warning",
+                builtin=None):
+    """Fire an alert with cooldown check and dispatch to configured webhook channels.
+
+    ``builtin`` — True: route through the built-in monitor resolver (mute +
+    channel prefs); False: a user rule, deliver exactly ``channels``; None:
+    auto — built-in iff ``alert_type`` is one of the always-on monitors.
+    """
     global _budget_alert_cooldowns
     now = time.time()
+
+    if builtin is None:
+        builtin = alert_type in _builtin_alert_types()
+    only_sinks = None
+    if builtin:
+        try:
+            resolved = _resolve_builtin_delivery(alert_type)
+        except Exception:
+            resolved = {"enabled": True, "channels": ["banner"], "mode": "auto"}
+        if not resolved["enabled"]:
+            return  # muted by the operator — no history, no banner, no fan-out
+        channels = resolved["channels"]
+        only_sinks = set(channels)
 
     # Check cooldown (default 30 min for budget alerts)
     cooldown_sec = 1800
@@ -9681,51 +10161,47 @@ def _fire_alert(rule_id, alert_type, message, channels=None, severity="warning")
     except Exception:
         pass
 
-    # Always dispatch to configured alert channels (Slack / Discord / generic webhook)
+    # Dispatch to configured alert channels (Slack / Discord / generic webhook).
+    # Built-in monitors pass their resolved channel set so a sink the operator
+    # unpinned is not fanned out to; user rules keep the legacy fan-out.
     _dispatch_alert(
         title=f"ClawMetry Alert [{alert_type}]",
         message=message,
         severity=severity,
         alert_type=alert_type,
+        only=only_sinks,
     )
 
 
 def _send_telegram_alert(message):
-    """Send alert via direct Telegram API (preferred) or gateway fallback."""
-    try:
-        cfg = _get_budget_config()
-        token = str(cfg.get("telegram_bot_token", "")).strip()
-        chat_id = str(cfg.get("telegram_chat_id", "")).strip()
-        if token and chat_id:
-            import urllib.request
+    """Send alert via the direct Telegram Bot API.
 
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
-            payload = json.dumps(
-                {
-                    "chat_id": chat_id,
-                    "text": f"[ClawMetry Alert] {message}",
-                    "parse_mode": "Markdown",
-                }
-            ).encode()
-            req = urllib.request.Request(
-                url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            urllib.request.urlopen(req, timeout=10)
-            return
+    Creds come from either store (see ``_telegram_creds``). With none
+    configured this is a no-op — the old "gateway fallback" called a helper
+    that was never defined, so it silently delivered nothing anyway.
+    """
+    token, chat_id = _telegram_creds()
+    if not (token and chat_id):
+        return
+    try:
+        import urllib.request
+
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = json.dumps(
+            {
+                "chat_id": chat_id,
+                "text": f"[ClawMetry Alert] {message}",
+                "parse_mode": "Markdown",
+            }
+        ).encode()
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=10)
     except Exception as e:
         print(f"Warning: Direct Telegram alert failed: {e}")
-    try:
-        _gw_invoke(
-            "message",
-            {
-                "action": "send",
-                "message": f"[ClawMetry Alert] {message}",
-            },
-        )
-    except Exception:
-        pass
 
 
 # PagerDuty and OpsGenie integration constants. The actual payload
@@ -9940,6 +10416,54 @@ def _dispatch_alert_to_all_sinks(alert_data: dict) -> list[str]:
         )
         sent.append("opsgenie")
     return sent
+
+
+
+
+def _session_runtime_of(sid):
+    """Runtime id for a namespaced session id ('copilot:...' -> 'copilot');
+    anything without a known family prefix is OpenClaw."""
+    sid = str(sid or "")
+    if ":" in sid:
+        head = sid.split(":", 1)[0]
+        try:
+            from clawmetry.entitlements import ALL_RUNTIMES
+            if head in ALL_RUNTIMES:
+                return head
+        except ImportError:
+            pass
+    return "openclaw"
+
+
+def _runtime_daily_spend(runtime):
+    """Today's spend (USD) for ONE runtime from the per-(day, runtime)
+    DuckDB rollup, via the daemon proxy. None on any failure so a scoped
+    rule silently skips a tick rather than firing on a node-wide number."""
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        from routes.local_query import local_store_via_daemon
+        today = _dt.now(_tz.utc).strftime("%Y-%m-%d")
+        rows = local_store_via_daemon(
+            "query_rollup_runtime_daily", since=today) or []
+        return float(sum(
+            (r.get("cost_usd") or 0) for r in rows
+            if r.get("day") == today and r.get("runtime") == runtime))
+    except Exception:
+        return None
+
+
+def _runtime_tokens_per_min(runtime):
+    """Tokens/min over the last 2 minutes for ONE runtime (DuckDB events
+    filtered by session-id prefix via the daemon proxy). None on failure."""
+    try:
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        from routes.local_query import local_store_via_daemon
+        since = (_dt.now(_tz.utc) - _td(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        rows = local_store_via_daemon(
+            "query_events", since=since, runtime=runtime, limit=20000) or []
+        return sum(int(r.get("token_count") or 0) for r in rows) / 2.0
+    except Exception:
+        return None
 
 
 def _get_alert_rules():
@@ -10301,6 +10825,10 @@ def _budget_monitor_loop():
                 threshold = rule["threshold"]
                 channels = json.loads(rule.get("channels", '["banner"]'))
                 cooldown = rule.get("cooldown_min", 30) * 60
+                # Per-runtime scope: 'all' (node-wide) or one runtime id.
+                # Scoped rules read per-runtime slices from DuckDB via the
+                # daemon proxy; node-wide rules keep the legacy aggregates.
+                rt_scope = str(rule.get("runtime") or "all").lower()
 
                 last_fired = _budget_alert_cooldowns.get(rule_id, 0)
                 if now - last_fired < cooldown:
@@ -10310,8 +10838,12 @@ def _budget_monitor_loop():
                 msg = ""
 
                 if rtype == "threshold":
-                    if status["daily_spent"] >= threshold:
-                        msg = f"Daily spending ${status['daily_spent']:.2f} exceeded threshold ${threshold:.2f}"
+                    _spent = status["daily_spent"]
+                    if rt_scope != "all":
+                        _spent = _runtime_daily_spend(rt_scope)
+                    if _spent is not None and _spent >= threshold:
+                        _scope_lbl = "" if rt_scope == "all" else f" [{rt_scope}]"
+                        msg = f"Daily spending{_scope_lbl} ${_spent:.2f} exceeded threshold ${threshold:.2f}"
                         fired = True
                 elif rtype == "spike":
                     # Spike: cost in last hour > threshold x average hourly rate
@@ -10335,20 +10867,112 @@ def _budget_monitor_loop():
                         msg = f"Spending spike: ${hour_cost:.2f} in last hour ({(hour_cost / avg_hourly):.1f}x average)"
                         fired = True
                 elif rtype == "token_spike":
-                    try:
-                        vel = _compute_velocity_status()
-                    except Exception:
-                        vel = None
-                    if vel:
-                        tokens_per_min = vel.get("tokensIn2Min", 0) / 2.0
-                        if tokens_per_min >= threshold:
-                            sid = vel.get("triggeringSession") or ""
-                            sid_hint = f" (session: {sid[:12]}...)" if sid else ""
+                    if rt_scope != "all":
+                        _tpm = _runtime_tokens_per_min(rt_scope)
+                        if _tpm is not None and _tpm >= threshold:
                             msg = (
-                                f"Token spike: {int(tokens_per_min):,} tokens/min "
-                                f"(threshold: {int(threshold):,}/min){sid_hint}"
+                                f"Token spike [{rt_scope}]: {int(_tpm):,} tokens/min "
+                                f"(threshold: {int(threshold):,}/min)"
                             )
                             fired = True
+                    else:
+                        try:
+                            vel = _compute_velocity_status()
+                        except Exception:
+                            vel = None
+                        if vel:
+                            tokens_per_min = vel.get("tokensIn2Min", 0) / 2.0
+                            if tokens_per_min >= threshold:
+                                sid = vel.get("triggeringSession") or ""
+                                sid_hint = f" (session: {sid[:12]}...)" if sid else ""
+                                msg = (
+                                    f"Token spike: {int(tokens_per_min):,} tokens/min "
+                                    f"(threshold: {int(threshold):,}/min){sid_hint}"
+                                )
+                                fired = True
+                elif rtype == "agent_down":
+                    # "Agent offline > N min" (UI alert_type ``node_offline``).
+                    # Founder 2026-08-15: this rtype has been accepted by the
+                    # POST validator since the self-hosted bridge landed but
+                    # never had a branch here, so every rule created from the
+                    # tab's "Agent offline" row was a silent no-op.
+                    #
+                    # Signal is the most recent REAL agent event in DuckDB —
+                    # not OTLP (the hardcoded ``agent_down`` monitor above
+                    # keys off ``_otel_last_received``, which stays 0 on the
+                    # many installs without ``[otel]``, so it never fires
+                    # there either). ``exclude_daemon`` keeps ClawMetry's own
+                    # diagnostics from masking a dead agent as "alive".
+                    try:
+                        from datetime import datetime as _dt2, timezone as _tz2
+                        from routes.local_query import local_store_via_daemon
+                        _rows = local_store_via_daemon(
+                            "query_events", limit=1, exclude_daemon=True,
+                            **({"runtime": rt_scope} if rt_scope != "all" else {}),
+                        ) or []
+                        _last_iso = (_rows[0].get("ts") or "") if _rows else ""
+                        if _last_iso:
+                            _last = _dt2.fromisoformat(
+                                str(_last_iso).replace("Z", "+00:00")
+                            )
+                            if _last.tzinfo is None:
+                                _last = _last.replace(tzinfo=_tz2.utc)
+                            _idle_min = (
+                                _dt2.now(_tz2.utc) - _last
+                            ).total_seconds() / 60.0
+                            if _idle_min >= threshold:
+                                _scope_lbl = (
+                                    "" if rt_scope == "all" else f" [{rt_scope}]"
+                                )
+                                msg = (
+                                    f"Agent offline{_scope_lbl}: no activity for "
+                                    f"{int(_idle_min)} min "
+                                    f"(threshold: {int(threshold)} min)"
+                                )
+                                fired = True
+                    except Exception:
+                        pass
+                elif rtype == "session_cost":
+                    # "Session cost > $N" (UI alert_type ``session_cost``).
+                    # Previously mapped onto ``threshold``, which evaluates
+                    # DAILY spend — so a $5 per-session rule actually fired on
+                    # the whole day's total. This checks the costliest single
+                    # session in the last 24h, which is what the row promises.
+                    #
+                    # Cost is API-equivalent (token split x API rates), never
+                    # the user's invoice — say so, per the cost-copy honesty
+                    # pass (a Max-plan subscriber pays $0 incremental).
+                    try:
+                        from datetime import datetime as _dt3, timedelta as _td3, timezone as _tz3
+                        from routes.local_query import local_store_via_daemon
+                        _since = (_dt3.now(_tz3.utc) - _td3(hours=24)).strftime(
+                            "%Y-%m-%dT%H:%M:%SZ"
+                        )
+                        _sessions = local_store_via_daemon(
+                            "query_sessions", since=_since, limit=500,
+                        ) or []
+                        _worst = None
+                        for _s in _sessions:
+                            _sid = _s.get("session_id") or ""
+                            if rt_scope != "all" and _session_runtime_of(_sid) != rt_scope:
+                                continue
+                            try:
+                                _c = float(_s.get("cost_usd") or 0)
+                            except (TypeError, ValueError):
+                                continue
+                            if _c >= threshold and (_worst is None or _c > _worst[1]):
+                                _worst = (_sid, _c)
+                        if _worst:
+                            _scope_lbl = "" if rt_scope == "all" else f" [{rt_scope}]"
+                            msg = (
+                                f"Session cost{_scope_lbl}: session "
+                                f"{_worst[0][:12]} reached ${_worst[1]:.2f} "
+                                f"(threshold: ${threshold:.2f}) - API-equivalent, "
+                                f"not a billed amount"
+                            )
+                            fired = True
+                    except Exception:
+                        pass
                 elif rtype == "unproductive_burn":
                     # Issue #1707 — forward-progress signal. Fires when any
                     # session burns >= ``threshold`` tokens per state delta
@@ -10366,6 +10990,9 @@ def _budget_monitor_loop():
                         worst = None
                         for r in rows:
                             try:
+                                if rt_scope != "all" and _session_runtime_of(
+                                        r.get("session_id") or "") != rt_scope:
+                                    continue
                                 if float(r.get("ratio") or 0) >= float(threshold):
                                     if worst is None or r["ratio"] > worst["ratio"]:
                                         worst = r
@@ -10389,13 +11016,40 @@ def _budget_monitor_loop():
                     try:
                         with _fleet_db_lock:
                             db = _fleet_db()
-                            for ch in channels:
-                                db.execute(
-                                    "INSERT INTO alert_history (rule_id, type, message, channel, fired_at) "
-                                    "VALUES (?, ?, ?, ?, ?)",
-                                    (rule_id, rtype, msg, ch, now),
-                                )
-                            db.commit()
+                            # Belt-and-suspenders cross-evaluator dedup.
+                            # The sync daemon's _evaluate_alerts_local
+                            # writes to this SAME alert_history table but
+                            # holds a separate per-process cooldown memo,
+                            # so before this check the same rule_id could
+                            # land twice within a second (live repro
+                            # 2026-07-15: ids 3,4 rule 2f270a9c, both
+                            # channel=banner). Skip the INSERT when a fire
+                            # of the same rule_id already lives inside the
+                            # rule's own cooldown window; cooldown=0
+                            # disables the check so explicit no-cooldown
+                            # rules still fire every tick.
+                            skip_insert = False
+                            try:
+                                cd_int = int(cooldown or 0)
+                            except (TypeError, ValueError):
+                                cd_int = 0
+                            if cd_int > 0:
+                                cutoff = now - cd_int
+                                existing = db.execute(
+                                    "SELECT 1 FROM alert_history "
+                                    "WHERE rule_id = ? AND fired_at > ? "
+                                    "LIMIT 1",
+                                    (rule_id, cutoff),
+                                ).fetchone()
+                                skip_insert = existing is not None
+                            if not skip_insert:
+                                for ch in channels:
+                                    db.execute(
+                                        "INSERT INTO alert_history (rule_id, type, message, channel, fired_at) "
+                                        "VALUES (?, ?, ?, ?, ?)",
+                                        (rule_id, rtype, msg, ch, now),
+                                    )
+                                db.commit()
                             db.close()
                     except Exception:
                         pass
@@ -10472,12 +11126,7 @@ def _get_dp_attrs(dp):
 
 def _process_otlp_metrics(pb_data, content_encoding=None, content_type=None):
     """Decode OTLP metrics protobuf/JSON and store relevant data."""
-    req = _otlp_decode(
-        pb_data,
-        metrics_service_pb2.ExportMetricsServiceRequest(),
-        content_encoding,
-        content_type,
-    )
+    req = _otlp_request(pb_data, "metrics", content_encoding, content_type)
 
     for resource_metrics in req.resource_metrics:
         resource_attrs = {}
@@ -10985,12 +11634,7 @@ def _process_otlp_traces(pb_data, content_encoding=None, content_type=None):
     query historical traces. The DuckDB write is best-effort wrapped in
     try/except — a write failure must NOT break the metrics cache path.
     """
-    req = _otlp_decode(
-        pb_data,
-        trace_service_pb2.ExportTraceServiceRequest(),
-        content_encoding,
-        content_type,
-    )
+    req = _otlp_request(pb_data, "traces", content_encoding, content_type)
 
     # Resolve the local store lazily so unit tests that monkeypatch the
     # singleton in advance (or run without DuckDB) don't pay the import
@@ -11133,12 +11777,7 @@ def _process_otlp_logs(pb_data, content_encoding=None, content_type=None):
     /v1/metrics (cost / tokens / runs), so the cost + usage tiles light up.
     Best-effort: a bad record never breaks the batch.
     """
-    req = _otlp_decode(
-        pb_data,
-        logs_service_pb2.ExportLogsServiceRequest(),
-        content_encoding,
-        content_type,
-    )
+    req = _otlp_request(pb_data, "logs", content_encoding, content_type)
 
     def _f(attrs, *keys):
         for k in keys:
@@ -11309,11 +11948,45 @@ def _safe_date_ts(date_str):
         return 0
 
 
+def _detected_runtimes():
+    """Presence-probe every supported runtime. [] when the probe is unavailable."""
+    try:
+        from clawmetry.runtime_probe import probe_runtimes
+        return [p for p in probe_runtimes() if p.get("found")]
+    except Exception:
+        return []
+
+
 def validate_configuration():
-    """Validate the detected configuration and provide helpful feedback for new users."""
+    """Validate the detected configuration and provide helpful feedback for new users.
+
+    ClawMetry watches every supported runtime, so the OpenClaw-specific checks
+    below only run when OpenClaw (or NemoClaw, which shares its layout) is the
+    runtime on this machine. A Claude Code / Codex / Cursor user got a wall of
+    "install OpenClaw" warnings about a runtime they never asked for.
+    """
     warnings = []
     tips = []
-    
+
+    detected = _detected_runtimes()
+    detected_ids = {p["id"] for p in detected}
+    openclaw_family = bool({"openclaw", "nemoclaw"} & detected_ids)
+
+    if detected:
+        shown = [p["label"] for p in detected[:6]]
+        if len(detected) > len(shown):
+            shown.append(f"+{len(detected) - len(shown)} more")
+        plural = "runtime" if len(detected) == 1 else "runtimes"
+        tips.append(f"[ok] Detected {len(detected)} agent {plural}: {', '.join(shown)}")
+    else:
+        warnings.append("[warn]  No agent runtime detected on this machine")
+        tips.append("[tip] Start an agent (OpenClaw, Claude Code, Codex, Cursor, ...) and the dashboard fills in")
+
+    if not openclaw_family:
+        # Nothing below applies: the other runtimes keep their own session
+        # stores, which the adapters read directly.
+        return warnings, tips
+
     # Check if workspace looks like a real OpenClaw setup
     workspace_files = ['SOUL.md', 'AGENTS.md', 'MEMORY.md', 'memory']
     found_files = []
@@ -11329,7 +12002,7 @@ def validate_configuration():
     # Check if log directory exists and has recent logs
     if not os.path.exists(LOG_DIR):
         warnings.append(f"[warn]  Log directory doesn't exist: {LOG_DIR}")
-        tips.append("[tip] Make sure OpenClaw/Moltbot is running to generate logs")
+        tips.append("[tip] Make sure OpenClaw is running to generate logs")
     else:
         # Check for recent log files
         log_pattern = os.path.join(LOG_DIR, "*claw*.log")
@@ -11343,13 +12016,6 @@ def validate_configuration():
     if not SESSIONS_DIR or not os.path.exists(SESSIONS_DIR):
         warnings.append(f"[warn]  Sessions directory not found: {SESSIONS_DIR}")
         tips.append("[tip] Sessions will appear when your agent starts conversations")
-    
-    # Check if OpenClaw binary is available
-    try:
-        subprocess.run(['openclaw', '--version'], capture_output=True, timeout=10)
-    except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
-        warnings.append("[warn]  OpenClaw binary not found in PATH")
-        tips.append("[tip] Install OpenClaw: https://github.com/openclaw/openclaw")
     
     return warnings, tips
 
@@ -11558,6 +12224,8 @@ def detect_config(args=None):
         app.register_blueprint(bp_runtime_ingest)
     app.register_blueprint(bp_otlp_traces)
     app.register_blueprint(bp_overview)
+    app.register_blueprint(bp_trial)
+    app.register_blueprint(bp_onboarding)
     app.register_blueprint(bp_security)
     app.register_blueprint(bp_sessions)
     app.register_blueprint(bp_sla)
@@ -11575,7 +12243,10 @@ def detect_config(args=None):
     # the OSS stub registers and returns HTTP 402 ``upgrade_required``.
     if not _pro_loaded:
         app.register_blueprint(bp_nemoclaw)
+        app.register_blueprint(bp_compliance)
+        app.register_blueprint(bp_org_analytics)
     app.register_blueprint(bp_skills)
+    app.register_blueprint(bp_runtime_memory)
     app.register_blueprint(bp_heartbeat)
     app.register_blueprint(bp_selfconfig)
     app.register_blueprint(bp_agents)
@@ -11585,15 +12256,105 @@ def detect_config(args=None):
     app.register_blueprint(bp_reasoning)
     app.register_blueprint(bp_plugins)
     app.register_blueprint(bp_local_query)
+    # ClawMetry Enterprise self-hosted server mode: one process serves the
+    # dashboard AND the ingest API the node daemons push to. Gated hard on
+    # SELF_HOSTED=true — never registered for normal local/cloud installs.
+    try:
+        from clawmetry.selfhosted import is_self_hosted as _is_self_hosted
+        if _is_self_hosted():
+            from routes.selfhosted_ingest import bp_selfhosted
+            app.register_blueprint(bp_selfhosted)
+            from clawmetry.selfhosted import maybe_start_license_ping
+            if maybe_start_license_ping():
+                print("  SelfHosted: [ok] license/version ping enabled (daily)")
+            print("  SelfHosted: [ok] ingest API registered (/auth, /ingest/*)")
+    except Exception as _sh_exc:
+        print(f"  SelfHosted: [warn] not registered: {_sh_exc}")
     app.register_blueprint(bp_dives)
     app.register_blueprint(bp_reports)
     app.register_blueprint(bp_scheduler)
     app.register_blueprint(bp_policy)
+    # Local pre-tool hook receiver (Claude Code PreToolUse gate) —
+    # routes/hooks.py. Its record_once hook also persists this
+    # dashboard's port to ~/.clawmetry/server.json for the gate
+    # installer's base-URL discovery.
+    from routes.hooks import bp_hooks
+    app.register_blueprint(bp_hooks)
+    # Per-runtime approval routing (/api/approvals/routing) + the phone
+    # decision page (/a/<id>) the notification links point at. Paid
+    # delivery layer: when clawmetry-pro is installed its blueprint was
+    # already registered by ``_ext_load(app)`` above and won these URLs, so
+    # skip the OSS registration to avoid a blueprint-name collision. The
+    # OSS module is the impl today and becomes a 402 stub once the impl
+    # moves — the switch is identical either way.
+    try:
+        import clawmetry_pro as _pro_ar
+        _pro_ar_loaded = bool(getattr(_pro_ar, "is_loaded", lambda: False)())
+    except Exception:
+        _pro_ar_loaded = False
+    if not _pro_ar_loaded:
+        from routes.approval_routing import bp_approval_routing
+        app.register_blueprint(bp_approval_routing)
     app.register_blueprint(bp_turn_anatomy)
     app.register_blueprint(bp_tool_catalog)
     app.register_blueprint(bp_context_economics)
+    app.register_blueprint(bp_spend_flow)
     app.register_blueprint(bp_entitlement)
     app.register_blueprint(bp_extensions)
+
+    # ── Trial-end hard-block gate ───────────────────────────────────────────
+    # When the resolver reports an unpaid / expired entitlement, every non-
+    # allowlisted request 402s with a machine-readable body carrying
+    # ``hard_blocked=True`` and the upgrade URL. Default-ON as of 0.12.x;
+    # opt out with ``CLAWMETRY_HARD_BLOCK=0``. The gate honours a per-request
+    # ``runtime`` scope hint so an operator who chose the "continue with free
+    # runtimes only" fallback (POST /api/trial/continue-free) still gets the
+    # OpenClaw / NanoClaw surface while paid runtimes stay blocked. See
+    # ``clawmetry/trial_enforcement.py`` for the full policy + allowlist.
+    from clawmetry import trial_enforcement as _te_gate
+
+    @app.before_request
+    def _trial_hard_block_gate():
+        try:
+            path = request.path or ""
+            if _te_gate.allowlisted_path(path):
+                return None
+            # Runtime hint sources, in preference order:
+            #   1. ?runtime=<name> (canonical UI param)
+            #   2. ?scope=<name>   (older alias some routes still emit)
+            #   3. X-Clawmetry-Runtime header (used by CLI + adapters)
+            rt_hint = None
+            try:
+                rt_hint = (
+                    (request.args.get("runtime") or "").strip()
+                    or (request.args.get("scope") or "").strip()
+                    or (request.headers.get("X-Clawmetry-Runtime") or "").strip()
+                    or None
+                )
+            except Exception:
+                rt_hint = None
+            if not _te_gate.is_hard_blocked(path=path, runtime=rt_hint):
+                return None
+            payload = _te_gate.block_payload()
+            resp = jsonify(payload)
+            resp.status_code = 402
+            resp.headers["X-Clawmetry-Trial-Blocked"] = "1"
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+        except Exception as exc:
+            # Fail-open. A bug in the gate must never brick a paying customer;
+            # let the request through and log at warning so operators can spot
+            # it in the daemon log rather than in a "why is nothing loading?"
+            # support ticket.
+            try:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "trial_hard_block_gate: %s", exc
+                )
+            except Exception:
+                pass
+            return None
+
     app.register_blueprint(bp_audit)
     app.register_blueprint(bp_device)
 
@@ -11609,7 +12370,10 @@ def detect_config(args=None):
     app.register_blueprint(bp_insights)
     app.register_blueprint(bp_review)
     app.register_blueprint(bp_evals)
+    app.register_blueprint(bp_quality)
     app.register_blueprint(bp_hitl)
+    app.register_blueprint(bp_rules)
+    app.register_blueprint(bp_attention)
 
     # ── v2 React SPA (opt-in) ───────────────────────────────────────────────
     # Default OFF so existing v1 users notice nothing. Enabled when the user
@@ -11749,6 +12513,58 @@ def detect_config(args=None):
             "marker_path": NOCLOUD_MARKER_PATH,
             "env_optout": bool(os.environ.get("CLAWMETRY_NO_CLOUD", "").strip()),
         })
+
+    # E2E encryption key — Settings surface for the secret that decrypts
+    # cloud-synced snapshots client-side in the browser. Deliberately a bare
+    # @app.route in this OSS-only section (like /api/cloud-status above),
+    # NOT a Blueprint: the hosted cloud app never calls this route-registration
+    # code path (it imports only bp_sessions/bp_overview/bp_health + specific
+    # helpers from this module via importlib — see clawmetry-cloud/CLAUDE.md),
+    # so this endpoint architecturally does not exist on app.clawmetry.com.
+    # Belt-and-braces: cloud's own container also has no ~/.clawmetry/config.json
+    # for a user's node in the first place, since the key never leaves this
+    # machine except E2E-encrypted. Auth follows the normal /api/* rule in
+    # _check_auth() (loopback trusted; remote needs the gateway token).
+    @app.route("/api/local/e2e-key", endpoint="e2e_key_get")
+    def _e2e_key_get():
+        from flask import jsonify as _jsonify
+        cfg_path = os.path.expanduser("~/.clawmetry/config.json")
+        try:
+            with open(cfg_path) as _f:
+                cfg = json.load(_f) or {}
+        except Exception:
+            cfg = {}
+        key = cfg.get("encryption_key", "") or ""
+        return _jsonify({
+            "configured": bool(key),
+            "key": key or None,
+            "node_id": cfg.get("node_id", ""),
+        })
+
+    @app.route("/api/local/e2e-key/regenerate", methods=["POST"], endpoint="e2e_key_regenerate")
+    def _e2e_key_regenerate():
+        from flask import jsonify as _jsonify
+        from clawmetry.sync import generate_encryption_key, save_config
+        cfg_path = os.path.expanduser("~/.clawmetry/config.json")
+        try:
+            with open(cfg_path) as _f:
+                cfg = json.load(_f) or {}
+        except Exception:
+            cfg = {}
+        if not cfg.get("api_key"):
+            return _jsonify({
+                "error": "Cloud sync isn't set up on this node yet. Run "
+                         "\"clawmetry connect\" first.",
+            }), 400
+        new_key = generate_encryption_key()
+        cfg["encryption_key"] = new_key
+        save_config(cfg)
+        # Restart so the daemon encrypts everything from now on with the new
+        # key. Anything already synced under the old key stays readable by
+        # anyone who has that old key — regenerating protects data going
+        # forward, it does not retroactively re-encrypt history.
+        _restart_sync_daemon()
+        return _jsonify({"key": new_key})
 
     # ────────────────────────────────────────────────────────────────────────
 
@@ -11942,7 +12758,7 @@ DASHBOARD_HTML = r"""
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
 </head>
-<body data-theme="dark" class="booting">
+<body data-theme="dark" class="booting has-profile-menu">
 {% include 'partials/overlays.html' %}
 <div class="zoom-wrapper" id="zoom-wrapper">
 <div class="nav">
@@ -11962,8 +12778,27 @@ DASHBOARD_HTML = r"""
     <span style="font-size:11px;color:var(--text-muted);font-weight:600;">Runtime</span>
     <select id="cm-global-runtime" onchange="_cmOnGlobalRuntimeChange(this)" title="Scope session views to a single agent runtime" style="font-size:12px;font-weight:600;padding:7px 10px;border:1px solid var(--border-color,rgba(255,255,255,0.22));border-radius:8px;background:var(--button-bg,transparent);color:var(--text-tertiary,#cbd5e1);cursor:pointer;"></select>
   </div>
-  <div class="theme-toggle" onclick="var o=document.getElementById('gw-setup-overlay');o.dataset.mandatory='false';document.getElementById('gw-setup-close').style.display='';o.style.display='flex'" data-i18n-title="topbar.gateway_settings" title="Gateway settings" style="cursor:pointer;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></div>
+  <!-- Refresh / reconnect. Always visible, because the desktop shell has no
+       browser chrome: no address bar, no reload button, and pywebview's Cocoa
+       backend swallows Cmd-R. Without this the only way out of a wedged page
+       was to quit the app. cmReconnect() probes the backend first and only
+       reloads when something is there to reload into -- reloading against a
+       dead port would replace the page with a blank error page. Turns amber
+       (.cm-attention) once the backend is known unreachable. -->
+  <div class="theme-toggle" id="cm-reconnect-btn" onclick="window.cmReconnect && window.cmReconnect()" role="button" tabindex="0" data-i18n-title="topbar.refresh" title="Refresh (Cmd/Ctrl + R)" style="cursor:pointer;">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+  </div>
   <div class="theme-toggle" id="alerts-bell-btn" onclick="switchTab('alerts')" data-i18n-title="topbar.active_alerts" title="Active alerts" style="cursor:pointer;position:relative;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg><span id="alerts-bell-badge" style="display:none;position:absolute;top:-4px;right:-4px;background:#ef4444;color:#fff;border-radius:10px;padding:0 4px;font-size:9px;font-weight:700;min-width:14px;line-height:14px;text-align:center;">0</span></div>
+
+  <!-- Cloud sync toggle chip. Included in every ClawMetry plan (Self-Hosted
+       through Enterprise), so it's a one-click UX toggle here rather than a
+       plan-tier decision. Hidden until the initial /api/cloud-cta/status
+       poll resolves so it doesn't flash the wrong state on first paint.
+       Refresh cadence: on load, on click, and after any focus event. -->
+  <div class="theme-toggle" id="sync-toggle-btn" onclick="clawmetryToggleSync()" title="Cloud sync" style="display:none;cursor:pointer;padding:6px 10px;gap:6px;align-items:center;">
+    <svg id="sync-toggle-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.5 19H9a7 7 0 1 1 6.71-9"/><polyline points="17 5 21 5 21 9"/></svg>
+    <span id="sync-toggle-label" style="font-size:11px;font-weight:600;letter-spacing:0.2px;">Sync</span>
+  </div>
 
   <div class="theme-toggle" id="logout-btn" onclick="clawmetryLogout()" data-i18n-title="topbar.logout" title="Logout" style="display:none;cursor:pointer;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg></div>
   <div class="i18n-switcher" id="i18n-switcher" style="position:relative;">
@@ -11987,7 +12822,7 @@ DASHBOARD_HTML = r"""
     <div class="nav-tab" onclick="switchTab('approvals')" title="Cloud-mediated approval queue">Approvals <span id="nav-approvals-badge" style="display:none;background:#ef4444;color:#fff;border-radius:10px;padding:1px 6px;font-size:10px;font-weight:700;margin-left:4px;">0</span></div>
     <div class="nav-tab" onclick="switchTab('alerts')" title="Get notified when something goes wrong">Alerts <span id="nav-alerts-badge" style="display:none;background:#ef4444;color:#fff;border-radius:10px;padding:1px 6px;font-size:10px;font-weight:700;margin-left:4px;">0</span></div>
     <div class="nav-tab" onclick="switchTab('notifications')" title="Slack / Email / PagerDuty / Telegram channels">Notifications</div>
-    <div class="nav-tab" onclick="switchTab('context')" title="See what context the LLM receives each turn">Context</div>
+    <div class="nav-tab" onclick="switchTab('context-economics')" title="Context-window usage from real per-turn readings">Context</div>
     <div class="nav-tab" onclick="switchTab('usage')">Tokens</div>
     <div class="nav-tab" id="crons-tab" onclick="switchTab('crons')">Crons</div>
     <div class="nav-tab" onclick="switchTab('memory')">Memory</div>
@@ -12014,13 +12849,19 @@ DASHBOARD_HTML = r"""
     <div id="cloud-connected-badge" onclick="window.open('https://app.clawmetry.com/cloud','_blank')" style="display:none;cursor:pointer;padding:6px 12px;border:1px solid rgba(34,197,94,0.4);border-radius:8px;font-size:12px;font-weight:600;color:#22c55e;white-space:nowrap;transition:all 0.2s;user-select:none;" onmouseover="this.style.background='rgba(34,197,94,0.08)'" onmouseout="this.style.background='transparent'">&#9679; Cloud Connected</div>
   </div>
   {% endif %}
+  <!-- Account menu: self-hosted installs sign in (trial/license) just like
+       Cloud, so they get the same top-right profile affordance — identity,
+       billing/plan management, and an always-visible sign-out. Rendered by
+       cmProfileInit() in gw-setup.js; supersedes the bare #logout-btn icon
+       (hidden via body.has-profile-menu in dashboard.css). -->
+  <div id="cm-profile-wrap" style="position:relative;margin-left:8px;flex-shrink:0;">
+    <button id="cm-profile-btn" onclick="cmProfileToggle(event)" data-i18n-title="profile.account" title="Account" aria-haspopup="menu" aria-expanded="false" style="width:32px;height:32px;border-radius:50%;border:1px solid var(--border-color,rgba(255,255,255,0.22));background:var(--button-bg,transparent);color:var(--text-tertiary,#cbd5e1);font-size:13px;font-weight:800;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;box-shadow:var(--card-shadow);transition:all 0.15s;">
+      <span id="cm-profile-initial" style="display:flex;align-items:center;justify-content:center;line-height:1;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></span>
+    </button>
+    <div id="cm-profile-menu" role="menu" style="display:none;position:absolute;top:calc(100% + 8px);right:0;min-width:250px;background:var(--bg-card,#1c2333);border:1px solid var(--border-color,rgba(255,255,255,0.1));border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,0.45);z-index:210;padding:6px;"></div>
+  </div>
 </div>
-{% include 'partials/cloud-modal.html' %}
-
-
 {% include 'partials/banners.html' %}
-
-{% include 'partials/budget-modal.html' %}
 
 {% if not legacy_nav %}
 {# Phase-1 IA refactor (issue #1659): 220px left sidebar + content grid.
@@ -12052,9 +12893,9 @@ DASHBOARD_HTML = r"""
         <span class="left-nav-icon" aria-hidden="true">&#36;</span>
         <span class="left-nav-label" data-i18n="nav.cost">Cost</span>
       </div>
-      <div class="left-nav-item" data-tab="transcripts" onclick="switchTab('transcripts')" data-i18n-title="nav.session_replay_tooltip" title="Conversations across channels (Telegram, Signal, WhatsApp, &hellip;)">
+      <div class="left-nav-item" data-tab="transcripts" onclick="switchTab('transcripts')" data-i18n-title="nav.session_replay_tooltip" title="Dig into sessions across channels (Telegram, Signal, WhatsApp, &hellip;)">
         <span class="left-nav-icon" aria-hidden="true">&#9787;</span>
-        <span class="left-nav-label"><span data-i18n="nav.session_replay">Conversations</span> <span class="left-nav-beta" data-i18n="nav.beta">(beta)</span></span>
+        <span class="left-nav-label"><span data-i18n="nav.session_replay">Sessions</span> <span class="left-nav-beta" data-i18n="nav.beta">(beta)</span></span>
       </div>
       <div class="left-nav-item" data-tab="approvals" onclick="switchTab('approvals')" data-i18n-title="nav.approvals_tooltip" title="Cloud-mediated approval queue">
         <span class="left-nav-icon" aria-hidden="true">&#10003;</span>
@@ -12065,6 +12906,20 @@ DASHBOARD_HTML = r"""
         <span class="left-nav-icon" aria-hidden="true">&#9873;</span>
         <span class="left-nav-label" data-i18n="nav.alerts">Alerts</span>
         <span id="nav-alerts-badge" class="left-nav-badge" style="display:none;">0</span>
+      </div>
+      {# Notifications sits directly under its two consumers (Approvals,
+         Alerts) - founder request 2026-07-29: buried in the Advanced drawer,
+         nobody could find where to connect a delivery channel, so enabled
+         alert rules dead-ended at "no channels". Evals (#4295) rides Tier-1
+         below that trio so it can't split the Approvals/Alerts/Notifications
+         adjacency. #}
+      <div class="left-nav-item" data-tab="notifications" onclick="switchTab('notifications')" data-i18n-title="nav.notifications_tooltip" title="Where Alerts and Approvals get delivered: Slack / Telegram / PagerDuty / Email">
+        <span class="left-nav-icon" aria-hidden="true">&#9993;</span>
+        <span class="left-nav-label" data-i18n="nav.notifications">Notifications</span>
+      </div>
+      <div class="left-nav-item" data-tab="evals" onclick="switchTab('evals')" data-i18n-title="nav.quality_tooltip" title="Is your agent doing good work? See this week's report card and the runs that need attention.">
+        <span class="left-nav-icon" aria-hidden="true">&#128221;</span>
+        <span class="left-nav-label" data-i18n="nav.quality">Quality</span>
       </div>
 
       {# Developer drawer: the deep-dive views. Pure toggle (no data-tab: the
@@ -12082,14 +12937,22 @@ DASHBOARD_HTML = r"""
         <div class="left-nav-item left-nav-item-sub" data-tab="models" onclick="switchTab('models')">
           <span class="left-nav-label" data-i18n="nav.models">Models</span>
         </div>
-        <div class="left-nav-item left-nav-item-sub" data-tab="context" onclick="switchTab('context')" data-i18n-title="nav.llm_context_tooltip" title="What the LLM sees on each turn">
-          <span class="left-nav-label" data-i18n="nav.llm_context">LLM Context</span>
-        </div>
-        {# Phase B (UX_AUDIT.md): Tracing, Turn timing and Compare sessions are
-           SESSION-scoped, so they left the global nav and are reached from a
+        {# "LLM Context" merged into Context usage (2026-08-01): the old tab
+           mixed hardcoded token estimates with a node-wide gauge. Context
+           usage (context-economics) shows the same story from real per-turn
+           readings, session + runtime scoped. switchTab('context') aliases
+           there so old deep links keep working. #}
+        {# Phase B (UX_AUDIT.md) removed Tracing, Turn timing and Compare
+           sessions from the global nav as SESSION-scoped views, reached from a
            session drill-down (openSessionDeepDive in app.js, wired into the
-           Conversations viewer). Their pages + data-tab ids stay: deep links
-           and switchTab('tracing'|'turn-anatomy'|'swimlane') still work. #}
+           Sessions viewer). Turn timing and Compare sessions still are.
+           TRACING IS BACK (#4782): a bring-your-own-agent app that speaks OTLP
+           has no session at all -- its traces are keyed by OTel trace_id and
+           never appear in the Sessions viewer -- so a drill-down-only entry
+           point left those traces reachable by deep link only. #}
+        <div class="left-nav-item left-nav-item-sub" id="left-nav-tracing" data-tab="tracing" onclick="switchTab('tracing')" title="Every run as a trace: the span waterfall, the span tree and the agent graph. Includes apps that send OpenTelemetry.">
+          <span class="left-nav-label" data-i18n="nav.tracing">Tracing</span>
+        </div>
         <div class="left-nav-item left-nav-item-sub" id="left-nav-agents" data-tab="agents" onclick="switchTab('agents')" title="Cross-session agent spawn topology from span data">
           <span class="left-nav-label" data-i18n="nav.agent_graph">Agent Graph</span>
         </div>
@@ -12099,8 +12962,8 @@ DASHBOARD_HTML = r"""
         <div class="left-nav-item left-nav-item-sub" id="left-nav-context-economics" data-tab="context-economics" onclick="switchTab('context-economics')" title="Context-window utilization over time, compaction triggers and tokens reclaimed">
           <span class="left-nav-label" data-i18n="nav.context_usage">Context usage</span>
         </div>
-        <div class="left-nav-item left-nav-item-sub" id="left-nav-harness" data-tab="harness" onclick="switchTab('harness')" title="What the selected runtime uniquely exposes — beyond the generic tabs" style="display:none">
-          <span class="left-nav-label" data-i18n="nav.runtime_extras">Runtime extras</span>
+        <div class="left-nav-item left-nav-item-sub" id="left-nav-harness" data-tab="harness" onclick="switchTab('harness')" title="What a harness is, part by part, and where to watch each part live">
+          <span class="left-nav-label" data-i18n="nav.harness">Harness</span>
         </div>
         <div class="left-nav-item left-nav-item-sub" data-tab="dives" onclick="switchTab('dives')" title="Ask questions about your AI usage in plain English">
           <span class="left-nav-label" data-i18n="nav.ask">Ask</span>
@@ -12116,20 +12979,24 @@ DASHBOARD_HTML = r"""
       <div class="left-nav-item left-nav-item-sub" data-tab="crons" id="crons-tab" onclick="switchTab('crons')" data-i18n-title="nav.crons_tooltip" title="Scheduled agent jobs">
         <span class="left-nav-label" data-i18n="nav.crons">Schedules</span>
       </div>
-      <div class="left-nav-item left-nav-item-sub" data-tab="memory" onclick="switchTab('memory')" data-i18n-title="nav.memory_tooltip" title="Persistent memory files the agent reads on boot">
+      {# Memory + Skills stay under Advanced while the multi-runtime file
+         browser matures (founder call 2026-08-14): known gaps — redundant
+         runtime chips, file click not loading content, Skills rendering the
+         Memory catalog. Promote to Tier-1 once those are fixed. #}
+      <div class="left-nav-item left-nav-item-sub" data-tab="memory" onclick="switchTab('memory')" data-i18n-title="nav.memory_tooltip" title="Every runtime's on-disk memory files (CLAUDE.md, AGENTS.md, GEMINI.md, …) in one browser">
         <span class="left-nav-label" data-i18n="nav.memory">Memory</span>
       </div>
-      <div class="left-nav-item left-nav-item-sub" data-tab="notifications" onclick="switchTab('notifications')">
-        <span class="left-nav-label" data-i18n="nav.notifications">Notifications</span>
+      <div class="left-nav-item left-nav-item-sub" data-tab="skills" onclick="switchTab('skills')" title="Every runtime's installed skills / commands / agents / hooks">
+        <span class="left-nav-label" data-i18n="nav.skills">Skills</span>
+      </div>
+      <div class="left-nav-item left-nav-item-sub" data-tab="logs" onclick="switchTab('logs')" title="Live runtime log stream">
+        <span class="left-nav-label">Logs</span>
       </div>
       <div class="left-nav-item left-nav-item-sub" data-tab="security" onclick="switchTab('security')">
         <span class="left-nav-label" data-i18n="nav.security">Security</span>
       </div>
       <div class="left-nav-item left-nav-item-sub" data-tab="policy" onclick="switchTab('policy')" title="Which tools each agent can run, where they run, and what got approved or blocked">
         <span class="left-nav-label" data-i18n="nav.tool_policy">Tool permissions</span>
-      </div>
-      <div class="left-nav-item left-nav-item-sub" data-tab="skills" onclick="switchTab('skills')">
-        <span class="left-nav-label" data-i18n="nav.skills">Skills</span>
       </div>
       <div class="left-nav-item left-nav-item-sub" data-tab="selfevolve" onclick="switchTab('selfevolve')">
         <span class="left-nav-label" data-i18n="nav.self_evolve">Self-Evolve</span>
@@ -12160,6 +13027,9 @@ DASHBOARD_HTML = r"""
 
 <!-- ALERTS (Cloud-Pro feature) -->
 {% include 'tabs/alerts.html' %}
+
+<!-- EVALS (LLM-as-judge scores + named evaluator library + golden suites) -->
+{% include 'tabs/evals.html' %}
 
 <!-- USAGE -->
 {% include 'tabs/usage.html' %}
@@ -12202,7 +13072,6 @@ DASHBOARD_HTML = r"""
 {% include 'tabs/notifications.html' %}
 
 <!-- CONTEXT INSPECTOR -->
-{% include 'tabs/context.html' %}
 
 <!-- TRACING (Phoenix/Arize-style: span waterfall + tree + agent graph) -->
 {% include 'tabs/tracing.html' %}
@@ -12219,6 +13088,9 @@ DASHBOARD_HTML = r"""
 
 <!-- HARNESS (declarative per-runtime custom panel; #2667) -->
 {% include 'tabs/harness.html' %}
+
+<!-- LOGS (live stream + historical viewer; #3761) -->
+{% include 'tabs/logs.html' %}
 
 <!-- SWIMLANE COMPARE — N parallel live lanes (sessions / runtimes) -->
 {% include 'tabs/swimlane.html' %}
@@ -12251,8 +13123,20 @@ DASHBOARD_HTML = r"""
 {% endif %}
 <script src="{{ url_for('static', filename='js/i18n.js', v=version) }}"></script>
 <script src="{{ url_for('static', filename='js/runtime-logos.js', v=version) }}"></script>
+<script src="{{ url_for('static', filename='js/time-range-picker.js', v=version) }}"></script>
 <script src="{{ url_for('static', filename='js/app.js', v=version) }}"></script>
 </div> <!-- end zoom-wrapper -->
+
+{# position:fixed overlays must live OUTSIDE #zoom-wrapper: its zoom
+   transform makes it the containing block for fixed descendants, which
+   stretches an inset:0 overlay to document height and pushes the centered
+   card below the fold (users saw only the blur backdrop, issue: blank
+   blurred dashboard on first run). #}
+{% include 'partials/cloud-modal.html' %}
+{% include 'partials/e2e-key-modal.html' %}
+{% include 'partials/onboarding-modal.html' %}
+{% include 'partials/selfhost-modal.html' %}
+{% include 'partials/budget-modal.html' %}
 
 <!-- Component Detail Modal -->
 <div class="comp-modal-overlay" id="comp-modal-overlay" onclick="if(event.target===this)closeCompModal()">
@@ -12311,36 +13195,8 @@ DASHBOARD_HTML = r"""
   </div>
 </div>
 
-<!-- Gateway Setup Wizard -->
-<div id="gw-setup-overlay" data-mandatory="false" onclick="if(event.target===this && this.dataset.mandatory!=='true'){this.style.display='none'}" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); z-index:10000; align-items:center; justify-content:center; font-family:Manrope,sans-serif;">
-  <div style="background:var(--bg-secondary, #1a1a2e); border:1px solid var(--border-primary, #333); border-radius:16px; padding:40px; max-width:440px; width:90%; text-align:center; box-shadow:0 20px 60px rgba(0,0,0,0.5); position:relative;">
-    <button id="gw-setup-close" onclick="document.getElementById('gw-setup-overlay').style.display='none'" style="display:none; position:absolute; top:12px; right:16px; background:none; border:none; color:var(--text-muted, #888); font-size:22px; cursor:pointer; padding:4px 8px; line-height:1;">✕</button>
-    <img src="/static/img/logo.svg" style="width:64px;height:64px;margin-bottom:16px;display:block;margin-left:auto;margin-right:auto;" alt="ClawMetry">
-    <h2 style="color:var(--text-primary, #fff); margin:0 0 8px; font-size:24px; font-weight:700;">ClawMetry Setup</h2>
-    <p style="color:var(--text-muted, #888); margin:0 0 24px; font-size:14px;">Enter your OpenClaw gateway token to connect.</p>
-    <input id="gw-token-input" type="password" placeholder="Paste your gateway token" 
-      style="width:100%; padding:12px 16px; border:1px solid var(--border-primary, #444); border-radius:8px; background:var(--bg-primary, #111); color:var(--text-primary, #fff); font-size:14px; font-family:monospace; box-sizing:border-box; outline:none; margin-bottom:8px;"
-      onkeydown="if(event.key==='Enter')gwSetupConnect()">
-    <div id="gw-setup-hint" style="color:var(--text-muted, #888); font-size:12px; margin:0 0 4px; text-align:left;">
-      <div style="font-weight:600;color:var(--text-secondary, #aaa);margin:6px 0 4px;">Local install (pip / brew / install.sh)</div>
-      <code style="display:block;color:var(--text-accent, #0af); background:rgba(0,170,255,0.1); padding:6px 8px; border-radius:4px; font-size:11px; word-break:break-all;">cat ~/.openclaw/openclaw.json | python3 -c "import json,sys;print(json.load(sys.stdin)['gateway']['auth']['token'])"</code>
-      <div style="font-weight:600;color:var(--text-secondary, #aaa);margin:8px 0 4px;">Docker install</div>
-      <code style="display:block;color:var(--text-accent, #0af); background:rgba(0,170,255,0.1); padding:6px 8px; border-radius:4px; font-size:11px; word-break:break-all;">docker exec $(docker ps -q) env | grep TOKEN</code>
-      <div style="font-weight:600;color:var(--text-secondary, #aaa);margin:8px 0 4px;">Remote / Docker / reverse-proxy</div>
-      <span style="color:var(--text-muted, #888);">Set <code style="color:var(--text-accent, #0af);">OPENCLAW_GATEWAY_URL=http://&lt;host&gt;:18789</code> env var, or enter the URL below.</span>
-    </div>
-    <p id="gw-url-hint" style="color:var(--text-muted, #666); font-size:11px; margin:0 0 16px; text-align:left;"><span style="color:var(--text-secondary,#aaa);">Gateway URL</span> <span style="color:var(--text-faint,#555);">(auto-detected for local; required for remote / Docker / reverse-proxy)</span><br><input id="gw-url-input" type="text" placeholder="http://localhost:18789" style="width:100%; margin-top:4px; padding:4px 8px; border:1px solid var(--border-primary, #444); border-radius:4px; background:var(--bg-primary, #111); color:var(--text-primary, #fff); font-size:11px; font-family:monospace; box-sizing:border-box;"></p>
-    <div id="gw-setup-error" style="color:#ff4444; font-size:13px; margin-bottom:12px; display:none;"></div>
-    <div id="gw-setup-status" style="color:var(--text-accent, #0af); font-size:13px; margin-bottom:12px; display:none;"></div>
-    <button onclick="gwSetupConnect()" id="gw-connect-btn"
-      style="width:100%; padding:12px; border:none; border-radius:8px; background:var(--bg-accent, #0f6fff); color:#fff; font-size:15px; font-weight:600; cursor:pointer; font-family:Manrope,sans-serif;">
-      Connect
-    </button>
-    <p style="color:var(--text-faint, #555); font-size:11px; margin:16px 0 0;">Token is stored locally on this ClawMetry instance.</p>
-  </div>
-</div>
-
 <script src="{{ url_for('static', filename='js/gw-setup.js', v=version) }}"></script>
+<script src="{{ url_for('static', filename='js/onboarding.js', v=version) }}"></script>
 
 </body>
 </html>
@@ -12638,8 +13494,8 @@ def _auto_discover_gateway(token):
                 "id": "discover",
                 "method": "connect",
                 "params": {
-                    "minProtocol": 3,
-                    "maxProtocol": 3,
+                    "minProtocol": _GW_MIN_PROTO,
+                    "maxProtocol": _GW_MAX_PROTO,
                     "client": {
                         "id": "cli",
                         "version": __version__,
@@ -13193,6 +14049,95 @@ def _build_model_billing(model_usage):
         summary = "likely_oauth_or_included"
 
     return model_billing, summary
+
+
+def _get_billing_coverage(model_billing, today_cost, week_cost, month_cost,
+                          fallback_all_covered_when_no_models=False):
+    """Detect the user's active subscription plan and split reported
+    API-equivalent cost into ``covered_usd`` (paid for by the plan → $0
+    out-of-pocket) vs ``out_of_pocket_usd`` (actual incremental spend).
+
+    Users on Claude Max / ChatGPT Plus / Cursor Pro etc. see alarming
+    "$X.YZ" cost numbers on the Cost tab even though their subscription
+    already covers those calls — the incremental cost is $0. This helper
+    is what lets the UI paint a green "Covered by <plan>" badge and stop
+    the panic. Same detection path the fleet heartbeat uses on-device
+    (`clawmetry.sync._build_billing_payload`), so device and dashboard
+    agree on the plan label.
+
+    Split heuristic: proportional to token share of models the per-model
+    billing pass classified as OAuth/included (`apiKeyConfigured=False`).
+    When the caller has no per-model tokens (local_store fast path),
+    ``fallback_all_covered_when_no_models`` treats a detected subscription
+    as covering the full amount — coarse but honest to the device UX.
+
+    Always returns a dict; never raises. Cost fields are floats in USD.
+    """
+    try:
+        from clawmetry.sync import _build_billing_payload  # noqa: WPS433
+        payload = _build_billing_payload({}) or {}
+    except Exception:
+        payload = {}
+
+    account_plan = payload.get("account_plan") if isinstance(payload, dict) else None
+    runtimes_bm = payload.get("runtimes") or {} if isinstance(payload, dict) else {}
+
+    total_tokens = sum(int(m.get("tokens") or 0) for m in (model_billing or []))
+    covered_tokens = sum(
+        int(m.get("tokens") or 0)
+        for m in (model_billing or [])
+        if not m.get("apiKeyConfigured")
+    )
+    any_sub_now = any((rt or {}).get("mode") == "subscription" for rt in runtimes_bm.values())
+    any_metered_now = any((rt or {}).get("mode") == "metered" for rt in runtimes_bm.values())
+    if total_tokens > 0:
+        ratio = covered_tokens / total_tokens
+    elif (fallback_all_covered_when_no_models or (any_sub_now and not any_metered_now)) and any_sub_now:
+        # No per-model token activity yet, but we've detected a subscription
+        # and no metered runtime — treat as fully covered so the "you're
+        # covered by <plan>" banner still paints on a quiet day/fresh install.
+        ratio = 1.0
+    else:
+        ratio = 0.0
+
+    def _split(total):
+        t = float(total or 0.0)
+        c = round(t * ratio, 6)
+        return {
+            "covered_usd": c,
+            "out_of_pocket_usd": round(max(0.0, t - c), 6),
+        }
+
+    any_sub = any((rt or {}).get("mode") == "subscription" for rt in runtimes_bm.values())
+    any_metered = any((rt or {}).get("mode") == "metered" for rt in runtimes_bm.values())
+    sub_labels = [
+        (rt or {}).get("label")
+        for rt in runtimes_bm.values()
+        if (rt or {}).get("mode") == "subscription" and (rt or {}).get("label")
+    ]
+    metered_labels = [
+        (rt or {}).get("label")
+        for rt in runtimes_bm.values()
+        if (rt or {}).get("mode") == "metered" and (rt or {}).get("label")
+    ]
+
+    return {
+        "detected": bool(account_plan) or any_sub,
+        "account_plan": account_plan,
+        "runtimes": runtimes_bm,
+        "subscription_labels": sub_labels,
+        "metered_labels": metered_labels,
+        "any_subscription": any_sub,
+        "any_metered": any_metered,
+        # True when we're confident every dollar shown is covered by a
+        # subscription (no metered runtime detected AND every model with
+        # token usage looks OAuth/included).
+        "all_covered": bool(any_sub) and not any_metered and ratio > 0.999,
+        "covered_token_share": round(ratio, 4),
+        "today": _split(today_cost),
+        "week": _split(week_cost),
+        "month": _split(month_cost),
+    }
 
 
 # ── Enhanced Cost Tracking Utilities ─────────────────────────────────────
@@ -14958,22 +15903,134 @@ for _sig in _THREAT_SIGNATURES:
     ]
 
 
-def _scan_events_for_threats(events):
-    """Scan brain-history events against threat signatures. Returns list of threat matches."""
+# Action labels a signature's ``tool_types`` may declare. These come from the
+# LEGACY JSONL parser's ``tool_to_type()`` (routes/brain.py) and predate the
+# DuckDB-first read path.
+_THREAT_ACTION_TYPES = frozenset(
+    {"EXEC", "READ", "WRITE", "BROWSER", "SEARCH", "MSG", "SPAWN", "TOOL"}
+)
+
+# Rows that are agent *speech*, not agent *action*. Running action signatures
+# over these is how you flag the model for merely discussing ``~/.ssh/id_rsa``.
+# Content-borne risk (PII, injection, leaked keys) is the content scanners'
+# job — see ``_scan_content_for_policy_events``.
+_THREAT_NON_ACTION_TYPES = frozenset(
+    {"MESSAGE", "THINKING", "USER", "ASSISTANT", "SUMMARY", "COMPACT", "SYSTEM"}
+)
+
+# Tool-CALL rows as the DuckDB fast path emits them (routes/brain.py's
+# ``evt_type = event_type.upper()``). Only the call is an agent ACTION.
+#
+# TOOL_RESULT is deliberately absent, and so is ERROR (which routes/brain.py
+# derives from a failed TOOL_RESULT). A result is data the agent RECEIVED, not
+# something it did, and results are big free-text blobs — a page of docs, web
+# search output, a source file. Scanning them for action patterns produced
+# nothing but noise: live on a real node, all four hits were TOOL_RESULT rows
+# and all four were false positives (a Devin CLI docs page and a geocoding
+# result matched "browser reaching an admin panel"; a Python source file
+# matched "credential file access" at CRITICAL). Content-borne risk in results
+# is the policy scanners' job — see ``_scan_content_for_policy_events``.
+_THREAT_TOOL_TYPES = frozenset({"TOOL_CALL", "TOOL.CALL", "TOOL_USE"})
+
+# Returned data, not agent action. Excluded for the reason above.
+_THREAT_RESULT_TYPES = frozenset({"TOOL_RESULT", "TOOL.RESULT", "ERROR"})
+
+
+def _threat_tool_name_to_action(name):
+    """Map a tool NAME to a legacy action label. Mirrors routes/brain.py's
+    ``tool_to_type`` so both taxonomies agree on what 'EXEC' means."""
+    tn = str(name or "").lower()
+    if tn == "exec" or "shell" in tn or "bash" in tn or tn == "process":
+        return "EXEC"
+    if "read" in tn or "grep" in tn or "glob" in tn:
+        return "READ"
+    if "write" in tn or "edit" in tn:
+        return "WRITE"
+    if "browser" in tn or "canvas" in tn or "image" in tn:
+        return "BROWSER"
+    if "web_search" in tn or "web_fetch" in tn or "search" in tn or "fetch" in tn:
+        return "SEARCH"
+    if "subagent" in tn or "spawn" in tn or "task" in tn:
+        return "SPAWN"
+    return "TOOL"
+
+
+def _threat_action_types(ev):
+    """Which action labels an event should be matched against.
+
+    The signature table gates on the legacy ``EXEC/READ/WRITE/...`` vocabulary,
+    but since the DuckDB-first migration brain rows arrive as
+    ``TOOL_CALL/TOOL_RESULT/MESSAGE/THINKING/ERROR``. The two vocabularies do
+    not intersect, so every event fell through every signature and the scanner
+    could never report a threat (it was structurally pinned at 0). This bridges
+    them: legacy labels pass through, speech rows are excluded, and a tool row
+    with no tool NAME is matched against every signature — the store keeps the
+    tool INPUT in ``detail`` but not which tool produced it, and the signature
+    regexes are specific enough (``/dev/tcp/``, ``.ssh/id_rsa``) to carry the
+    precision on their own.
+    """
+    ev_type = str(ev.get("type") or "").upper()
+    if not ev_type:
+        return frozenset()
+    if ev_type in _THREAT_ACTION_TYPES:
+        return frozenset({ev_type})
+    if ev_type in _THREAT_NON_ACTION_TYPES or ev_type in _THREAT_RESULT_TYPES:
+        return frozenset()
+    if ev_type in _THREAT_TOOL_TYPES:
+        name = ev.get("tool") or ev.get("toolName") or ev.get("name")
+        if name:
+            return frozenset({_threat_tool_name_to_action(name)})
+        return _THREAT_ACTION_TYPES
+    # CHANNEL.*, NUMBAT_FINDING, daemon rows, anything else we don't recognise
+    # as an agent action: leave alone rather than guess.
+    return frozenset()
+
+
+def _threat_event_session(ev):
+    """Session id for a brain event across both read paths.
+
+    The legacy parser used ``source``; the DuckDB fast path emits ``sessionId``
+    (full) plus ``src`` (truncated to 32 chars). Reading only ``source`` meant
+    every event reported the empty string, so a node with five active sessions
+    reported ``sessions_scanned: 1``.
+    """
+    return str(
+        ev.get("sessionId") or ev.get("source") or ev.get("src") or ""
+    )
+
+
+def _threat_session_runtime(session_id):
+    """``claude_code:1bfbb30f-...`` → ``claude_code``. Bare ids → ""."""
+    sid = str(session_id or "")
+    return sid.split(":", 1)[0] if ":" in sid else ""
+
+
+def _scan_events_for_threats(events, runtime=None):
+    """Scan brain-history events against threat signatures. Returns list of threat matches.
+
+    ``runtime`` scopes the scan to one agent runtime (per FLYWHEEL §1c —
+    a number shown under the runtime switcher must belong to that runtime).
+    """
     threats = []
     sessions_seen = set()
     sessions_with_threats = set()
+    want_runtime = str(runtime or "").strip().lower()
 
     for ev in events:
-        source = ev.get("source", "")
+        source = _threat_event_session(ev)
+        if want_runtime and _threat_session_runtime(source).lower() != want_runtime:
+            continue
         sessions_seen.add(source)
-        ev_type = ev.get("type", "")
+        action_types = _threat_action_types(ev)
+        if not action_types:
+            continue
+        ev_type = str(ev.get("type") or "")
         detail = ev.get("detail", "")
         if not detail:
             continue
 
         for sig in _THREAT_SIGNATURES:
-            if ev_type not in sig["tool_types"]:
+            if not action_types.intersection(sig["tool_types"]):
                 continue
             for compiled in sig["_compiled"]:
                 if compiled.search(detail):
@@ -14988,6 +16045,8 @@ def _scan_events_for_threats(events):
                             "session": ev.get("sourceLabel", source),
                             "source": source,
                             "event_type": ev_type,
+                            "engine": "builtin",
+                            "runtime": _threat_session_runtime(source),
                         }
                     )
                     break  # One match per signature per event
@@ -15017,574 +16076,17 @@ def _scan_events_for_threats(events):
 
 
 def _scan_security_posture():
-    """Scan OpenClaw configuration for security misconfigurations.
+    """Thin delegate — the OpenClaw posture scan moved to
+    :mod:`clawmetry.security_posture` (runtime-aware posture registry).
 
-    Returns a list of checks with pass/fail/warn status, remediation hints,
-    and an overall A-F security score.
-
-    Supports three config detection strategies:
-    1. Local filesystem (native install)
-    2. Docker container (reads config via docker exec/cp)
-    3. Live gateway API (works for any deployment, including Hostinger/VPS Docker)
+    Kept as a function on this module so existing callers keep working:
+    routes/infra.py's legacy path, clawmetry/sync.py's shadow scan
+    (``getattr(dashboard, "_scan_security_posture")``), and tests.
+    Behaviour is identical: this returns the openclaw provider's result.
     """
-    checks = []
-    is_docker = False
+    from clawmetry.security_posture import get_posture
 
-    # --- Locate openclaw.json config ---
-    config_data = None
-    config_path = None
-
-    # Strategy 1: Local filesystem
-    for cf in [
-        os.path.expanduser("~/.openclaw/openclaw.json"),
-        os.path.expanduser("~/.clawdbot/openclaw.json"),
-        os.path.expanduser("~/.clawdbot/clawdbot.json"),
-    ]:
-        try:
-            with open(cf) as f:
-                config_data = json.load(f)
-                config_path = cf
-                break
-        except Exception:
-            continue
-
-    # Strategy 2: Docker container (if not found locally)
-    if config_data is None:
-        try:
-            import subprocess as _sp
-
-            # Find OpenClaw containers
-            out = _sp.run(
-                ["docker", "ps", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if out.returncode == 0:
-                for line in out.stdout.strip().splitlines():
-                    parts = line.split("\t")
-                    if len(parts) < 3:
-                        continue
-                    cid, name, image = parts[0], parts[1], parts[2]
-                    if not any(
-                        k in (name + image).lower()
-                        for k in ["openclaw", "clawd", "claw"]
-                    ):
-                        continue
-                    # Try to read config from inside container
-                    for container_path in [
-                        "/root/.openclaw/openclaw.json",
-                        "/home/node/.openclaw/openclaw.json",
-                        "/data/openclaw.json",
-                        "/app/openclaw.json",
-                    ]:
-                        try:
-                            cat_out = _sp.run(
-                                ["docker", "exec", cid, "cat", container_path],
-                                capture_output=True,
-                                text=True,
-                                timeout=8,
-                            )
-                            if cat_out.returncode == 0 and cat_out.stdout.strip():
-                                config_data = json.loads(cat_out.stdout)
-                                config_path = f"docker:{cid[:12]}:{container_path}"
-                                is_docker = True
-                                break
-                        except Exception:
-                            continue
-                    if config_data:
-                        break
-        except (FileNotFoundError, Exception):
-            pass  # Docker not available
-
-    # Strategy 3: Live gateway API (works for any deployment including remote Docker)
-    if config_data is None:
-        try:
-            gw_cfg = _load_gw_config()
-            gw_url = gw_cfg.get("url", GATEWAY_URL)
-            gw_token = gw_cfg.get("token", GATEWAY_TOKEN)
-            if gw_url and gw_token:
-                import urllib.request
-
-                req = urllib.request.Request(
-                    f"{gw_url}/api/config",
-                    headers={
-                        "Authorization": f"Bearer {gw_token}",
-                        "Accept": "application/json",
-                    },
-                )
-                with urllib.request.urlopen(req, timeout=8) as resp:
-                    if resp.status == 200:
-                        config_data = json.loads(resp.read().decode())
-                        config_path = f"gateway:{gw_url}"
-                        # Check if gateway reports Docker environment
-                        runtime = config_data.get("runtime", {})
-                        if runtime.get("container") or os.path.exists("/.dockerenv"):
-                            is_docker = True
-        except Exception:
-            pass
-
-    if config_data is None:
-        return {
-            "score": "U",
-            "score_label": "Unknown",
-            "score_color": "#64748b",
-            "checks": [
-                {
-                    "id": "config_found",
-                    "label": "Configuration file",
-                    "status": "fail",
-                    "detail": "No openclaw.json found (checked local files, Docker containers, and gateway API)",
-                    "remediation": "Ensure OpenClaw is installed and configured. For Docker: verify the container is running. For remote: configure GATEWAY_URL and GATEWAY_TOKEN.",
-                    "severity": "critical",
-                    "weight": 20,
-                }
-            ],
-            "passed": 0,
-            "failed": 1,
-            "warnings": 0,
-            "total": 1,
-        }
-
-    # Config found — add pass check with source info
-    source_label = (
-        "local file"
-        if not config_path.startswith(("docker:", "gateway:"))
-        else (
-            "Docker container" if config_path.startswith("docker:") else "gateway API"
-        )
-    )
-    checks.append(
-        {
-            "id": "config_found",
-            "label": "Configuration file",
-            "status": "pass",
-            "detail": f"Config loaded from {source_label} ({config_path})",
-            "remediation": None,
-            "severity": "critical",
-            "weight": 20,
-        }
-    )
-
-    # Docker-specific checks
-    if is_docker:
-        checks.append(
-            {
-                "id": "docker_isolation",
-                "label": "Container isolation",
-                "status": "pass",
-                "detail": "OpenClaw is running inside a Docker container (network/filesystem isolation).",
-                "remediation": None,
-                "severity": "high",
-                "weight": 5,
-            }
-        )
-
-    gateway = config_data.get("gateway", {})
-    plugins = config_data.get("plugins", {})
-
-    # Check 1: Gateway auth token configured
-    auth_token = (
-        gateway.get("auth", {}).get("token")
-        or gateway.get("authToken")
-        or os.environ.get("OPENCLAW_AUTH_TOKEN")
-    )
-    if auth_token and len(str(auth_token)) >= 8:
-        checks.append(
-            {
-                "id": "auth_enabled",
-                "label": "Gateway authentication",
-                "status": "pass",
-                "detail": "Auth token is configured (length: {})".format(
-                    len(str(auth_token))
-                ),
-                "remediation": None,
-                "severity": "critical",
-                "weight": 25,
-            }
-        )
-    else:
-        checks.append(
-            {
-                "id": "auth_enabled",
-                "label": "Gateway authentication",
-                "status": "fail",
-                "detail": "No auth token configured. Anyone on the network can control your agent.",
-                "remediation": "Set gateway.auth.token in openclaw.json to a strong random string (32+ chars).",
-                "severity": "critical",
-                "weight": 25,
-            }
-        )
-
-    # Check 2: Auth token strength (not default/weak)
-    weak_tokens = {
-        "test",
-        "password",
-        "12345678",
-        "changeme",
-        "openclaw",
-        "clawdbot",
-        "default",
-        "admin",
-    }
-    if auth_token:
-        token_str = str(auth_token).lower()
-        if token_str in weak_tokens or len(token_str) < 16:
-            checks.append(
-                {
-                    "id": "auth_strength",
-                    "label": "Auth token strength",
-                    "status": "warn",
-                    "detail": "Token is too short or uses a common/default value.",
-                    "remediation": "Use a cryptographically random token: openssl rand -hex 32",
-                    "severity": "high",
-                    "weight": 15,
-                }
-            )
-        else:
-            checks.append(
-                {
-                    "id": "auth_strength",
-                    "label": "Auth token strength",
-                    "status": "pass",
-                    "detail": "Token appears strong ({} chars)".format(len(token_str)),
-                    "remediation": None,
-                    "severity": "high",
-                    "weight": 15,
-                }
-            )
-
-    # Check 3: Gateway bind address (should be localhost, not 0.0.0.0)
-    # In Docker, binding to 0.0.0.0 is expected (Docker manages port exposure)
-    bind_host = gateway.get("host") or gateway.get("bind") or "127.0.0.1"
-    if bind_host in ("0.0.0.0", "::") and is_docker:
-        checks.append(
-            {
-                "id": "bind_address",
-                "label": "Gateway bind address",
-                "status": "pass",
-                "detail": "Gateway binds to {} inside Docker container (Docker manages network exposure via port mapping).".format(
-                    bind_host
-                ),
-                "remediation": None,
-                "severity": "critical",
-                "weight": 20,
-            }
-        )
-    elif bind_host in ("0.0.0.0", "::"):
-        checks.append(
-            {
-                "id": "bind_address",
-                "label": "Gateway bind address",
-                "status": "fail",
-                "detail": "Gateway binds to {} (all interfaces). Exposed to the network.".format(
-                    bind_host
-                ),
-                "remediation": 'Set gateway.host to "127.0.0.1" unless you need remote access. Use a reverse proxy with TLS for remote.',
-                "severity": "critical",
-                "weight": 20,
-            }
-        )
-    else:
-        checks.append(
-            {
-                "id": "bind_address",
-                "label": "Gateway bind address",
-                "status": "pass",
-                "detail": "Gateway binds to {} (local only)".format(bind_host),
-                "remediation": None,
-                "severity": "critical",
-                "weight": 20,
-            }
-        )
-
-    # Check 4: Exec tool permissions
-    tools_config = config_data.get("tools", {})
-    exec_policy = tools_config.get("exec", {})
-    exec_security = exec_policy.get("security") or exec_policy.get("mode") or "full"
-    if exec_security == "full":
-        checks.append(
-            {
-                "id": "exec_permissions",
-                "label": "Exec tool permissions",
-                "status": "warn",
-                "detail": 'Exec security is "full" (unrestricted shell access).',
-                "remediation": 'Consider "allowlist" mode with specific commands, or "deny" for high-risk environments.',
-                "severity": "high",
-                "weight": 10,
-            }
-        )
-    elif exec_security == "deny":
-        checks.append(
-            {
-                "id": "exec_permissions",
-                "label": "Exec tool permissions",
-                "status": "pass",
-                "detail": "Exec tool is disabled (deny mode).",
-                "remediation": None,
-                "severity": "high",
-                "weight": 10,
-            }
-        )
-    else:
-        checks.append(
-            {
-                "id": "exec_permissions",
-                "label": "Exec tool permissions",
-                "status": "pass",
-                "detail": "Exec security mode: {}".format(exec_security),
-                "remediation": None,
-                "severity": "high",
-                "weight": 10,
-            }
-        )
-
-    # Check 5: TLS / HTTPS for gateway
-    gw_port = gateway.get("port", 18789)
-    gw_tls = gateway.get("tls", {})
-    has_tls = bool(gw_tls.get("cert") or gw_tls.get("key") or gw_tls.get("enabled"))
-    if has_tls:
-        checks.append(
-            {
-                "id": "tls_enabled",
-                "label": "TLS encryption",
-                "status": "pass",
-                "detail": "TLS is configured for the gateway.",
-                "remediation": None,
-                "severity": "high",
-                "weight": 10,
-            }
-        )
-    elif bind_host in ("0.0.0.0", "::") and is_docker:
-        checks.append(
-            {
-                "id": "tls_enabled",
-                "label": "TLS encryption",
-                "status": "warn",
-                "detail": "No TLS configured on gateway (Docker). TLS is typically handled by the hosting provider or reverse proxy.",
-                "remediation": "Verify your hosting provider (Hostinger, etc.) or reverse proxy terminates TLS before reaching the container.",
-                "severity": "high",
-                "weight": 10,
-            }
-        )
-    elif bind_host in ("0.0.0.0", "::"):
-        checks.append(
-            {
-                "id": "tls_enabled",
-                "label": "TLS encryption",
-                "status": "fail",
-                "detail": "No TLS configured and gateway is network-exposed. Traffic is unencrypted.",
-                "remediation": "Configure gateway.tls.cert and gateway.tls.key, or use a reverse proxy (nginx/caddy) with TLS.",
-                "severity": "high",
-                "weight": 10,
-            }
-        )
-    else:
-        checks.append(
-            {
-                "id": "tls_enabled",
-                "label": "TLS encryption",
-                "status": "pass",
-                "detail": "TLS not needed (gateway is localhost only).",
-                "remediation": None,
-                "severity": "high",
-                "weight": 10,
-            }
-        )
-
-    # Check 6: Plugin/channel security (telegram/discord tokens not in plaintext env)
-    plugin_entries = plugins.get("entries", {})
-    exposed_secrets = []
-    for pname, pconf in plugin_entries.items():
-        if isinstance(pconf, dict):
-            for key in ["token", "apiKey", "api_key", "secret", "webhook_secret"]:
-                val = pconf.get(key)
-                if (
-                    val
-                    and isinstance(val, str)
-                    and not val.startswith("$")
-                    and not val.startswith("env:")
-                ):
-                    exposed_secrets.append("{}.{}".format(pname, key))
-    if exposed_secrets:
-        checks.append(
-            {
-                "id": "secrets_in_config",
-                "label": "Secrets in config file",
-                "status": "warn",
-                "detail": "{} secret(s) stored as plaintext in config: {}".format(
-                    len(exposed_secrets), ", ".join(exposed_secrets[:3])
-                ),
-                "remediation": 'Use environment variables instead. E.g., set TELEGRAM_TOKEN env var and reference as "$TELEGRAM_TOKEN" in config.',
-                "severity": "medium",
-                "weight": 5,
-            }
-        )
-    else:
-        checks.append(
-            {
-                "id": "secrets_in_config",
-                "label": "Secrets in config file",
-                "status": "pass",
-                "detail": "No plaintext secrets detected in plugin config.",
-                "remediation": None,
-                "severity": "medium",
-                "weight": 5,
-            }
-        )
-
-    # Check 7: Workspace permissions (AGENTS.md, SOUL.md not world-readable)
-    oc_home = os.path.expanduser("~/.openclaw")
-    if os.path.isdir(oc_home):
-        try:
-            mode = oct(os.stat(oc_home).st_mode)[-3:]
-            if mode[-1] != "0":  # world-readable
-                checks.append(
-                    {
-                        "id": "workspace_perms",
-                        "label": "Workspace permissions",
-                        "status": "warn",
-                        "detail": "OpenClaw home directory is world-readable (mode: {})".format(
-                            mode
-                        ),
-                        "remediation": "Run: chmod 700 ~/.openclaw",
-                        "severity": "medium",
-                        "weight": 5,
-                    }
-                )
-            else:
-                checks.append(
-                    {
-                        "id": "workspace_perms",
-                        "label": "Workspace permissions",
-                        "status": "pass",
-                        "detail": "Workspace directory permissions are restrictive (mode: {})".format(
-                            mode
-                        ),
-                        "remediation": None,
-                        "severity": "medium",
-                        "weight": 5,
-                    }
-                )
-        except Exception:
-            checks.append(
-                {
-                    "id": "workspace_perms",
-                    "label": "Workspace permissions",
-                    "status": "warn",
-                    "detail": "Could not check workspace permissions.",
-                    "remediation": "Run: chmod 700 ~/.openclaw",
-                    "severity": "medium",
-                    "weight": 5,
-                }
-            )
-    else:
-        checks.append(
-            {
-                "id": "workspace_perms",
-                "label": "Workspace permissions",
-                "status": "pass",
-                "detail": "Default workspace directory not found (custom location or containerized).",
-                "remediation": None,
-                "severity": "medium",
-                "weight": 5,
-            }
-        )
-
-    # Check 8: Node/remote access configuration
-    nodes_config = config_data.get("nodes", {})
-    auto_approve = nodes_config.get("autoApprove", False)
-    if auto_approve:
-        checks.append(
-            {
-                "id": "node_auto_approve",
-                "label": "Node auto-approve",
-                "status": "warn",
-                "detail": "Nodes are auto-approved without manual review.",
-                "remediation": "Set nodes.autoApprove to false so you review each device before granting access.",
-                "severity": "medium",
-                "weight": 5,
-            }
-        )
-    else:
-        checks.append(
-            {
-                "id": "node_auto_approve",
-                "label": "Node auto-approve",
-                "status": "pass",
-                "detail": "Node pairing requires manual approval.",
-                "remediation": None,
-                "severity": "medium",
-                "weight": 5,
-            }
-        )
-
-    # Check 9: Elevated exec permissions
-    elevated = tools_config.get("elevated", {}) or exec_policy.get("elevated", {})
-    elevated_enabled = (
-        elevated.get("enabled", False) if isinstance(elevated, dict) else bool(elevated)
-    )
-    if elevated_enabled:
-        checks.append(
-            {
-                "id": "elevated_exec",
-                "label": "Elevated (sudo) exec",
-                "status": "warn",
-                "detail": "Elevated/sudo exec is enabled. Agent can run commands as root.",
-                "remediation": "Disable unless absolutely necessary. Use specific sudoers rules instead of blanket elevation.",
-                "severity": "high",
-                "weight": 10,
-            }
-        )
-    else:
-        checks.append(
-            {
-                "id": "elevated_exec",
-                "label": "Elevated (sudo) exec",
-                "status": "pass",
-                "detail": "Elevated exec is disabled.",
-                "remediation": None,
-                "severity": "high",
-                "weight": 10,
-            }
-        )
-
-    # --- Calculate score ---
-    total_weight = sum(c["weight"] for c in checks)
-    earned = sum(c["weight"] for c in checks if c["status"] == "pass")
-    # warnings get half credit
-    earned += sum(c["weight"] * 0.5 for c in checks if c["status"] == "warn")
-    pct = (earned / total_weight * 100) if total_weight > 0 else 0
-
-    if pct >= 90:
-        score, label, color = "A", "Excellent", "#22c55e"
-    elif pct >= 75:
-        score, label, color = "B", "Good", "#84cc16"
-    elif pct >= 60:
-        score, label, color = "C", "Fair", "#f59e0b"
-    elif pct >= 40:
-        score, label, color = "D", "Poor", "#f97316"
-    else:
-        score, label, color = "F", "Critical", "#ef4444"
-
-    passed = sum(1 for c in checks if c["status"] == "pass")
-    failed = sum(1 for c in checks if c["status"] == "fail")
-    warnings = sum(1 for c in checks if c["status"] == "warn")
-
-    return {
-        "score": score,
-        "score_label": label,
-        "score_color": color,
-        "score_pct": round(pct, 1),
-        "checks": checks,
-        "passed": passed,
-        "failed": failed,
-        "warnings": warnings,
-        "total": len(checks),
-        "config_path": config_path,
-        "is_docker": is_docker,
-        "scanned_at": datetime.now().isoformat(),
-    }
+    return get_posture("openclaw")
 
 
 # (bp_security /api/security/posture moved to routes/infra.py)
@@ -17602,6 +18104,105 @@ def _get_recent_log_files(days=7):
     return log_files
 
 
+# ── OTLP compatibility listener (issue #4780) ────────────────────────────
+#
+# The receiver has always been reachable at /v1/* on the dashboard port, but
+# every OpenTelemetry SDK and collector defaults to http://localhost:4318. That
+# gap meant an already-instrumented app could not be observed until someone
+# discovered OTEL_EXPORTER_OTLP_ENDPOINT and pointed it at :8900 -- an env var
+# between the user and "it just works".
+#
+# So we also listen on 4318, serving ONLY the receiver blueprint. A span
+# arriving there takes the identical handler / decoder / store path as one
+# arriving on the dashboard port; nothing about the mapping is duplicated.
+
+# Conventional OTLP/HTTP port. Override with CLAWMETRY_OTLP_PORT (0 = pick an
+# ephemeral port, which the tests use). CLAWMETRY_OTLP_PORT_DISABLE=1 turns the
+# listener off for anyone who wants the port left alone.
+_OTLP_COMPAT_DEFAULT_PORT = 4318
+_otlp_compat_server = None
+
+
+def _build_otlp_compat_app():
+    """A minimal Flask app exposing the OTLP receiver and nothing else.
+
+    Deliberately NOT the dashboard app: a second surface serving the UI and
+    /api/* would widen what is reachable for no gain. Everything except /v1/*
+    (and the small /api/otel-status probe on the same blueprint) 404s here.
+
+    The main app's auth guard is registered too, so the loopback-trusted /
+    token-required rule is one rule, not two: binding this listener somewhere
+    other than loopback cannot silently open an unauthenticated ingest.
+    """
+    from flask import Flask as _Flask
+    from routes.meta import bp_otel as _bp_otel
+
+    otlp_app = _Flask("clawmetry_otlp_compat")
+    otlp_app.register_blueprint(_bp_otel)
+    otlp_app.before_request(_check_auth)
+    return otlp_app
+
+
+def _start_otlp_compat_listener(host=None, port=None, debug=False):
+    """Serve the OTLP receiver on the conventional port in a daemon thread.
+
+    Returns the waitress server (for tests) or ``None`` when the listener is
+    disabled, unavailable, or the port is already held. Never raises: a machine
+    already running an OTel Collector keeps its collector, and ClawMetry says so
+    once rather than failing to boot.
+    """
+    global _otlp_compat_server
+    if str(os.environ.get("CLAWMETRY_OTLP_PORT_DISABLE", "")).strip().lower() in (
+        "1", "true", "yes",
+    ):
+        return None
+    # Flask's debug reloader runs main() in BOTH the supervisor and the child.
+    # Only the child serves the dashboard, so let it own the port; otherwise the
+    # supervisor grabs 4318 and the child logs "already in use" on every reload.
+    if debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+        return None
+    if port is None:
+        try:
+            port = int(os.environ.get("CLAWMETRY_OTLP_PORT", _OTLP_COMPAT_DEFAULT_PORT))
+        except (TypeError, ValueError):
+            port = _OTLP_COMPAT_DEFAULT_PORT
+    # Loopback by default even when the dashboard binds 0.0.0.0. Widening the
+    # ingest surface has to be a deliberate act, not a side effect of the
+    # dashboard's --host.
+    host = host or os.environ.get("CLAWMETRY_OTLP_HOST", "127.0.0.1")
+
+    import logging as _logging
+    log = _logging.getLogger("clawmetry.dashboard")
+    try:
+        from waitress import create_server as _create_server
+    except ImportError:
+        log.debug("waitress missing; OTLP compat listener not started")
+        return None
+    try:
+        server = _create_server(
+            _build_otlp_compat_app(), host=host, port=port,
+            threads=4, channel_timeout=60,
+        )
+    except OSError as e:
+        # Port in use is the common, expected case: the user already runs an
+        # OTel Collector. Not an error -- the dashboard port still serves /v1/*.
+        log.info(
+            "OTLP port %s:%s is already in use (%s); ClawMetry is still "
+            "receiving OTLP on the dashboard port", host, port, e,
+        )
+        return None
+    except Exception as e:
+        log.warning("OTLP compat listener failed to start: %s", e)
+        return None
+
+    threading.Thread(
+        target=server.run, name="clawmetry-otlp-4318", daemon=True,
+    ).start()
+    _otlp_compat_server = server
+    log.info("OTLP receiver listening on http://%s:%s/v1/traces", host, port)
+    return server
+
+
 # ── CLI Entry Point ─────────────────────────────────────────────────────
 
 BANNER = r"""
@@ -17625,14 +18226,14 @@ ARCHITECTURE_OVERVIEW = """\
 
   ┌─────────────────────┐              ┌─────────────────────┐              ┌─────────────────────┐
   │  🤖                 │  READS FILES │  🦞                 │  SHOWS YOU  │  📊                 │
-  │  Your OpenClaw      │ ──────────->  │                     │ ──────────->  │                     │
-  │  agents             │              │  ClawMetry          │              │  Your browser       │
+  │  Your AI agents     │ ──────────->  │                     │ ──────────->  │                     │
+  │  Any of 22 runtimes │              │  ClawMetry          │              │  Your browser       │
   │                     │              │  Parses logs +      │              │  localhost:{port}   │
   │  Running normally.  │              │  sessions.          │              │  Live dashboard     │
   │  Nothing changes.   │              │  Serves dashboard.  │              │                     │
   └─────────────────────┘              └─────────────────────┘              └─────────────────────┘
 
-  Runs locally on the same machine as OpenClaw. Your data never leaves your box.
+  Runs locally on the same machine as your agents. Your data never leaves your box.
   Docs: https://clawmetry.com/how-it-works
 """
 
@@ -17647,6 +18248,16 @@ Commands:
   restart        Restart the background service
   status         Show service status, port, and uptime
   uninstall      Remove the background service
+
+Cloud:
+  login                  Log in / sign up for ClawMetry Cloud (email or Google/GitHub)
+  connect                Activate cloud sync with an API key (scripted/advanced)
+  disconnect             Stop cloud sync and remove the account key
+  doctor                 Diagnose cloud connectivity (DNS/proxy/TLS, detects
+                         corporate TLS interception)
+  --turn-on-cloud-sync   Resume cloud sync (keeps your login)
+  --turn-off-cloud-sync  Pause cloud sync — nothing leaves this machine;
+                         the local dashboard keeps working
 
 Options:
   --port <port>        Port to listen on (default: 8900)
@@ -17665,7 +18276,17 @@ Examples:
 Docs: https://docs.clawmetry.com
 """
 
-PID_FILE = "/tmp/clawmetry.pid"
+# Windows has no /tmp, so the literal path resolved to C:\tmp and every read
+# failed into the bare except below — _read_pid() always returned None, which
+# is what silently disabled the stale-instance reclaim at startup (two dev
+# servers could then bind the same port and requests would land on whichever
+# Windows picked). tempfile.gettempdir() honours %TEMP% there; POSIX keeps the
+# exact path it has always used so existing pid files stay discoverable.
+PID_FILE = (
+    os.path.join(_tempfile.gettempdir(), "clawmetry.pid")
+    if os.name == "nt"
+    else "/tmp/clawmetry.pid"
+)
 LAUNCHD_LABEL = "com.clawmetry.dashboard"
 LAUNCHD_PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist")
 SYSTEMD_SERVICE = os.path.expanduser(
@@ -17711,11 +18332,11 @@ def _read_pid():
 
 
 def _is_pid_running(pid):
-    try:
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, PermissionError):
-        return False
+    # Delegates to the portable probe: os.kill(pid, 0) never raises on
+    # Windows, so this used to report stale dashboard pids as running.
+    from clawmetry.process_control import is_alive as _pid_alive
+
+    return _pid_alive(pid)
 
 
 def _is_macos():
@@ -17871,25 +18492,142 @@ def _write_cloud_token(token):
         json.dump(data, f, indent=2)
 
 
+# In-memory account-email cache for /api/cloud-cta/status. `fail_at` throttles
+# cloud lookups on offline machines (retry at most once a minute) so opening
+# the profile menu never blocks on a dead network for every click.
+_ACCOUNT_EMAIL_CACHE = {"token": "", "email": "", "fail_at": 0.0}
+
+
+def _account_email_for_token(token):
+    """Resolve the sign-in email behind a cm_ key, '' if unknowable.
+
+    The profile menu needs a "who am I" for cloud-OAuth accounts that hold
+    no local license (license `sub` is empty there) — without this the
+    header says "Not signed in" on a fully signed-in, cloud-connected node
+    (founder report 2026-08-09). Resolution order:
+
+      1. ``~/.clawmetry/config.json`` → ``account_email`` (written at
+         connect time and by the claim watcher in clawmetry/sync.py).
+      2. Cloud ``/api/cloud/account?token=`` (best-effort, cached; the
+         result is persisted back into config.json when that file exists
+         so restarts skip the network hop).
+
+    Placeholder identities (``agent+<hash>@clawmetry.auto`` / ``.linked``)
+    are reported as '' — they are internal pre-claim accounts, not
+    something to show a human. Never raises.
+    """
+    if not token:
+        return ""
+
+    def _real(email):
+        e = (email or "").strip()
+        low = e.lower()
+        if low.endswith("@clawmetry.auto") or low.endswith("@clawmetry.linked"):
+            return ""
+        return e
+
+    daemon_cfg = os.path.expanduser("~/.clawmetry/config.json")
+    try:
+        with open(daemon_cfg) as f:
+            cfg = json.load(f)
+        # Only trust the stored email when it belongs to THIS key — after a
+        # reconnect under a different account the old email would be stale.
+        if cfg.get("api_key") == token:
+            e = _real(cfg.get("account_email"))
+            if e:
+                return e
+    except Exception:
+        cfg = None
+
+    if _ACCOUNT_EMAIL_CACHE["token"] == token:
+        if _ACCOUNT_EMAIL_CACHE["email"]:
+            return _ACCOUNT_EMAIL_CACHE["email"]
+        if time.time() - _ACCOUNT_EMAIL_CACHE["fail_at"] < 60:
+            return ""
+
+    email = ""
+    try:
+        import urllib.parse as _up
+        import urllib.request as _ur
+        from clawmetry.endpoints import app_url as _app_url
+
+        url = _app_url() + "/api/cloud/account?token=" + _up.quote(token)
+        with _ur.urlopen(url, timeout=3) as resp:
+            body = json.loads(resp.read() or b"{}")
+        email = _real(body.get("email") if isinstance(body, dict) else "")
+    except Exception:
+        email = ""
+
+    _ACCOUNT_EMAIL_CACHE.update(
+        {"token": token, "email": email,
+         "fail_at": 0.0 if email else time.time()}
+    )
+    if email and isinstance(cfg, dict) and cfg.get("api_key") == token:
+        # Best-effort persist so the daemon and future dashboards see it
+        # without a network hop; config.json stays 0o600 via save_config.
+        try:
+            from clawmetry.sync import save_config
+
+            cfg["account_email"] = email
+            save_config(cfg)
+        except Exception:
+            pass
+    return email
+
+
+def _selfhost_intent():
+    """True when this install's recorded intent is self-host (local-only).
+
+    Two signals, either wins: the nocloud marker (the daemon-facing egress
+    switch), or a recorded selfhost_* choice in ~/.clawmetry/onboarding.json
+    (survives even if some flow clears the marker). Used to pick the
+    default rail for sign-in flows that did not explicitly choose one:
+    founder report 2026-08-09 — a self-host install that signed back in
+    via the profile menu rode the managed rail, which called
+    enable_cloud() and silently started pushing snapshots. Identity and
+    egress are separate choices; sign-in alone must never flip egress on.
+    Never raises.
+    """
+    try:
+        from clawmetry.config import is_cloud_disabled
+
+        if is_cloud_disabled():
+            return True
+    except Exception:
+        pass
+    try:
+        from routes.onboarding import _read_choice_file
+
+        choice = str(_read_choice_file().get("choice", "")).strip().lower()
+        return choice.startswith("selfhost")
+    except Exception:
+        return False
+
+
 # ── One-click cloud connect via GitHub/Google OAuth (dashboard CTA) ────────────
 # The local "Enable Cloud Sync" modal can sign the user up AND connect this node
 # in one click. We reuse the same loopback browser-bridge as `clawmetry connect`:
 # start a one-shot 127.0.0.1 listener, hand the cloud OAuth flow our port via
 # cli_port=<port>, and the cloud callback redirects the freshly-minted cm_ key
-# back to loopback. The key only ever travels over 127.0.0.1. On capture we run
-# the full connect (register node -> ~/.clawmetry/config.json -> start daemon).
-# The dashboard polls _OAUTH_BRIDGE for status.
-_OAUTH_BRIDGE = {"status": "idle", "provider": "", "node_id": "", "enc_key": "", "error": ""}
+# back to loopback. The key only ever travels over 127.0.0.1. What happens on
+# capture depends on the bridge mode: "managed" runs the full connect (register
+# node -> ~/.clawmetry/config.json -> enable cloud -> start daemon); "selfhost"
+# (the onboarding gate's self-host card) keeps egress off and rides the trial
+# rail instead. The dashboard polls _OAUTH_BRIDGE for status.
+_OAUTH_BRIDGE = {"status": "idle", "provider": "", "mode": "", "node_id": "",
+                 "enc_key": "", "trial": "", "error": ""}
 
 
-def _full_connect_with_key(api_key):
-    """Register this node with a verified cm_ key and start syncing.
+def _persist_identity_with_key(api_key):
+    """Register the account/node for a verified cm_ key and persist it.
 
-    Mirrors the non-interactive parts of `clawmetry connect`: validate/register
-    the node, preserve or auto-generate the E2E encryption key, write
-    ~/.clawmetry/config.json, mirror the token into openclaw.json (so the
-    dashboard cloud-proxy works), and ensure the sync daemon is running.
-    Returns (node_id, enc_key). Never raises for non-fatal issues.
+    The shared identity half of both connect flavours: validate/register the
+    node (best-effort — network hiccups still save config so it syncs once
+    reachable), preserve or auto-generate the E2E encryption key, write
+    ~/.clawmetry/config.json, and mirror the token into openclaw.json (so
+    the dashboard cloud-proxy works). Deliberately does NOT touch the
+    nocloud marker or the daemon — callers own the egress decision.
+    Returns (node_id, enc_key).
     """
     import platform
     import socket
@@ -17910,7 +18648,6 @@ def _full_connect_with_key(api_key):
         result = validate_key(api_key, hostname=hostname, existing_node_id=saved_node_id)
         node_id = result.get("node_id") or saved_node_id or hostname
     except Exception:
-        # Network/server hiccup: save config anyway so it syncs once reachable.
         node_id = saved_node_id or hostname
 
     enc_key = saved_enc or generate_encryption_key()
@@ -17921,11 +18658,89 @@ def _full_connect_with_key(api_key):
         "connected_at": __import__("datetime").datetime.now().isoformat(),
         "encryption_key": enc_key,
     }
+    # Resolve + store the sign-in email now, while we know the network is up
+    # (we just OAuth'd through it) — the profile menu reads it via
+    # /api/cloud-cta/status and must not show "Not signed in" on a
+    # signed-in node (founder report 2026-08-09).
+    try:
+        _ACCOUNT_EMAIL_CACHE.update({"token": "", "email": "", "fail_at": 0.0})
+        acct_email = _account_email_for_token(api_key)
+        if acct_email:
+            config["account_email"] = acct_email
+    except Exception:
+        pass
     save_config(config)
     try:
         _write_cloud_token(api_key)
     except Exception:
         pass
+    return node_id, enc_key
+
+
+def _activate_trial_for_key(api_key) -> str:
+    """Mint-or-reuse the account's 7-day Pro trial for ``api_key``.
+
+    Mirrors ``clawmetry.cli._activate_signup_trial`` — same
+    ``/api/license/trial/signup`` endpoint, same idempotent server
+    semantics — but takes the key as an argument so in-process pairing
+    paths (dashboard cloud modal OTP, OAuth loopback bridge) can call it
+    without having to first round-trip through
+    ``~/.clawmetry/config.json``. Returns
+    ``'active' | 'expired' | 'unavailable'`` for the caller to surface;
+    every failure path returns ``'unavailable'`` (never raises).
+
+    Founder ask 2026-08-12: cloud users MUST get the same 7-day Pro
+    trial that self-host users get on sign-in, so they can experience
+    the full product before deciding to pay. Previously the cloud rail
+    only enabled sync and left the account on FREE.
+    """
+    if not (api_key or "").startswith("cm_"):
+        return "unavailable"
+    try:
+        import urllib.request as _ur
+        from clawmetry import license as _lic
+
+        req = _ur.Request(
+            _lic._cloud_base() + "/api/license/trial/signup",
+            data=json.dumps({"api_key": api_key}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with _ur.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode())
+        if not (isinstance(body, dict) and body.get("ok")):
+            return "unavailable"
+        if body.get("expired"):
+            return "expired"
+        if not body.get("key"):
+            return "unavailable"
+        ok, _msg = _lic.activate(body["key"], node_id=_lic._node_id())
+        return "active" if ok else "unavailable"
+    except Exception:
+        return "unavailable"
+
+
+def _full_connect_with_key(api_key):
+    """Register this node with a verified cm_ key and start syncing.
+
+    Mirrors the non-interactive parts of `clawmetry connect`: persist the
+    identity (_persist_identity_with_key), mint-or-reuse the account's
+    7-day Pro trial (same rail as the CLI's ``_activate_signup_trial``
+    and as ``_selfhost_signin_with_key``), opt into egress, and ensure
+    the sync daemon is running. Returns (node_id, enc_key, trial) where
+    trial is ``'active' | 'expired' | 'unavailable'``. Never raises for
+    non-fatal issues.
+    """
+    node_id, enc_key = _persist_identity_with_key(api_key)
+
+    # Mint-or-reuse the 7-day Pro trial so cloud users get the same
+    # "unlock every runtime for 7 days" onboarding self-host already
+    # gets. Founder ask 2026-08-12 — without this the cloud rail was
+    # asymmetric: self-host signup started the trial, cloud signup did
+    # not, so cloud users couldn't experience the full product before
+    # the paywall. Runs BEFORE _restart_sync_daemon so the daemon sees
+    # the freshly activated license on its first poll.
+    trial = _activate_trial_for_key(api_key)
 
     # Clear the local-only marker so the daemon actually pushes to cloud. A
     # local-only install writes ~/.clawmetry/nocloud; without this the connect
@@ -17940,6 +18755,20 @@ def _full_connect_with_key(api_key):
     # (Re)start the sync daemon so it re-reads the new key AND re-evaluates
     # cloud mode. If it is already running in local-only mode, merely "starting
     # if absent" would leave it local-only forever, so we restart unconditionally.
+    _restart_sync_daemon()
+
+    return node_id, enc_key, trial
+
+
+def _restart_sync_daemon():
+    """Restart the sync daemon so it re-reads ~/.clawmetry/config.json.
+
+    Cross-platform: launchctl kickstart on macOS, systemctl restart on
+    Linux, kill+relaunch elsewhere. Best-effort, never raises — callers
+    (cloud connect, E2E key regenerate) proceed either way since the config
+    file write already succeeded and a stale in-memory daemon just means
+    the next natural restart picks up the change.
+    """
     try:
         if _is_macos():
             if os.path.exists(SYNC_LAUNCHD_PLIST):
@@ -17958,15 +18787,57 @@ def _full_connect_with_key(api_key):
     except Exception:
         pass
 
-    return node_id, enc_key
+
+def _selfhost_signin_with_key(api_key):
+    """Self-host sign-in: identity without egress, then the trial rail.
+
+    Mirrors `clawmetry connect` answered with keep-local (identity is what
+    unlocks runtimes; egress is a separate choice): touch the nocloud
+    marker BEFORE persisting the key — the daemon must never observe a
+    cm_ key without the marker, or it would happily start pushing — then
+    register the identity and mint-or-reuse the account's 7-day trial via
+    /api/license/trial/signup (idempotent server-side, same rail as the
+    CLI) and activate it locally. Returns (node_id, trial) where trial is
+    'active' | 'expired' | 'unavailable'.
+    """
+    try:
+        from clawmetry.config import NOCLOUD_MARKER_PATH as _marker
+        import pathlib as _pl
+
+        _p = _pl.Path(str(_marker))
+        _p.parent.mkdir(parents=True, exist_ok=True)
+        _p.touch(exist_ok=True)
+    except Exception:
+        pass
+
+    node_id, _enc = _persist_identity_with_key(api_key)
+
+    # Same trial rail as _full_connect_with_key (cloud) and
+    # clawmetry.cli._activate_signup_trial — mint-or-reuse the 7-day
+    # Pro trial. Delegated to the shared helper so cloud + self-host
+    # never drift on trial semantics again (founder ask 2026-08-12).
+    trial = _activate_trial_for_key(api_key)
+
+    # Same as the email-OTP trial path: make sure the local ingest daemon is
+    # running (it stays local-only under the marker written above).
+    try:
+        from routes.trial import _ensure_local_daemon
+
+        _ensure_local_daemon()
+    except Exception:
+        pass
+    return node_id, trial
 
 
-def _start_oauth_bridge(provider):
+def _start_oauth_bridge(provider, mode="managed"):
     """Start the loopback OAuth bridge and return the cloud start URL (or None).
 
     The caller (dashboard JS) opens the returned URL in a new browser tab. A
-    background thread captures the loopback callback, runs _full_connect_with_key,
-    and updates the module-level _OAUTH_BRIDGE the status route reports.
+    background thread captures the loopback callback and updates the
+    module-level _OAUTH_BRIDGE the status route reports. mode picks what
+    happens with the captured key: "managed" runs _full_connect_with_key
+    (register node + enable cloud sync); "selfhost" runs
+    _selfhost_signin_with_key (identity + local trial, egress stays off).
     """
     import http.server
     import threading
@@ -17975,12 +18846,15 @@ def _start_oauth_bridge(provider):
 
     global _OAUTH_BRIDGE
     provider = (provider or "").lower()
+    mode = "selfhost" if (mode or "").lower() == "selfhost" else "managed"
     if provider not in ("github", "google"):
-        _OAUTH_BRIDGE = {"status": "error", "provider": provider,
-                         "node_id": "", "enc_key": "", "error": "Unsupported provider"}
+        _OAUTH_BRIDGE = {"status": "error", "provider": provider, "mode": mode,
+                         "node_id": "", "enc_key": "", "trial": "",
+                         "error": "Unsupported provider"}
         return None
 
-    app_base = os.environ.get("CLAWMETRY_APP_BASE", "https://app.clawmetry.com").rstrip("/")
+    from clawmetry.endpoints import app_url as _resolve_app_url
+    app_base = _resolve_app_url()
     captured = {}
 
     class _Handler(http.server.BaseHTTPRequestHandler):
@@ -18007,13 +18881,14 @@ def _start_oauth_bridge(provider):
     try:
         srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
     except OSError:
-        _OAUTH_BRIDGE = {"status": "error", "provider": provider,
-                         "node_id": "", "enc_key": "", "error": "Could not start local listener"}
+        _OAUTH_BRIDGE = {"status": "error", "provider": provider, "mode": mode,
+                         "node_id": "", "enc_key": "", "trial": "",
+                         "error": "Could not start local listener"}
         return None
 
     port = srv.server_address[1]
-    _OAUTH_BRIDGE = {"status": "waiting", "provider": provider,
-                     "node_id": "", "enc_key": "", "error": ""}
+    _OAUTH_BRIDGE = {"status": "waiting", "provider": provider, "mode": mode,
+                     "node_id": "", "enc_key": "", "trial": "", "error": ""}
 
     def _run():
         global _OAUTH_BRIDGE
@@ -18026,16 +18901,25 @@ def _start_oauth_bridge(provider):
             srv.server_close()
         tok = captured.get("token", "")
         if not tok.startswith("cm_"):
-            _OAUTH_BRIDGE = {"status": "error", "provider": provider, "node_id": "",
-                             "enc_key": "", "error": "Sign-in was not completed."}
+            _OAUTH_BRIDGE = {"status": "error", "provider": provider, "mode": mode,
+                             "node_id": "", "enc_key": "", "trial": "",
+                             "error": "Sign-in was not completed."}
             return
         try:
-            node_id, enc_key = _full_connect_with_key(tok)
-            _OAUTH_BRIDGE = {"status": "connected", "provider": provider,
-                             "node_id": node_id, "enc_key": enc_key, "error": ""}
+            if mode == "selfhost":
+                node_id, trial = _selfhost_signin_with_key(tok)
+                _OAUTH_BRIDGE = {"status": "connected", "provider": provider,
+                                 "mode": mode, "node_id": node_id, "enc_key": "",
+                                 "trial": trial, "error": ""}
+            else:
+                node_id, enc_key, trial = _full_connect_with_key(tok)
+                _OAUTH_BRIDGE = {"status": "connected", "provider": provider,
+                                 "mode": mode, "node_id": node_id,
+                                 "enc_key": enc_key, "trial": trial, "error": ""}
         except Exception as e:  # pragma: no cover - defensive
-            _OAUTH_BRIDGE = {"status": "error", "provider": provider, "node_id": "",
-                             "enc_key": "", "error": str(e)[:200]}
+            _OAUTH_BRIDGE = {"status": "error", "provider": provider, "mode": mode,
+                             "node_id": "", "enc_key": "", "trial": "",
+                             "error": str(e)[:200]}
 
     threading.Thread(target=_run, daemon=True).start()
     return f"{app_base}/api/oauth/{provider}/start?cli_port={port}"
@@ -18343,7 +19227,9 @@ def _kill_all_sync_procs():
     pid = _read_pid()
     if pid and _is_pid_running(pid):
         try:
-            os.kill(pid, signal.SIGKILL)
+            # signal.SIGKILL does not exist on Windows (AttributeError);
+            # SIGTERM maps to TerminateProcess there, same hard-kill intent.
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
         except OSError:
             pass
 
@@ -18368,11 +19254,31 @@ def _start_daemon_background():
     import subprocess
     import pathlib as _pl
 
+    # Without a config the spawned daemon crash-loops (load_config raises)
+    # and the local store never fills; and `python -m` puts the CWD on
+    # sys.path, so a dashboard launched from a source checkout would spawn
+    # the repo's (possibly stale) sync.py instead of the installed wheel.
+    try:
+        from clawmetry.sync import ensure_local_config
+        ensure_local_config()
+    except Exception:
+        pass
+    spawn_kwargs = {"cwd": os.path.expanduser("~")}
+    if os.name == "nt":
+        # start_new_session is POSIX-only and silently no-ops on Windows:
+        # the daemon stayed tied to this console (killed when it closes)
+        # and, when the dashboard itself runs hidden, python.exe popped a
+        # visible console window. Mirror cli.py _start_subprocess.
+        spawn_kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+    else:
+        spawn_kwargs["start_new_session"] = True
     proc = subprocess.Popen(
         [sys.executable, "-m", "clawmetry.sync"],
         stdout=open(os.devnull, "w"),
         stderr=open(os.devnull, "w"),
-        start_new_session=True,
+        **spawn_kwargs,
     )
     pid_file = _pl.Path.home() / ".clawmetry" / "sync.pid"
     pid_file.parent.mkdir(parents=True, exist_ok=True)
@@ -18765,6 +19671,11 @@ def _run_server(args):
     except (ValueError, OSError):
         pass  # stdout may be closed/redirected on Windows
 
+    # Start the OTLP compatibility listener BEFORE the banner so the banner can
+    # report the port it actually bound (or stay quiet when it stepped aside for
+    # an existing collector). Issue #4780.
+    _otlp_listener = _start_otlp_compat_listener(debug=args.debug)
+
     try:
         local_ip = get_local_ip()
         public_ip = get_public_ip()
@@ -18775,8 +19686,17 @@ def _run_server(args):
             print(
                 f"  -> http://{public_ip}:{args.port}  (Public - ensure port is open)"
             )
-        if _HAS_OTEL_PROTO:
-            print(f"  -> OTLP endpoint: http://{local_ip}:{args.port}/v1/metrics")
+        # OTLP ingest is always on now: OTLP/JSON needs no extra (#4781), and
+        # the receiver also listens on the conventional 4318 (#4780). Print the
+        # endpoint an OTel SDK would use with no configuration at all.
+        if _otlp_listener is not None:
+            print(
+                f"  -> OTLP endpoint: http://localhost:{_otlp_listener.effective_port}"
+                "  (OTEL_EXPORTER_OTLP_ENDPOINT)"
+            )
+        else:
+            print(f"  -> OTLP endpoint: http://localhost:{args.port}"
+                  "  (OTEL_EXPORTER_OTLP_ENDPOINT)")
         # One-click login URL when gateway token was detected (#1356 PR-D).
         # Defense against shoulder-surfing screenshots: only the framed URL is
         # printed (never the bare token), and only on the interactive startup
@@ -18866,6 +19786,19 @@ def _init_data_provider():
 
 
 def main():
+    # Enterprise TLS/proxy bootstrap (idempotent; also runs in cli.main).
+    # Covers direct `python3 dashboard.py` runs so telemetry/cloud-proxy
+    # POSTs work behind corporate TLS-intercepting proxies.
+    try:
+        from clawmetry.net import configure_outbound_network
+        configure_outbound_network(role="dashboard")
+    except Exception:
+        pass
+    try:
+        from clawmetry.winconsole import hide_child_console_windows
+        hide_child_console_windows()
+    except Exception:
+        pass
     # -----------------------------------------------------------------------
     # Build a shared parent parser for options that apply to all subcommands
     # (and to foreground mode when no subcommand is given).

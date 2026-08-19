@@ -47,11 +47,12 @@ def lic(monkeypatch, tmp_path):
     monkeypatch.setattr(L, "LICENSE_PATH", str(tmp_path / "license.key"))
     monkeypatch.setattr(L, "_CONFIG_PATH", str(tmp_path / "config.json"))
     monkeypatch.delenv("CLAWMETRY_LICENSE_SERVER", raising=False)
-    # Clear the cloud server override too so `activate` stays fully offline (no
-    # network) in unit tests — the self-hosted install path only phones home
-    # when a server is explicitly configured.
     monkeypatch.delenv("CLAWMETRY_INGEST_URL", raising=False)
     monkeypatch.delenv("CLAWMETRY_ENFORCE", raising=False)
+    # `activate` phones home to the production cloud BY DEFAULT now, so unit
+    # tests opt out via CLAWMETRY_OFFLINE. The phone-home tests below delete
+    # this and stub urllib themselves — nothing here may touch the network.
+    monkeypatch.setenv("CLAWMETRY_OFFLINE", "1")
     return SimpleNamespace(L=L, priv=priv, pub_pem=pub_pem)
 
 
@@ -108,6 +109,33 @@ def test_parse_license_enterprise(lic):
     assert en.tier == e.TIER_ENTERPRISE
 
 
+def test_parse_license_starter(lic):
+    """Self-hosted 'starter' keys ($90/node/yr) map to TIER_CLOUD_STARTER —
+    a paid tier with the Starter feature set, not a silent Pro upgrade."""
+    import clawmetry.entitlements as e
+
+    tok = lic.L._encode_token(_payload("starter", nodes=1), lic.priv)
+    en = lic.L.parse_license(tok)
+    assert en is not None
+    assert en.tier == e.TIER_CLOUD_STARTER
+    assert en.source == "license"
+    assert en.node_limit == 1
+    assert en.is_paid is True
+    # Starter carries the Starter feature set (not Pro's) + paid runtimes.
+    assert e.STARTER_FEATURES <= en.features
+    assert "claude_code" in en.runtimes
+
+
+def test_parse_license_unknown_tier_defaults_to_pro(lic):
+    """Forward compatibility: a tier this OSS build doesn't know still
+    resolves to Pro rather than bricking the license."""
+    import clawmetry.entitlements as e
+
+    tok = lic.L._encode_token(_payload("mega_future_tier"), lic.priv)
+    en = lic.L.parse_license(tok)
+    assert en is not None and en.tier == e.TIER_PRO
+
+
 def test_invalid_token_parses_to_none(lic):
     assert lic.L.parse_license("CLAW1.bogus.bogus") is None
 
@@ -135,8 +163,9 @@ def test_activate_valid_key(lic):
     assert ok is True
     assert "pro" in msg.lower()
     assert os.path.isfile(lic.L.LICENSE_PATH)
-    # deferred install message when no server configured
-    assert "deferred" in msg.lower()
+    # offline-mode skip message when CLAWMETRY_OFFLINE is set (the fixture
+    # default) — no node registration, no wheel download, activation still ok.
+    assert "offline mode" in msg.lower()
 
 
 def test_activate_invalid_key(lic):
@@ -150,6 +179,122 @@ def test_activate_expired_key(lic):
     ok, msg = lic.L.activate(tok)
     assert ok is False
     assert "expired" in msg.lower()
+
+
+# ── activation phone-home (default server / offline opt-out) ─────────────────
+#
+# `clawmetry activate <KEY>` registers the node + fetches the clawmetry-pro
+# wheel from the DEFAULT cloud base when nothing is configured — the license
+# email says only `clawmetry activate <token>`, so the default must work.
+# CLAWMETRY_OFFLINE=1 is the explicit opt-out. Every test here stubs urllib:
+# no test may ever touch the real network.
+
+
+def _stub_registration(monkeypatch, L):
+    """Stub urllib.request.urlopen for the node-registration POST and capture
+    the URL _provision_pro_wheel would be handed. Returns the capture dict."""
+    import io
+    import json as _j
+    import urllib.request
+
+    seen: dict = {"register_urls": [], "wheel_url": None}
+
+    class _Resp(io.BytesIO):
+        headers: dict = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _fake_urlopen(req, timeout=0):
+        url = req.full_url
+        seen["register_urls"].append(url)
+        assert "/api/license/activate" in url, f"unexpected URL {url}"
+        return _Resp(_j.dumps({"ok": True, "download_url": "/api/license/download"}).encode())
+
+    def _fake_provision(url, headers=None, node_id=None):
+        seen["wheel_url"] = url
+        return "clawmetry-pro installed (test)"
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(L, "_provision_pro_wheel", _fake_provision)
+    return seen
+
+
+def test_activate_no_env_phones_home_to_default_server(lic, monkeypatch):
+    """No env vars at all -> registration + wheel download go to the
+    production cloud base (this was the bug: it early-returned 'deferred'
+    and paying customers never got the pro wheel)."""
+    monkeypatch.delenv("CLAWMETRY_OFFLINE", raising=False)
+    seen = _stub_registration(monkeypatch, lic.L)
+    tok = lic.L._encode_token(_payload("pro", nodes=2), lic.priv)
+    ok, msg = lic.L.activate(tok)
+    assert ok is True
+    assert seen["register_urls"] == ["https://ingest.clawmetry.com/api/license/activate"]
+    assert seen["wheel_url"] == "https://ingest.clawmetry.com/api/license/download"
+    assert "installed" in msg
+
+
+def test_activate_license_server_env_still_wins(lic, monkeypatch):
+    """CLAWMETRY_LICENSE_SERVER beats both CLAWMETRY_INGEST_URL and the
+    default cloud base (self-hosted / air-gapped license servers)."""
+    monkeypatch.delenv("CLAWMETRY_OFFLINE", raising=False)
+    monkeypatch.setenv("CLAWMETRY_LICENSE_SERVER", "https://lic.example.test/")
+    monkeypatch.setenv("CLAWMETRY_INGEST_URL", "https://ingest.other.test")
+    seen = _stub_registration(monkeypatch, lic.L)
+    tok = lic.L._encode_token(_payload(), lic.priv)
+    ok, _msg = lic.L.activate(tok)
+    assert ok is True
+    assert seen["register_urls"] == ["https://lic.example.test/api/license/activate"]
+    assert seen["wheel_url"] == "https://lic.example.test/api/license/download"
+
+
+@pytest.mark.parametrize("truthy", ["1", "true", "YES"])
+def test_activate_offline_env_skips_phone_home(lic, monkeypatch, truthy):
+    """CLAWMETRY_OFFLINE (any truthy spelling) keeps activation fully local:
+    no network call, clear skip message, license still active on disk."""
+    import os
+    import urllib.request
+
+    monkeypatch.setenv("CLAWMETRY_OFFLINE", truthy)
+
+    def _no_network(*a, **k):
+        raise AssertionError("network touched in offline mode")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _no_network)
+    tok = lic.L._encode_token(_payload("pro", nodes=3), lic.priv)
+    ok, msg = lic.L.activate(tok)
+    assert ok is True
+    assert "offline mode" in msg
+    assert "skipping node registration" in msg
+    assert "CLAWMETRY_LICENSE_SERVER" in msg  # tells the operator the way out
+    assert os.path.isfile(lic.L.LICENSE_PATH)
+    en = lic.L.load_license(lic.L.LICENSE_PATH)
+    assert en is not None and en.is_paid  # entitlements unlocked offline
+
+
+def test_activate_survives_unreachable_default_server(lic, monkeypatch):
+    """A failed phone-home NEVER fails activation: the key is verified
+    offline and saved; the wheel install is deferred with a message."""
+    import os
+    import urllib.error
+    import urllib.request
+
+    monkeypatch.delenv("CLAWMETRY_OFFLINE", raising=False)
+
+    def _down(req, timeout=0):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _down)
+    tok = lic.L._encode_token(_payload("pro", nodes=2), lic.priv)
+    ok, msg = lic.L.activate(tok)
+    assert ok is True
+    assert "deferred" in msg.lower()
+    assert os.path.isfile(lic.L.LICENSE_PATH)
+    en = lic.L.load_license(lic.L.LICENSE_PATH)
+    assert en is not None and en.is_paid
 
 
 def test_inspect_key_valid_returns_summary(lic):
@@ -173,6 +318,22 @@ def test_inspect_key_enterprise_tier(lic):
     info = lic.L.inspect_key(tok)
     assert info is not None and info["tier"] == "enterprise"
     assert info["nodes"] == 99
+
+
+def test_inspect_key_starter_tier(lic):
+    tok = lic.L._encode_token(_payload("starter", nodes=1), lic.priv)
+    info = lic.L.inspect_key(tok)
+    assert info is not None and info["tier"] == "starter"
+
+
+def test_current_license_info_starter(lic):
+    """`clawmetry license` status renders a starter key as 'starter'."""
+    tok = lic.L._encode_token(_payload("starter", nodes=1), lic.priv)
+    ok, _ = lic.L.activate(tok)
+    assert ok
+    info = lic.L.current_license_info()
+    assert info["valid"] is True
+    assert info["tier"] == "starter"
 
 
 def test_inspect_key_invalid_returns_none(lic):
@@ -229,6 +390,205 @@ def test_current_license_info(lic):
     assert info["days_left"] > 300
 
 
+# ── inspect_key: shape parity with current_license_info ─────────────────────
+#
+# The docstring on ``inspect_key`` promises "the same field set as
+# ``current_license_info`` (so the UI can render the two the same way)". Pin
+# the invariant: every non-None return from ``inspect_key`` MUST carry the
+# same 10-key envelope as ``current_license_info``'s file-exists branches, so
+# a UI, ``jq`` filter, or support script never has to branch on which envelope
+# it received. The two on-disk-only fields collapse to ``None`` on the dry-run
+# side; the trust-anchor fingerprint is payload-independent and byte-equals
+# what ``current_license_info`` populates.
+
+
+def test_inspect_key_active_matches_current_license_info_shape(lic):
+    tok = lic.L._encode_token(_payload("pro", nodes=7), lic.priv)
+    info = lic.L.inspect_key(tok)
+    assert info is not None
+    assert set(info.keys()) == _EXPECTED_FILE_EXISTS_KEYS
+
+
+def test_inspect_key_expired_matches_current_license_info_shape(lic):
+    tok = lic.L._encode_token(_payload("pro", nodes=4, exp_delta=-7200), lic.priv)
+    info = lic.L.inspect_key(tok)
+    assert info is not None
+    assert set(info.keys()) == _EXPECTED_FILE_EXISTS_KEYS
+
+
+def test_inspect_key_carries_trust_anchor_fingerprint(lic):
+    """The pubkey fingerprint is payload-independent, so an inspection
+    envelope MUST carry the same value ``current_license_info`` would
+    populate — a support script can then verify "does the pasted key
+    verify against the pubkey we ship?" without an extra API round-trip."""
+    tok = lic.L._encode_token(_payload("pro", nodes=1), lic.priv)
+    info = lic.L.inspect_key(tok)
+    assert info is not None
+    fp = info["pubkey_fingerprint_sha256"]
+    assert isinstance(fp, str)
+    assert len(fp) == 64
+    # Matches the standalone helper — the two must never drift.
+    assert fp == lic.L.pubkey_fingerprint()
+
+
+def test_inspect_key_on_disk_fields_are_none_on_dry_run(lic):
+    """A dry-run inspection never touches disk, so the two on-disk-only
+    fields (``permissions_safe`` / ``file_mode``) MUST collapse to ``None``.
+    Keeps the shape identical to ``current_license_info`` while making it
+    obvious to a caller that those fields carry no information yet."""
+    tok = lic.L._encode_token(_payload("pro", nodes=1), lic.priv)
+    info = lic.L.inspect_key(tok)
+    assert info is not None
+    assert info["permissions_safe"] is None
+    assert info["file_mode"] is None
+
+
+def test_inspect_key_expired_carries_trust_anchor_fingerprint(lic):
+    """Expired-but-parseable keys still populate the fingerprint — support
+    can confirm "this key was minted with our pubkey" even for a stale key."""
+    tok = lic.L._encode_token(_payload("pro", nodes=1, exp_delta=-3600), lic.priv)
+    info = lic.L.inspect_key(tok)
+    assert info is not None
+    assert info["status"] == "expired"
+    assert info["pubkey_fingerprint_sha256"] == lic.L.pubkey_fingerprint()
+    assert info["permissions_safe"] is None
+    assert info["file_mode"] is None
+
+
+def test_inspect_key_shape_parity_with_active_current_license_info(lic):
+    """End-to-end shape check: ``inspect_key`` on a token and
+    ``current_license_info`` after activating the SAME token must return the
+    exact same key set. Guards against future drift where either side adds
+    a field the other forgets."""
+    tok = lic.L._encode_token(_payload("pro", nodes=5), lic.priv)
+    dry = lic.L.inspect_key(tok)
+    lic.L.activate(tok)
+    live = lic.L.current_license_info()
+    assert dry is not None and live is not None
+    assert set(dry.keys()) == set(live.keys())
+    # Both envelopes must agree on the trust anchor — a mismatch would mean
+    # inspect_key was validating against a different key than the resolver.
+    assert dry["pubkey_fingerprint_sha256"] == live["pubkey_fingerprint_sha256"]
+
+
+def test_inspect_key_fingerprint_degrades_to_none_when_pubkey_broken(lic, monkeypatch):
+    """If the embedded pubkey PEM can't parse, ``pubkey_fingerprint`` returns
+    ``None`` (see its docstring). ``inspect_key`` must degrade cleanly to the
+    same ``None`` for the fingerprint field instead of raising — the outer
+    ``try/except`` would swallow it back to ``None`` anyway, but a token
+    that verified BEFORE the pubkey broke must still surface as an
+    inspection envelope with ``fingerprint=None``, not a total ``None``."""
+    tok = lic.L._encode_token(_payload("pro", nodes=1), lic.priv)
+    # Break the fingerprint helper AFTER we've minted a token so verification
+    # still passes. The two operations use the same pubkey source in prod so
+    # in practice a broken PEM breaks both — but the helper is defensive and
+    # returns None on any parse failure, so mirror that here.
+    monkeypatch.setattr(lic.L, "pubkey_fingerprint", lambda: None)
+    info = lic.L.inspect_key(tok)
+    assert info is not None
+    assert info["pubkey_fingerprint_sha256"] is None
+    # Rest of the envelope stays intact — a broken fingerprint helper is
+    # NOT allowed to blank the actual payload fields.
+    assert info["tier"] == "pro"
+    assert info["valid"] is True
+
+
+# ── current_license_info: uniform shape across active/expired/invalid ─────────
+#
+# When a license file exists, EVERY branch must return the same field set so
+# a UI can render the row without special-casing which keys are present.
+
+_EXPECTED_FILE_EXISTS_KEYS = frozenset({
+    "valid", "status", "tier", "nodes", "sub", "exp", "issued_at", "days_left",
+    "pubkey_fingerprint_sha256", "permissions_safe", "file_mode",
+})
+
+
+def test_current_license_info_missing_file_returns_none(lic):
+    import os
+
+    assert not os.path.isfile(lic.L.LICENSE_PATH)
+    assert lic.L.current_license_info() is None
+
+
+def test_current_license_info_invalid_signature_matches_full_shape(lic):
+    """A file with a bogus signature returns the same field set as an active
+    or expired license, so a UI never has to branch on which keys exist."""
+    import os
+
+    other_priv, _ = _keypair()
+    forged = lic.L._encode_token(_payload(), other_priv)
+    os.makedirs(os.path.dirname(lic.L.LICENSE_PATH), exist_ok=True)
+    with open(lic.L.LICENSE_PATH, "w", encoding="utf-8") as fh:
+        fh.write(forged + "\n")
+
+    info = lic.L.current_license_info()
+    assert info is not None
+    assert set(info.keys()) == _EXPECTED_FILE_EXISTS_KEYS
+    assert info["valid"] is False
+    assert info["status"] == "invalid"
+    # Untrusted payload fields must NOT leak — an attacker could put any tier
+    # into an unsigned body, so treat them as unknown.
+    assert info["tier"] is None
+    assert info["nodes"] is None
+    assert info["sub"] is None
+    assert info["exp"] is None
+    assert info["days_left"] is None
+    # Trust anchor + on-disk state are payload-independent and must be filled.
+    assert isinstance(info["pubkey_fingerprint_sha256"], str)
+    assert len(info["pubkey_fingerprint_sha256"]) == 64
+    assert info["permissions_safe"] in (True, False)
+
+
+def test_current_license_info_expired_matches_full_shape(lic):
+    """activate() refuses expired keys, so simulate the on-disk state
+    directly — this pins the 'expired-but-signature-verifies' branch of
+    current_license_info(), which is the state a live install reaches when
+    a valid key ages past its exp."""
+    import os
+
+    tok = lic.L._encode_token(_payload("pro", nodes=4, exp_delta=-7200), lic.priv)
+    os.makedirs(os.path.dirname(lic.L.LICENSE_PATH), exist_ok=True)
+    with open(lic.L.LICENSE_PATH, "w", encoding="utf-8") as fh:
+        fh.write(tok + "\n")
+
+    info = lic.L.current_license_info()
+    assert info is not None
+    assert set(info.keys()) == _EXPECTED_FILE_EXISTS_KEYS
+    assert info["valid"] is False
+    assert info["status"] == "expired"
+    assert info["tier"] == "pro"
+    assert info["nodes"] == 4
+    assert info["days_left"] is not None and info["days_left"] <= 0
+
+
+def test_current_license_info_active_matches_full_shape(lic):
+    tok = lic.L._encode_token(_payload("pro", nodes=3), lic.priv)
+    lic.L.activate(tok)
+    info = lic.L.current_license_info()
+    assert info is not None
+    assert set(info.keys()) == _EXPECTED_FILE_EXISTS_KEYS
+    assert info["valid"] is True
+    assert info["status"] == "active"
+
+
+def test_current_license_info_garbage_file_returns_uniform_invalid_shape(lic):
+    """Not even a well-formed CLAW1 token — just random bytes — still gets the
+    full shape back so a UI's 'invalid license' row renders identically."""
+    import os
+
+    os.makedirs(os.path.dirname(lic.L.LICENSE_PATH), exist_ok=True)
+    with open(lic.L.LICENSE_PATH, "w", encoding="utf-8") as fh:
+        fh.write("not-even-a-token\n")
+
+    info = lic.L.current_license_info()
+    assert info is not None
+    assert set(info.keys()) == _EXPECTED_FILE_EXISTS_KEYS
+    assert info["valid"] is False
+    assert info["status"] == "invalid"
+    assert info["tier"] is None
+
+
 # ── integration with entitlements ──────────────────────────────────────────────
 
 
@@ -256,10 +616,18 @@ def test_activate_then_entitlement_resolves_pro(lic, monkeypatch):
 @pytest.fixture
 def prov(lic, monkeypatch, tmp_path):
     """license module with the pro marker redirected to a temp file + the cloud
-    base pointed at a fake server, and no real pro package present."""
+    base pointed at a fake server, and no real pro package present.
+
+    Note: the parent ``lic`` fixture sets ``CLAWMETRY_OFFLINE=1`` so tests never
+    leak to the real network by accident. Since ``auto_provision_pro`` now
+    honors that flag (early-returns without probing), phone-home tests must
+    opt back OUT explicitly — otherwise every stubbed urlopen would never be
+    reached. Tests that WANT the offline short-circuit stub urlopen to raise
+    on any call (see ``test_auto_provision_offline_env_skips_probe``)."""
     monkeypatch.setattr(lic.L, "_PRO_MARKER_PATH", str(tmp_path / "pro.json"))
     monkeypatch.setenv("CLAWMETRY_INGEST_URL", "https://fake.clawmetry.test")
     monkeypatch.setattr(lic.L, "_pro_installed_version", lambda: None)
+    monkeypatch.delenv("CLAWMETRY_OFFLINE", raising=False)
     return lic
 
 
@@ -362,6 +730,28 @@ def test_auto_provision_idempotent_when_pro_present(prov, monkeypatch):
     assert installed is True
     assert calls["download"] == 1  # re-validates with the server every call
     assert "already installed" in msg
+
+
+@pytest.mark.parametrize("truthy", ["1", "true", "YES"])
+def test_auto_provision_offline_env_skips_probe(prov, monkeypatch, truthy):
+    """CLAWMETRY_OFFLINE (any truthy spelling) short-circuits auto_provision_pro
+    before any HTTP is issued: neither /api/license/entitlement nor
+    /api/license/download is touched. Symmetric with the activate path's
+    offline gate (see ``test_activate_offline_env_skips_phone_home``) so a
+    single env var reliably keeps an air-gapped install off the wire whether
+    the operator connects via cm_ key or activates via signed license."""
+    import urllib.request
+
+    monkeypatch.setenv("CLAWMETRY_OFFLINE", truthy)
+
+    def _no_network(*a, **k):
+        raise AssertionError("network touched in offline mode")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _no_network)
+    installed, msg = prov.L.auto_provision_pro("cm_prouser", node_id="n1")
+    assert installed is False
+    assert "offline mode" in msg
+    assert "CLAWMETRY_OFFLINE" in msg  # tells the operator the way out
 
 
 def test_download_wheel_refuses_non_https(prov):

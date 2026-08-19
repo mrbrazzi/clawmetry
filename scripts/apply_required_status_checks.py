@@ -36,17 +36,17 @@ any non-ghs_ token:
 
 Primary repo behaviour (clawmetry):
   When GITHUB_REPOSITORY=vivekchand/clawmetry and using a PAT, the script
-  applies ALL 6 required checks across all 3 repos in one run. This means
+  applies ALL 3 required checks across all 3 repos in one run. This means
   you only need to trigger the apply-required-checks.yml workflow ONCE -- on
   the clawmetry repo -- to close C6 everywhere.
 
   When using GITHUB_TOKEN (read-only push path), only the current repo's
   checks are verified to avoid cross-repo 403s.
 
-When run locally (GITHUB_REPOSITORY not set), the script applies all 6
+When run locally (GITHUB_REPOSITORY not set), the script applies all 3
 checks and requires a token with cross-repo admin access.
 
-Tracking: vivekchand/clawmetry#2146 (C6)
+Tracking: vivekchand/clawmetry#4552 (C6)
 """
 from __future__ import annotations
 
@@ -60,12 +60,11 @@ OWNER = "vivekchand"
 
 # Each tuple: (repo, exact job name as it appears in the workflow's `name:` field)
 #
-# Job names verified against workflow files 2026-06-11:
-#   clawmetry/.github/workflows/oss-golden-path.yml      -> "OSS golden path (wheel + OpenClaw + 9 tabs)"
-#   clawmetry/.github/workflows/cross-repo-handoff.yml   -> "Cross-repo handoff (C4)"
-#   clawmetry/.github/workflows/ci.yml (moat-keystone)   -> "MOAT Keystone (13-endpoint bar)"
-#   clawmetry/.github/workflows/ci.yml (e2e-critical)    -> "E2E Browser Tests (critical subset)"
-#   clawmetry-cloud/.github/workflows/e2e.yml            -> "Cloud golden-path browser E2E"
+# Job names verified against workflow files 2026-07-27:
+#   clawmetry/.github/workflows/e2e-gate.yml              -> "E2E Gate (required)"
+#     (aggregates OSS golden path + Cross-repo handoff + MOAT Keystone +
+#      E2E Browser Tests into one status check; PR #4111, merged 2026-07-27)
+#   clawmetry-cloud/.github/workflows/e2e.yml             -> "Cloud golden-path browser E2E"
 #   clawmetry-landing/.github/workflows/landing-golden-path.yml -> "Landing golden path (C3)"
 #
 # visual-diff (pr-screenshots.yml) is intentionally excluded: that workflow has
@@ -73,20 +72,22 @@ OWNER = "vivekchand"
 # a required check would permanently stall non-UI PRs on "Expected -- Waiting
 # for status to be reported."
 REQUIRED_CHECKS: list[tuple[str, str]] = [
-    ("clawmetry",         "OSS golden path (wheel + OpenClaw + 9 tabs)"),
-    ("clawmetry",         "Cross-repo handoff (C4)"),
-    # docs/MOAT_BAR.md Section 5, AC#1: keystone_e2e --no-drive blocks merge.
-    # ci.yml `moat-keystone` job runs on every PR; job name must match exactly.
-    ("clawmetry",         "MOAT Keystone (13-endpoint bar)"),
-    # ci.yml `e2e-critical` job: 32-tab auth-overlay sweep (C5 gate).
-    # Without this, a PR breaking tabs 10-32 fails CI but remains mergeable.
-    ("clawmetry",         "E2E Browser Tests (critical subset)"),
+    # Single aggregator replacing the 4 individual OSS E2E checks.
+    # Requires .github/workflows/e2e-gate.yml (PR #4111, merged 2026-07-27).
+    # One branch-protection entry closes C6 for clawmetry instead of four.
+    ("clawmetry",         "E2E Gate (required)"),
     ("clawmetry-cloud",   "Cloud golden-path browser E2E"),
     ("clawmetry-landing", "Landing golden path (C3)"),
 ]
 
 # Checks previously added as required that must be actively removed.
 DEPRECATED_CHECKS: list[tuple[str, str]] = [
+    # Replaced by "E2E Gate (required)" aggregator (PR #4111, 2026-07-27).
+    # Remove these individual checks if present so branch protection stays clean.
+    ("clawmetry", "OSS golden path (wheel + OpenClaw + 9 tabs)"),
+    ("clawmetry", "Cross-repo handoff (C4)"),
+    ("clawmetry", "MOAT Keystone (13-endpoint bar)"),
+    ("clawmetry", "E2E Browser Tests (critical subset)"),
     # Added in error before 2026-06-02: pr-screenshots.yml has a paths: filter
     # so visual-diff only fires on UI-touching PRs. As a required check it
     # permanently stalls non-UI PRs waiting for a status that never arrives.
@@ -144,6 +145,67 @@ def _ensure_protection(repo: str, token: str) -> None:
     print(f"  [{repo}] created minimal branch protection on main")
 
 
+def _enable_status_checks_preserving(repo: str, contexts: list, token: str) -> None:
+    """Turn required_status_checks ON inside an EXISTING protection rule.
+
+    The PATCH sub-resource 404s with 'Required status checks not enabled'
+    when main is protected (PR reviews, enforce_admins, ...) but the
+    status-check block was never switched on -- the exact state all three
+    repos were in (C6 audit red since #3970). PUT /protection REPLACES the
+    whole rule, so read the current one and re-submit it faithfully with
+    the status-check block added; nothing else may change.
+    """
+    path = f"/repos/{OWNER}/{repo}/branches/main/protection"
+    cur = _api("GET", path, token=token)
+
+    reviews = None
+    rpr = cur.get("required_pull_request_reviews")
+    if rpr:
+        reviews = {
+            "dismiss_stale_reviews": bool(rpr.get("dismiss_stale_reviews")),
+            "require_code_owner_reviews": bool(rpr.get("require_code_owner_reviews")),
+            "required_approving_review_count": int(
+                rpr.get("required_approving_review_count") or 0
+            ),
+        }
+        if rpr.get("require_last_push_approval") is not None:
+            reviews["require_last_push_approval"] = bool(
+                rpr.get("require_last_push_approval")
+            )
+
+    restrictions = None
+    if cur.get("restrictions"):
+        r = cur["restrictions"]
+        restrictions = {
+            "users": [u.get("login") for u in r.get("users", []) if u.get("login")],
+            "teams": [t.get("slug") for t in r.get("teams", []) if t.get("slug")],
+            "apps": [a.get("slug") for a in r.get("apps", []) if a.get("slug")],
+        }
+
+    def _flag(name: str) -> bool:
+        return bool((cur.get(name) or {}).get("enabled"))
+
+    _api(
+        "PUT",
+        path,
+        body={
+            "required_status_checks": {"strict": False, "contexts": contexts},
+            "enforce_admins": _flag("enforce_admins"),
+            "required_pull_request_reviews": reviews,
+            "restrictions": restrictions,
+            "required_linear_history": _flag("required_linear_history"),
+            "allow_force_pushes": _flag("allow_force_pushes"),
+            "allow_deletions": _flag("allow_deletions"),
+            "required_conversation_resolution": _flag(
+                "required_conversation_resolution"
+            ),
+            "lock_branch": _flag("lock_branch"),
+            "allow_fork_syncing": _flag("allow_fork_syncing"),
+        },
+        token=token,
+    )
+
+
 def add_required_check(repo: str, context: str, token: str) -> None:
     """Idempotently add context as a required status check on repo/main."""
     _ensure_protection(repo, token)
@@ -151,16 +213,29 @@ def add_required_check(repo: str, context: str, token: str) -> None:
     path = f"/repos/{OWNER}/{repo}/branches/main/protection/required_status_checks"
     try:
         current = _api("GET", path, token=token)
-        existing: list[str] = current.get("contexts", [])
+        existing: list[str] = list(current.get("contexts") or [])
+        # Build a full set from both arrays to avoid duplicates when checks were
+        # already configured via the Settings UI (which writes to 'checks' only).
+        existing_set: set[str] = set(existing)
+        for item in (current.get("checks") or []):
+            if isinstance(item, dict) and item.get("context"):
+                existing_set.add(item["context"])
     except RuntimeError:
         existing = []
+        existing_set = set()
 
-    if context in existing:
+    if context in existing_set:
         print(f"  [{repo}] already required: {context!r}")
         return
 
     existing.append(context)
-    _api("PATCH", path, body={"strict": False, "contexts": existing}, token=token)
+    try:
+        _api("PATCH", path, body={"strict": False, "contexts": existing}, token=token)
+    except RuntimeError as exc:
+        if "Required status checks not enabled" not in str(exc):
+            raise
+        _enable_status_checks_preserving(repo, existing, token)
+        print(f"  [{repo}] enabled required status checks on existing protection")
     print(f"  [{repo}] added required check ({len(existing)} total): {context!r}")
 
 
@@ -169,7 +244,7 @@ def remove_required_check(repo: str, context: str, token: str) -> None:
     path = f"/repos/{OWNER}/{repo}/branches/main/protection/required_status_checks"
     try:
         current = _api("GET", path, token=token)
-        existing: list[str] = current.get("contexts", [])
+        existing: list[str] = list(current.get("contexts") or [])
     except RuntimeError:
         print(f"  [{repo}] no branch protection found, skipping removal of: {context!r}")
         return
@@ -192,6 +267,11 @@ def _get_branch_protection_contexts(repo: str, token: str) -> set[str] | None:
 
     Returns the set of configured context strings, or None if the branch
     endpoint is unreachable or returns no protection data.
+
+    Reads from both 'contexts' (legacy) and 'checks' (current) arrays.
+    GitHub Settings UI writes required checks to the 'checks' array only;
+    reading only 'contexts' causes false C6-missing reports after an admin
+    configures checks via the Settings UI.
     """
     path = f"/repos/{OWNER}/{repo}/branches/main"
     try:
@@ -201,7 +281,12 @@ def _get_branch_protection_contexts(repo: str, token: str) -> set[str] | None:
         return None
     protection = data.get("protection") or {}
     rsc = protection.get("required_status_checks") or {}
-    return set(rsc.get("contexts", []))
+    contexts: set[str] = set(rsc.get("contexts") or [])
+    # Also extract from 'checks' array so Settings UI-configured checks are seen.
+    for item in (rsc.get("checks") or []):
+        if isinstance(item, dict) and item.get("context"):
+            contexts.add(item["context"])
+    return contexts
 
 
 def verify_required_checks_readonly(
@@ -224,7 +309,10 @@ def verify_required_checks_readonly(
     for repo in repos:
         actual = _get_branch_protection_contexts(repo, token)
         if actual is None:
-            print(f"  [{repo}] UNKNOWN: branch endpoint did not return protection info")
+            # Branch endpoint unavailable -- treat as unconfigured, not as OK.
+            # Silently continuing here would mask real C6 gaps.
+            print(f"  [{repo}] FAIL: branch endpoint unavailable -- treating as unconfigured")
+            ok = False
             continue
         required = {ctx for r, ctx in checks if r == repo}
         blocked = {ctx for r, ctx in deprecated if r == repo}
@@ -250,6 +338,9 @@ def verify_required_checks(
 
     Returns True if all required checks are present and no deprecated checks
     remain. Prints a FAIL line for each discrepancy so CI logs are actionable.
+
+    Reads from both 'contexts' (legacy) and 'checks' (current) arrays so
+    checks configured via the GitHub Settings UI are detected as present.
     """
     repos = dict.fromkeys([r for r, _ in checks + deprecated])
     ok = True
@@ -257,7 +348,11 @@ def verify_required_checks(
         path = f"/repos/{OWNER}/{repo}/branches/main/protection/required_status_checks"
         try:
             current = _api("GET", path, token=token)
-            actual: set[str] = set(current.get("contexts", []))
+            actual: set[str] = set(current.get("contexts") or [])
+            # Also read from 'checks' array: Settings UI writes here, not 'contexts'.
+            for check in (current.get("checks") or []):
+                if isinstance(check, dict) and check.get("context"):
+                    actual.add(check["context"])
         except RuntimeError as exc:
             print(f"  [{repo}] FAIL: could not read required checks: {exc}")
             ok = False
@@ -287,7 +382,7 @@ def _checks_to_apply() -> list[tuple[str, str]]:
     """Return the REQUIRED_CHECKS to apply for the current context (PAT path).
 
     clawmetry is the primary E2E hub. When running from here with a PAT that
-    has Administration (read+write) on all 3 repos, we apply all 6 required
+    has Administration (read+write) on all 3 repos, we apply all 3 required
     checks in a single run -- matching the dry-run preview in
     apply-required-checks.yml which already says 'apply to all 3 repos'.
 
@@ -374,28 +469,37 @@ def main() -> None:
                 "  Fix: re-run the workflow and paste a fine-grained PAT into the 'pat_token' field.\n"
                 "  PAT permissions: Administration (read+write) on clawmetry, clawmetry-cloud, clawmetry-landing.\n"
                 "  Alternative: bash scripts/close-c6.sh (uses your gh CLI session, ~30 sec).\n"
-                "  Tracking: vivekchand/clawmetry#2146 (C6)"
+                "  Tracking: vivekchand/clawmetry#4552 (C6)"
             )
-        # Read-only path: GITHUB_TOKEN cannot write branch protection.
+        # Read-only path: GITHUB_TOKEN cannot write branch protection rules.
         # Scope verification to the current repo only to avoid cross-repo 403s.
         local_checks, local_deprecated = _readonly_scope()
         print("=== E2E Robustness C6: read-only verify (GITHUB_TOKEN, no write access) ===")
         print()
         print("INFO: GITHUB_TOKEN cannot write branch protection rules.")
         print()
-        print("INFO: Quickest path to close C6 (one run, no local setup):")
-        print("  1. Create a fine-grained PAT: github.com > Settings > Developer settings")
-        print("     > Fine-grained tokens > Generate. Repository access: clawmetry,")
-        print("     clawmetry-cloud, clawmetry-landing. Permission: Administration (read+write).")
-        print("  2. Actions > 'Apply required E2E status checks (C6 -- one-shot)' > Run workflow")
-        print("     confirm=APPLY, pat_token=<paste token> > Run workflow")
+        print("INFO: Fastest close -- no PAT, no tools, ~60 s in any browser (Option A):")
+        print("  GitHub Settings UI autocompletes check names from recent CI runs.")
+        print("  1. github.com/vivekchand/clawmetry/settings/branches > Edit main >")
+        print("     Require status checks > add:")
+        print("       E2E Gate (required)")
+        print("  2. github.com/vivekchand/clawmetry-cloud/settings/branches > add:")
+        print("       Cloud golden-path browser E2E")
+        print("  3. github.com/vivekchand/clawmetry-landing/settings/branches > add:")
+        print("       Landing golden path (C3)")
+        print()
+        print("INFO: Alternative -- Actions one-shot (fine-grained PAT with Administration: write):")
+        print("  Create PAT: github.com/settings/personal-access-tokens/new")
+        print("    repos: clawmetry, clawmetry-cloud, clawmetry-landing")
+        print("    permission: Administration read+write")
+        print("  Then: Actions > 'Apply required E2E status checks (C6 -- one-shot)' > Run workflow")
+        print("    confirm=APPLY, pat_token=<paste token>")
         print("  Closes C6 for ALL 3 repos in one run. No local clone, no gh CLI.")
         print()
-        print("INFO: Alternative -- one-liner from a terminal (uses existing gh CLI session):")
+        print("INFO: Terminal shortcut (uses existing gh CLI session, ~30 s):")
         print("  bash scripts/close-c6.sh")
         print()
-        print("INFO: Manual alternative -- Settings > Branches > main >")
-        print("  Required status checks > add:")
+        print("INFO: Full check list that will be required:")
         for repo, ctx in REQUIRED_CHECKS:
             print(f"    [{repo}] {ctx!r}")
         print()

@@ -34,7 +34,21 @@ Thumbs.db
 # Logs
 *.log
 .clawmetry-fleet.db
+.clawmetry-fleet.db-shm
+.clawmetry-fleet.db-wal
+.clawmetry-metrics.json
 .claude/worktrees/
 
 # Node (used only by tests/e2e/ for the cloud-contract spec runner)
 node_modules/
+
+# Desktop app build outputs (PyInstaller)
+desktop/build/
+desktop/dist/
+# Auto-generated at every pyinstaller run from dashboard.py __version__.
+desktop/installer/version_info.txt
+# Any local signing cert must never land in the tree.
+*.pfx
+*.p12
+build/
+dist/

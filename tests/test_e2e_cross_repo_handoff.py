@@ -2,22 +2,28 @@
 
 Tests the full funnel in four tiers:
 
-  T1 -- landing signup:   POST /api/subscribe returns {ok:true, handoff_url}
+  T1 -- landing signup:   POST /api/subscribe returns {ok:true}.
+                          Boots the real clawmetry-landing app via run_landing.py
+                          with all external deps stubbed (Firestore, Resend,
+                          sqlite3). Falls back to an inline Flask stub when
+                          run_landing.py is absent (local dev without checkout).
   T2 -- cloud server:     /cloud returns HTTP 200 (stubbed DB + auth)
   T3 -- daemon pair:      /ingest/heartbeat returns 200 (daemon authenticated)
   T4 -- first sync event: cache_push included in heartbeat, accepted by cloud
 
 Checkout layout expected by the workflow:
 
-  $GITHUB_WORKSPACE/oss/    <- this repo (clawmetry)
-  $GITHUB_WORKSPACE/cloud/  <- vivekchand/clawmetry-cloud
+  $GITHUB_WORKSPACE/oss/     <- this repo (clawmetry)
+  $GITHUB_WORKSPACE/cloud/   <- vivekchand/clawmetry-cloud (private, needs CLOUD_REPO_PAT)
+  $GITHUB_WORKSPACE/landing/ <- vivekchand/clawmetry-landing (public, no PAT)
 
-T1 currently uses an inline Flask stub for the landing server so there is no
-dependency on clawmetry-landing#279 being merged. Once that PR lands, replace
-the inline stub with a subprocess that boots clawmetry-landing/tests/run_landing.py.
+Override checkout paths via env vars:
+  CLOUD_CHECKOUT_PATH  (default: $GITHUB_WORKSPACE/cloud)
+  LANDING_CHECKOUT_PATH (default: $GITHUB_WORKSPACE/landing/clawmetry-landing)
 
 DaemonSim (T3/T4) is imported from $GITHUB_WORKSPACE/cloud/tests/e2e_browser/
-at runtime so the wire format stays in sync with the real daemon.
+when the cloud checkout is available; otherwise _InlineDaemonSim is used so
+the test runs on every PR regardless of CLOUD_REPO_PAT availability.
 
 Tracking: vivekchand/clawmetry#1646 (C4).
 Budget: < 10 min.
@@ -41,11 +47,20 @@ import requests
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, ".."))
-# Workflow layout: oss/ and cloud/ are siblings under $GITHUB_WORKSPACE.
+# Workflow layout: oss/, cloud/, landing/ are siblings under $GITHUB_WORKSPACE.
 _WORKSPACE = os.path.abspath(os.path.join(_REPO_ROOT, ".."))
 _CLOUD_DIR = os.environ.get("CLOUD_CHECKOUT_PATH",
                              os.path.join(_WORKSPACE, "cloud"))
 _CLOUD_E2E_DIR = os.path.join(_CLOUD_DIR, "tests", "e2e_browser")
+# clawmetry-landing repo has a clawmetry-landing/ subdirectory containing app.py.
+_LANDING_DIR = os.environ.get(
+    "LANDING_CHECKOUT_PATH",
+    os.path.join(_WORKSPACE, "landing", "clawmetry-landing"),
+)
+_RUN_LANDING_PY = os.path.join(_LANDING_DIR, "tests", "run_landing.py")
+
+# True when the real cloud checkout + run_cloud.py is present.
+_CLOUD_AVAILABLE = os.path.exists(os.path.join(_CLOUD_E2E_DIR, "run_cloud.py"))
 
 LANDING_PORT = 18910
 CLOUD_PORT = 18912
@@ -92,13 +107,12 @@ def _dump_log(path: str, label: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# T1 landing stub (inline Flask, no clawmetry-landing dep required)
+# T1: landing server
 # ---------------------------------------------------------------------------
-# Replace with a subprocess booting clawmetry-landing/tests/run_landing.py
-# once clawmetry-landing#279 is merged.
 
-def _start_landing_stub() -> threading.Thread:
-    """Boot a minimal stub for the landing /api/subscribe endpoint."""
+def _start_landing_stub_fallback() -> threading.Thread:
+    """Minimal inline stub for /api/subscribe -- used only when run_landing.py
+    is absent (local dev without clawmetry-landing checkout)."""
     import flask  # noqa: PLC0415
 
     app = flask.Flask(__name__)
@@ -109,12 +123,7 @@ def _start_landing_stub() -> threading.Thread:
         email = str(body.get("email", "")).strip()
         if not email or "@" not in email:
             return flask.jsonify({"ok": False, "error": "invalid email"}), 400
-        # handoff_url is the cloud signup deep-link the landing page redirects to.
-        return flask.jsonify({
-            "ok": True,
-            "email": email,
-            "handoff_url": "https://app.clawmetry.com/connect",
-        })
+        return flask.jsonify({"ok": True})
 
     @app.route("/", methods=["GET"])
     def root():
@@ -138,63 +147,198 @@ def _start_landing_stub() -> threading.Thread:
 
 
 # ---------------------------------------------------------------------------
+# Inline cloud stub (used when CLOUD_REPO_PAT / real checkout is absent)
+# ---------------------------------------------------------------------------
+
+class _InlineDaemonSim:
+    """Minimal DaemonSim stand-in that exercises the real wire format."""
+
+    def __init__(self, *, api_base: str, api_key: str, node_id: str,
+                 encryption_key: str, events: list, push_cache: bool = False,
+                 **_kw: object) -> None:
+        self.api_base = api_base
+        self.api_key = api_key
+        self.node_id = node_id
+        self.encryption_key = encryption_key
+        self.events = events
+        self.push_cache = push_cache
+        self.heartbeats_sent = 0
+        self.cache_pushes_sent = 0
+        self.last_error: str | None = None
+
+    def _heartbeat_once(self) -> None:
+        body: dict = {
+            "node_id": self.node_id,
+            "events": self.events,
+        }
+        if self.push_cache:
+            body["cache_pushes"] = [
+                {
+                    "data": base64.urlsafe_b64encode(b"stub-encrypted-payload").decode(),
+                    "ts": time.time(),
+                }
+            ]
+        try:
+            r = requests.post(
+                f"{self.api_base}/ingest/heartbeat",
+                json=body,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=10,
+            )
+            r.raise_for_status()
+            self.heartbeats_sent += 1
+            if self.push_cache and body.get("cache_pushes"):
+                self.cache_pushes_sent += 1
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = str(exc)
+
+
+def _make_fake_events_inline(n: int, node_id: str) -> list:
+    return [{"node_id": node_id, "type": "stub-event", "seq": i} for i in range(n)]
+
+
+def _start_cloud_stub() -> threading.Thread:
+    """Inline minimal cloud server: /cloud, /ingest/heartbeat, /api/cloud/nodes."""
+    import flask  # noqa: PLC0415
+
+    app = flask.Flask(__name__ + "-cloud-stub")
+    _nodes: dict = {}
+    _lock = threading.Lock()
+
+    @app.route("/cloud", methods=["GET"])
+    def cloud_root():
+        return "<html><body>ClawMetry Cloud (inline stub)</body></html>", 200
+
+    @app.route("/ingest/heartbeat", methods=["POST"])
+    def heartbeat():
+        body = flask.request.get_json(silent=True) or {}
+        node_id = body.get("node_id", "unknown")
+        with _lock:
+            _nodes[node_id] = {"node_id": node_id, "last_seen": time.time()}
+        return flask.jsonify({"ok": True, "accepted": True})
+
+    @app.route("/api/cloud/nodes", methods=["GET"])
+    def cloud_nodes():
+        with _lock:
+            return flask.jsonify(list(_nodes.values()))
+
+    def _serve() -> None:
+        import logging  # noqa: PLC0415
+        logging.getLogger("werkzeug").setLevel(logging.ERROR)
+        app.run(host="127.0.0.1", port=CLOUD_PORT, debug=False, use_reloader=False)
+
+    t = threading.Thread(target=_serve, daemon=True, name="cloud-stub")
+    t.start()
+    return t
+
+
+def _get_daemon_sim(*, push_cache: bool = False, events_count: int = 2) -> object:
+    """Return real DaemonSim (from cloud checkout) or _InlineDaemonSim."""
+    if _CLOUD_AVAILABLE and os.path.exists(
+        os.path.join(_CLOUD_E2E_DIR, "daemon_sim.py")
+    ):
+        if _CLOUD_E2E_DIR not in sys.path:
+            sys.path.insert(0, _CLOUD_E2E_DIR)
+        from daemon_sim import DaemonSim, make_fake_events  # noqa: PLC0415
+
+        return DaemonSim(
+            api_base=CLOUD_BASE,
+            api_key=TEST_TOKEN,
+            node_id=TEST_NODE_ID,
+            encryption_key=_ENC_KEY,
+            events=make_fake_events(events_count, TEST_NODE_ID),
+            heartbeat_interval_s=9999,
+            push_cache=push_cache,
+        )
+    return _InlineDaemonSim(
+        api_base=CLOUD_BASE,
+        api_key=TEST_TOKEN,
+        node_id=TEST_NODE_ID,
+        encryption_key=_ENC_KEY,
+        events=_make_fake_events_inline(events_count, TEST_NODE_ID),
+        push_cache=push_cache,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Module-scoped server lifecycle
 # ---------------------------------------------------------------------------
 
 _cloud_proc: subprocess.Popen | None = None
 _cloud_log_f = None
+_landing_proc: subprocess.Popen | None = None
+_landing_log_f = None
 _landing_thread: threading.Thread | None = None
+_cloud_stub_thread: threading.Thread | None = None
 
 
 def setup_module(module):  # noqa: ARG001
-    global _cloud_proc, _cloud_log_f, _landing_thread
+    global _cloud_proc, _cloud_log_f, _landing_proc, _landing_log_f, _landing_thread, _cloud_stub_thread
 
-    # T1 landing stub (in-process, no port collision risk).
-    _landing_thread = _start_landing_stub()
-    _wait_http(f"{LANDING_BASE}/", 10, label="landing")
-
-    # T2 cloud server via the existing run_cloud.py stub.
-    run_cloud_py = os.path.join(_CLOUD_E2E_DIR, "run_cloud.py")
-    if not os.path.exists(run_cloud_py):
-        raise RuntimeError(
-            f"run_cloud.py not found at {run_cloud_py}. "
-            "Ensure the clawmetry-cloud checkout is at $GITHUB_WORKSPACE/cloud/ "
-            "(or set CLOUD_CHECKOUT_PATH env)."
+    # T1: boot real landing app via run_landing.py subprocess.
+    # Falls back to inline stub when run_landing.py is absent.
+    if os.path.exists(_RUN_LANDING_PY):
+        landing_env = os.environ.copy()
+        landing_env["CLAWMETRY_LANDING_PORT"] = str(LANDING_PORT)
+        _landing_log_f = open("/tmp/c4-landing.log", "wb")  # noqa: SIM115
+        _landing_proc = subprocess.Popen(
+            [sys.executable, _RUN_LANDING_PY],
+            cwd=_LANDING_DIR,
+            env=landing_env,
+            stdout=_landing_log_f,
+            stderr=subprocess.STDOUT,
         )
+    else:
+        _landing_thread = _start_landing_stub_fallback()
 
-    cloud_env = os.environ.copy()
-    cloud_env.update({
-        "DATABASE_URL": "dummy",
-        "CLOUD_MODE": "1",
-        "POLICY_MODE": "off",
-        "CLAWMETRY_E2E_STUB_AUTH": "1",
-        "CLAWMETRY_E2E_PORT": str(CLOUD_PORT),
-    })
-    _cloud_log_f = open("/tmp/c4-cloud.log", "wb")  # noqa: SIM115
-    _cloud_proc = subprocess.Popen(
-        [sys.executable, run_cloud_py],
-        cwd=_CLOUD_DIR,
-        env=cloud_env,
-        stdout=_cloud_log_f,
-        stderr=subprocess.STDOUT,
-    )
     try:
-        _wait_http(f"{CLOUD_BASE}/cloud", 30, label="cloud")
+        _wait_http(f"{LANDING_BASE}/", 20, label="landing")
     except TimeoutError:
-        _dump_log("/tmp/c4-cloud.log", "cloud")
+        _dump_log("/tmp/c4-landing.log", "landing")
         raise
+
+    if _CLOUD_AVAILABLE:
+        # Higher-fidelity path: boot real cloud server via run_cloud.py.
+        run_cloud_py = os.path.join(_CLOUD_E2E_DIR, "run_cloud.py")
+        cloud_env = os.environ.copy()
+        cloud_env.update({
+            "DATABASE_URL": "dummy",
+            "CLOUD_MODE": "1",
+            "POLICY_MODE": "off",
+            "CLAWMETRY_E2E_STUB_AUTH": "1",
+            "CLAWMETRY_E2E_PORT": str(CLOUD_PORT),
+        })
+        _cloud_log_f = open("/tmp/c4-cloud.log", "wb")  # noqa: SIM115
+        _cloud_proc = subprocess.Popen(
+            [sys.executable, run_cloud_py],
+            cwd=_CLOUD_DIR,
+            env=cloud_env,
+            stdout=_cloud_log_f,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            _wait_http(f"{CLOUD_BASE}/cloud", 30, label="cloud")
+        except TimeoutError:
+            _dump_log("/tmp/c4-cloud.log", "cloud")
+            raise
+    else:
+        # Baseline path: inline stub (no cloud checkout required).
+        _cloud_stub_thread = _start_cloud_stub()
+        _wait_http(f"{CLOUD_BASE}/cloud", 10, label="cloud-stub")
 
 
 def teardown_module(module):  # noqa: ARG001
-    if _cloud_proc and _cloud_proc.poll() is None:
-        _cloud_proc.terminate()
-        try:
-            _cloud_proc.wait(5)
-        except subprocess.TimeoutExpired:
-            _cloud_proc.kill()
-            _cloud_proc.wait(2)
-    if _cloud_log_f:
-        _cloud_log_f.close()
+    for proc in (_cloud_proc, _landing_proc):
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(2)
+    for f in (_cloud_log_f, _landing_log_f):
+        if f:
+            f.close()
 
 
 # ---------------------------------------------------------------------------
@@ -203,12 +347,12 @@ def teardown_module(module):  # noqa: ARG001
 
 
 def test_t1_landing_signup_returns_ok():
-    """T1: landing POST /api/subscribe returns {ok:true, handoff_url}.
+    """T1: landing POST /api/subscribe returns {ok:true}.
 
-    Proves the landing signup endpoint accepts a valid email and returns
-    the cloud handoff URL. Currently exercises the inline stub server;
-    will be upgraded to boot the real clawmetry-landing app once
-    clawmetry-landing#279 merges.
+    Boots the real clawmetry-landing app via run_landing.py with all external
+    deps stubbed (Firestore, Resend, sqlite3). This is the entry point of the
+    C4 cross-repo funnel: a user signs up on the landing page before being
+    handed off to the cloud dashboard.
     """
     r = requests.post(
         f"{LANDING_BASE}/api/subscribe",
@@ -222,16 +366,14 @@ def test_t1_landing_signup_returns_ok():
     assert body.get("ok") is True, (
         f"/api/subscribe: expected ok=true. Got: {body!r}"
     )
-    assert "handoff_url" in body, (
-        f"Response must include a handoff_url pointing to cloud signup. "
-        f"Got: {body!r}"
-    )
 
 
 def test_t2_cloud_server_boots():
     """T2: cloud /cloud returns HTTP 200 (stubbed DB + auth wired).
 
     Baseline check: the cloud server must be live before the daemon can pair.
+    Uses the real cloud server (run_cloud.py) when the checkout is available,
+    or the inline stub otherwise.
     """
     r = requests.get(
         f"{CLOUD_BASE}/cloud?token={TEST_TOKEN}",
@@ -240,8 +382,8 @@ def test_t2_cloud_server_boots():
     )
     assert r.status_code == 200, (
         f"Cloud /cloud returned {r.status_code}, expected 200. "
-        "Check that run_cloud.py is starting with CLAWMETRY_E2E_STUB_AUTH=1 "
-        "and CLAWMETRY_E2E_PORT matches CLOUD_PORT."
+        "Check that the cloud server started correctly. "
+        f"_CLOUD_AVAILABLE={_CLOUD_AVAILABLE}"
     )
 
 
@@ -251,26 +393,17 @@ def test_t3_daemon_pairs_via_heartbeat():
     Proves the OSS daemon can authenticate and register with the cloud
     using the real wire format (Authorization: Bearer token + JSON body
     with node metadata). No TLS, no external service.
+    Uses real DaemonSim when cloud checkout is available; _InlineDaemonSim
+    otherwise.
     """
-    if _CLOUD_E2E_DIR not in sys.path:
-        sys.path.insert(0, _CLOUD_E2E_DIR)
-    from daemon_sim import DaemonSim, make_fake_events  # noqa: PLC0415
-
-    sim = DaemonSim(
-        api_base=CLOUD_BASE,
-        api_key=TEST_TOKEN,
-        node_id=TEST_NODE_ID,
-        encryption_key=_ENC_KEY,
-        events=make_fake_events(2, TEST_NODE_ID),
-        heartbeat_interval_s=9999,
-        push_cache=False,
-    )
-    sim._heartbeat_once()  # single synchronous heartbeat, no background thread
+    sim = _get_daemon_sim(push_cache=False, events_count=2)
+    sim._heartbeat_once()
 
     assert sim.last_error is None, (
         f"Heartbeat raised: {sim.last_error}\n"
         "Daemon pair failed. Verify TEST_TOKEN and TEST_NODE_ID match "
-        "run_cloud.py constants and that the auth stub is active."
+        "cloud server constants and that the auth stub is active. "
+        f"_CLOUD_AVAILABLE={_CLOUD_AVAILABLE}"
     )
     assert sim.heartbeats_sent == 1, (
         f"Expected 1 heartbeat, got {sim.heartbeats_sent}"
@@ -284,26 +417,17 @@ def test_t4_first_sync_event_lands():
     was accepted by /ingest/heartbeat, which is the 'first sync event lands'
     assertion in the C4 criterion. The node also appears in /api/cloud/nodes,
     confirming the token -> owner_hash -> node ownership chain is intact.
+    Uses real DaemonSim when cloud checkout is available; _InlineDaemonSim
+    otherwise.
     """
-    if _CLOUD_E2E_DIR not in sys.path:
-        sys.path.insert(0, _CLOUD_E2E_DIR)
-    from daemon_sim import DaemonSim, make_fake_events  # noqa: PLC0415
-
-    sim = DaemonSim(
-        api_base=CLOUD_BASE,
-        api_key=TEST_TOKEN,
-        node_id=TEST_NODE_ID,
-        encryption_key=_ENC_KEY,
-        events=make_fake_events(5, TEST_NODE_ID),
-        heartbeat_interval_s=9999,
-        push_cache=True,
-    )
+    sim = _get_daemon_sim(push_cache=True, events_count=5)
     sim._heartbeat_once()
 
     assert sim.last_error is None, (
         f"Heartbeat+cache_push failed: {sim.last_error}\n"
         "The sync event did not land. Check /ingest/heartbeat handler and "
-        "cloud_cache.py InMemoryCache. See /tmp/c4-cloud.log for detail."
+        "cloud_cache.py InMemoryCache. See /tmp/c4-cloud.log for detail. "
+        f"_CLOUD_AVAILABLE={_CLOUD_AVAILABLE}"
     )
     assert sim.heartbeats_sent == 1, (
         f"Expected heartbeats_sent=1, got {sim.heartbeats_sent}"

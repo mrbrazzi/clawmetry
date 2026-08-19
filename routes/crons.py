@@ -183,6 +183,7 @@ def _row_to_cron_job(row):
         "schedule": schedule or {},
         "enabled": bool(row.get("enabled", True)),
         "createdAtMs": int(extras.get("createdAtMs") or 0),
+        "model": row.get("model") or "",
         "state": {
             "lastRunAtMs": _parse_iso_to_ms(row.get("last_run_at")),
             "lastStatus": row.get("last_status") or "pending",
@@ -190,7 +191,7 @@ def _row_to_cron_job(row):
             **state_extras,
         },
     }
-    # Carry through any extra top-level fields (prompt, channel, model, ...)
+    # Carry through any extra top-level fields (prompt, channel, ...)
     for k, v in extras.items():
         if k not in {"createdAtMs", "schedule", "lastDurationMs",
                      "consecutiveFailures", "lastError", "runHistory",
@@ -383,6 +384,7 @@ def _try_local_store_cron_health_summary():
             "nextRunAtMs": next_run_ms,
             "consecutiveFailures": consecutive_failures,
             "lastError": last_error,
+            "model": job.get("model") or "",
             "costUsd": round(float(cost_usd), 6),
             "costSessionCount": cost_session_count,
             "monthlyProjectedCost": 0.0,
@@ -1187,6 +1189,7 @@ def api_cron_health_summary():
                 "nextRunAtMs": next_run_ms,
                 "consecutiveFailures": consecutive_failures,
                 "lastError": last_error,
+                "model": job.get("model") or "",
                 "costUsd": round(float(cost_usd), 6),
                 "costSessionCount": cost_session_count,
                 "monthlyProjectedCost": round(monthly_cost, 4),

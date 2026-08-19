@@ -269,12 +269,96 @@ def _start_tokens_equivalent(want: str, have: str, tol: int = 3) -> bool:
     return any(abs(x - y) <= tol for x in a for y in b)
 
 
+class PipeLineReader:
+    """Portable non-blocking line reader for a subprocess pipe.
+
+    ``select.select()`` on a pipe is POSIX-only — on Windows select works
+    on sockets exclusively and raises OSError, which crashed every
+    streaming reader (dashboard SSE log streams, daemon gateway-log
+    streamer, sandbox OCSF drain). A daemon reader thread pumping lines
+    into a queue gives the same wait-with-timeout semantics on every OS.
+    """
+
+    def __init__(self, stream) -> None:
+        import queue
+        import threading
+
+        self._q: "queue.Queue[str]" = queue.Queue()
+        self._eof = False
+
+        def _pump() -> None:
+            try:
+                for line in iter(stream.readline, ""):
+                    self._q.put(line)
+            except Exception:
+                pass
+            finally:
+                self._eof = True
+
+        threading.Thread(target=_pump, daemon=True).start()
+
+    def readline(self, timeout: float = 0) -> Optional[str]:
+        """Next line, or None when nothing arrived within ``timeout``.
+
+        ``timeout=0`` polls only lines already buffered (the select(..., 0)
+        drain idiom); a positive timeout blocks up to that long.
+        """
+        import queue
+
+        try:
+            if timeout and timeout > 0:
+                return self._q.get(timeout=timeout)
+            return self._q.get_nowait()
+        except queue.Empty:
+            return None
+
+    @property
+    def eof(self) -> bool:
+        """True once the stream ended AND every buffered line was consumed."""
+        return self._eof and self._q.empty()
+
+
 def is_alive(pid: int) -> bool:
-    """True iff ``pid`` is a live process we can address. Never raises."""
+    """True iff ``pid`` is a live process we can address. Never raises.
+
+    This is the ONLY sanctioned liveness probe. The POSIX ``os.kill(pid, 0)``
+    idiom is NOT a probe on Windows: signal 0 is ``CTRL_C_EVENT`` there, and
+    the call succeeds even for long-dead pids, so it reports everything as
+    alive (verified empirically on Windows 11 / CPython 3.12 — dead pid,
+    detached process, and group-leader all return without error). Windows
+    must ask the Win32 API instead.
+    """
     if pid is None or pid <= 0:
         return False
+    pid = int(pid)
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            ERROR_ACCESS_DENIED = 5
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if not handle:
+                # Access denied means the pid exists (another user/session);
+                # anything else (invalid parameter) means no such process.
+                return kernel32.GetLastError() == ERROR_ACCESS_DENIED
+            try:
+                exit_code = ctypes.c_ulong()
+                if not kernel32.GetExitCodeProcess(
+                    handle, ctypes.byref(exit_code)
+                ):
+                    return False
+                return exit_code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001
+            return False
     try:
-        os.kill(int(pid), 0)
+        os.kill(pid, 0)
         return True
     except ProcessLookupError:
         return False

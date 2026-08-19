@@ -7,10 +7,13 @@ name: OSS Golden Path (C1)
 # the user-reported bug (2026-05-17): "gateway token not passed for OSS,
 # never displays other screens." test_e2e_oss_all_tabs.py covers all 33
 # tabs; this is the first time it runs as a hard per-PR gate.
+# OTLP smoke (added 2026-08-13): POST /v1/traces -> DuckDB spans table ->
+# /api/spans round-trip (commit #4785). Runs before Playwright browser
+# install (~5s overhead, no browser needed).
 # Budget: 12 minutes wall-clock (raised from 8; Playwright chromium download
 # ~100 MB takes up to 4.5 min on a cold runner -- cache hit drops it to ~30 s;
 # C5 33-tab Playwright sweep adds ~90 s on top of the C1 9-tab sweep).
-# Tracking: vivekchand/clawmetry#1646 (C1), #3666 (C5)
+# Tracking: vivekchand/clawmetry#1646 (C1), #3666 (C5), #3970 (E2E epic)
 
 on:
   pull_request:
@@ -26,11 +29,17 @@ jobs:
     name: OSS golden path (wheel + OpenClaw + 9 tabs)
     runs-on: ubuntu-latest
     timeout-minutes: 12
+    # Trial-end hard block is default-ON — see clawmetry/trial_enforcement.py.
+    # The golden-path test drives /api/sessions and 8 other observability tabs
+    # without installing a license; opt out at the job level. Hard-block
+    # coverage stays in tests/test_trial_hard_block.py.
+    env:
+      CLAWMETRY_HARD_BLOCK: '0'
 
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -140,6 +149,13 @@ jobs:
       # Step 4 -- start the dashboard from the installed wheel (NOT from the
       # source checkout). This is the key C1 invariant: the installed package
       # must serve all tabs correctly, not just the in-repo version.
+      #
+      # The health-check loop now fails the step (exit 1) if the server never
+      # becomes ready, instead of silently exiting. Without this, a startup
+      # crash (e.g. ImportError on a broken branch) caused conftest.py to
+      # launch a second server from source, which also crashed, producing
+      # confusing ERROR-at-setup failures instead of a clear "server never
+      # started" message. (Tracking: vivekchand/clawmetry#3970)
       - name: Start dashboard from installed wheel
         run: |
           OPENCLAW_GATEWAY_TOKEN=ci-golden-token \
@@ -147,11 +163,18 @@ jobs:
             --port 8920 --no-debug \
             > /tmp/oss-golden-dashboard.log 2>&1 &
           echo "DASHBOARD_PID=$!" >> "$GITHUB_ENV"
+          ok=0
           for i in $(seq 1 30); do
             curl -sf -H "Authorization: Bearer ci-golden-token" \
-              http://localhost:8920/api/health && echo "Dashboard ready after ${i}s" && break
+              http://localhost:8920/api/health && echo "Dashboard ready after ${i}s" && ok=1 && break
             sleep 1
           done
+          [ "$ok" = "1" ] || {
+            echo "::error::Dashboard never became ready after 30s -- startup crash likely."
+            echo "::error::Tail of dashboard log:"
+            tail -30 /tmp/oss-golden-dashboard.log || true
+            exit 1
+          }
 
       # Step 5 -- wait for the daemon sync thread to ingest the seeded JSONL.
       # The dashboard starts a background sync loop on boot that watches
@@ -172,6 +195,22 @@ jobs:
             sleep 1
           done
 
+      # Step 5b -- OTLP trace ingest smoke (no Playwright required).
+      # Verifies the full pipeline: POST /v1/traces -> DuckDB spans table ->
+      # /api/spans returns the synthetic span. Catches regressions in the
+      # out-of-the-box OTLP receiver shipped in commit #4785 (2026-08-12).
+      # Runs BEFORE the Playwright browser install so it adds ~5s overhead
+      # regardless of whether the browser cache is warm.
+      - name: Run OTLP ingest E2E smoke
+        env:
+          CLAWMETRY_URL: http://localhost:8920
+          CLAWMETRY_TOKEN: ci-golden-token
+        run: |
+          /tmp/oss-golden/bin/python -m pytest \
+            tests/test_e2e_otlp_ingest.py \
+            -v --tb=short --junitxml=/tmp/junit-otlp.xml \
+            -m 'not quarantine'
+
       # Step 6 -- Playwright tab sweeps.
       - name: Install Playwright browsers
         run: /tmp/oss-golden/bin/python -m playwright install chromium --with-deps
@@ -185,7 +224,8 @@ jobs:
         run: |
           /tmp/oss-golden/bin/python -m pytest \
             tests/test_e2e_oss_golden_path.py \
-            -v --tb=short
+            -v --tb=short --junitxml=/tmp/junit-c1.xml \
+            -m 'not quarantine'
 
       # Restart the dashboard so C5 starts with a clean server that has no
       # accumulated SSE streams or WebSocket reconnect loops from C1. Each
@@ -193,7 +233,15 @@ jobs:
       # /api/health-stream) that may outlive their browser context; after 9
       # C1 tab loads the waitress thread pool fills up, causing page.goto
       # timeouts for later C5 tabs. A fresh process clears all stale threads.
+      #
+      # if: always() -- C5 must run even when C1 test assertions fail.
+      # A C1 regression (test failure) should NOT silently skip the 33-tab
+      # post-auth overlay sweep that is the direct fix for the user-reported
+      # gateway-token bug (2026-05-17). Previously, ANY C1 failure caused C5
+      # to be skipped, meaning auth regressions on broken branches were never
+      # caught. (Tracking: vivekchand/clawmetry#3970)
       - name: Restart dashboard (clean state for C5 sweep)
+        if: always()
         run: |
           kill "$DASHBOARD_PID" 2>/dev/null || true
           sleep 3
@@ -203,11 +251,18 @@ jobs:
             >> /tmp/oss-golden-dashboard.log 2>&1 &
           NEW_PID=$!
           echo "DASHBOARD_PID=$NEW_PID" >> "$GITHUB_ENV"
+          ok=0
           for i in $(seq 1 30); do
             curl -sf -H "Authorization: Bearer ci-golden-token" \
-              http://localhost:8920/api/health && echo "Dashboard ready (fresh) after ${i}s" && break
+              http://localhost:8920/api/health && echo "Dashboard ready (fresh) after ${i}s" && ok=1 && break
             sleep 1
           done
+          [ "$ok" = "1" ] || {
+            echo "::error::Dashboard did not restart cleanly after 30s."
+            echo "::error::Tail of dashboard log:"
+            tail -30 /tmp/oss-golden-dashboard.log || true
+            exit 1
+          }
 
       # C5: all 33 canonical dashboard tabs must render without any
       # auth-blocking overlay after the gateway token is injected into
@@ -215,14 +270,20 @@ jobs:
       # (2026-05-17): "gateway token not passed for OSS, never displays
       # other screens." Previously this test existed but was never run in
       # CI; now it is a hard gate that blocks PR merges on auth failures.
+      #
+      # if: always() -- run even when C1 tests fail (e.g. data regression).
+      # C5 is an independent dimension: a failing C1 session-data assertion
+      # does not imply C5's auth path is broken, so both must always gate.
       - name: Run C5 all-tabs post-auth sweep (33 tabs)
+        if: always()
         env:
           CLAWMETRY_URL: http://localhost:8920
           CLAWMETRY_TOKEN: ci-golden-token
         run: |
           /tmp/oss-golden/bin/python -m pytest \
             tests/test_e2e_oss_all_tabs.py \
-            -v --tb=short
+            -v --tb=short --junitxml=/tmp/junit-c5.xml \
+            -m 'not quarantine'
 
       - name: Dashboard and gateway logs on failure
         if: failure()
@@ -231,6 +292,15 @@ jobs:
           tail -150 /tmp/oss-golden-dashboard.log || true
           echo "==== openclaw gateway log ===="
           tail -100 /tmp/openclaw-logs/gateway.log || true
+
+      - name: Upload JUnit test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-c1c5-${{ github.run_id }}
+          path: /tmp/junit-*.xml
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload logs on failure
         if: failure()

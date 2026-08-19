@@ -34,8 +34,18 @@ _loaded = False
 # ``GET /api/extensions`` so operators can confirm clawmetry-pro is actually
 # wired in without scraping ``pip list``. A plugin that raised during load
 # is intentionally NOT recorded here — matches the warning-and-continue
-# posture of ``load_plugins`` itself.
+# posture of ``load_plugins`` itself; the failure lands in
+# :data:`_failed_plugins` instead so ``/api/extensions`` can surface it.
 _loaded_plugins: List[str] = []
+# Plugin entry points that raised during load, in attempted-load order.
+# Each entry is ``{"name": <ep.name>, "error": <str(exc)>}``. The
+# warning-and-continue posture of :func:`load_plugins` means these failures
+# never take down the host process, but an operator triaging
+# "why didn't clawmetry-pro load?" would otherwise have to tail daemon logs
+# — this mirror lets ``clawmetry status`` / ``GET /api/extensions`` report
+# the failure directly. Cleared on every :func:`load_plugins` re-entry so a
+# reloaded daemon does not report stale failures from an earlier pass.
+_failed_plugins: List[Dict[str, str]] = []
 
 
 def register(event: str, handler: Callable[[Dict[str, Any]], None]) -> None:
@@ -71,6 +81,47 @@ def emit(event: str, payload: Dict[str, Any] | None = None) -> None:
             logger.warning(
                 f"Extension handler {handler.__name__!r} raised on event {event!r}: {exc}"
             )
+
+
+def call(event: str, payload: Dict[str, Any] | None = None,
+         default: Any = None) -> Any:
+    """Ask handlers a question and return the first real answer.
+
+    :func:`emit` announces something that happened and discards return
+    values. ``call`` is the opposite: a handler's RETURN VALUE is the whole
+    point. The first handler to return a non-``None`` result wins; a handler
+    that raises is skipped and logged, exactly as in :func:`emit`, so one
+    broken plugin can never make the host raise.
+
+    With no handler registered — the common case, an OSS install with no
+    paid package — this returns ``default``. Callers therefore express
+    their own unlicensed behaviour by choosing that default, rather than
+    catching ImportError around a direct import of code that may not be
+    installed. Pick the SAFE value: a gate asking "should I arm?" passes
+    ``default=False`` so an unlicensed node stays in its pre-feature state.
+
+    ``None`` from a handler means "no opinion, ask the next one" and is
+    indistinguishable from not being registered. A handler that needs to
+    answer "no" must return a falsey value that is not ``None`` (``False``,
+    ``0``, ``{}``) — same convention as the runtime pre-tool gate handlers
+    in ``clawmetry/approvals.py``.
+    """
+    if payload is None:
+        payload = {}
+    with _lock:
+        handlers = list(_registry.get(event, []))
+    for handler in handlers:
+        try:
+            result = handler(payload)
+        except Exception as exc:
+            logger.warning(
+                f"Extension handler {getattr(handler, '__name__', handler)!r} "
+                f"raised on call {event!r}: {exc}"
+            )
+            continue
+        if result is not None:
+            return result
+    return default
 
 
 def _select_entry_points(group: str):
@@ -116,10 +167,33 @@ def load_plugins(app=None) -> None:
     if _loaded:
         return
     _loaded = True
-    # Reset the diagnostic mirror so a test that flips ``_loaded`` back to
-    # False and re-runs the loader doesn't see stale names from the prior pass.
+    # Reset the diagnostic mirrors so a test that flips ``_loaded`` back to
+    # False and re-runs the loader doesn't see stale names or stale failures
+    # from the prior pass.
     with _lock:
         _loaded_plugins.clear()
+        _failed_plugins.clear()
+
+    # Trial-end hard block: refuse to load ``clawmetry-pro`` (or any other
+    # paid-tier plugin) when the resolver reports an unpaid / expired
+    # entitlement AND the operator has not opted out. This is belt-and-braces
+    # on top of the Flask 402 gate — even if a paid blueprint somehow bypasses
+    # the request-level gate, it never got a chance to register in the first
+    # place. Fail-open on any internal error so a bug in the enforcement
+    # module can never brick a legitimate paying customer. Documented in
+    # ``docs/TRIAL_ENFORCEMENT.md``.
+    try:
+        from clawmetry import trial_enforcement as _te
+        if _te.is_hard_blocked():
+            logger.warning(
+                "clawmetry.extensions: hard-block active — skipping plugin "
+                "load until a valid license lands (upgrade at %s)",
+                _te.resolved_upgrade_url(),
+            )
+            return
+    except Exception as _te_exc:
+        logger.debug("hard-block probe failed, proceeding with plugin load: %s",
+                     _te_exc)
 
     try:
         eps = _select_entry_points("clawmetry.extensions")
@@ -153,6 +227,15 @@ def load_plugins(app=None) -> None:
             logger.info(f"Loaded ClawMetry extension plugin: {ep.name!r}")
         except Exception as exc:
             logger.warning(f"Failed to load extension plugin {ep.name!r}: {exc}")
+            # Record the failure so operators triaging "why didn't clawmetry-pro
+            # load?" can read it off ``failed_plugins()`` / ``/api/extensions``
+            # instead of tailing daemon logs. Only the exception's ``str`` is
+            # captured — no traceback, so bug-report-style paths / secrets in
+            # frames never leak into a diagnostic endpoint.
+            name = getattr(ep, "name", "") or ""
+            if name:
+                with _lock:
+                    _failed_plugins.append({"name": name, "error": str(exc)})
 
 
 def registered_events() -> List[str]:
@@ -176,7 +259,100 @@ def loaded_plugins() -> List[str]:
     in?" without scraping ``pip list`` or importing the package. Returns a
     SHALLOW COPY so callers can't mutate the registry. Names appear in load
     order; entries that raised during load are excluded — matching the
-    warning-and-continue posture of :func:`load_plugins`. Never raises.
+    warning-and-continue posture of :func:`load_plugins`. The excluded
+    entries land in :func:`failed_plugins` so an operator can still see them.
+    Never raises.
     """
     with _lock:
         return list(_loaded_plugins)
+
+
+def probe_plugins() -> List[Dict[str, Any]]:
+    """Side-effect-free discovery of ``clawmetry.extensions`` entry points.
+
+    Companion to :func:`loaded_plugins` / :func:`failed_plugins`, which only
+    carry state populated by :func:`load_plugins` inside the process that
+    called it. In the sync daemon and the dashboard that's fine — both call
+    ``load_plugins`` at startup. But ``clawmetry status`` (and the ``clawmetry
+    extensions`` CLI sibling) run as short-lived processes that never call
+    ``load_plugins``, so the two mirrors always read empty there. Operators
+    triaging "did ``clawmetry-pro`` install correctly?" from the CLI got no
+    signal beyond the disk-marker check in :func:`clawmetry.license._pro_installed_version`,
+    which only reports whether the wheel was extracted — a broken import in
+    the pro package (a downgrade to an incompatible ``clawmetry`` core, a
+    partial extract that lost a module, a mismatched entry-point path) would
+    still show green on disk while the plugin silently never loaded.
+
+    This function bridges that gap by enumerating the entry points and
+    calling ``ep.load()`` on each — which imports the target callable but
+    does NOT invoke it. So a plugin that would raise inside
+    ``register_all()`` still reports ``importable: True`` here (the
+    invocation happens in :func:`load_plugins`, not in this probe). That's
+    the intent: the probe answers "would ClawMetry try to load this on the
+    next dashboard/sync start?" without running any plugin code.
+
+    Returned rows are dicts::
+
+        {"name": "<ep.name>", "value": "<ep.value>", "importable": bool,
+         "error": "<str(exc)>" | None}
+
+    ``value`` is the ``module:attr`` string from the entry point (useful for
+    telling apart two entries with the same name from different packages).
+    ``error`` is populated only when ``ep.load()`` raises; only the
+    exception's ``str`` is captured — no traceback — matching the same
+    posture as :func:`failed_plugins` so paths / secrets in frames never
+    leak into ``clawmetry status --json`` or the ``/api/extensions`` probe.
+
+    Never raises. If entry-point enumeration itself blows up (e.g. a
+    corrupt distribution metadata file), returns ``[]`` and logs the
+    failure at warning level — the caller sees an empty list, same
+    contract as every other diagnostic helper on this module.
+    """
+    try:
+        eps = _select_entry_points("clawmetry.extensions")
+    except Exception as exc:
+        logger.warning("probe_plugins: entry-point enumeration failed: %s", exc)
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for ep in eps:
+        name = getattr(ep, "name", "") or ""
+        value = getattr(ep, "value", "") or ""
+        row: Dict[str, Any] = {
+            "name": name,
+            "value": value,
+            "importable": False,
+            "error": None,
+        }
+        try:
+            ep.load()
+            row["importable"] = True
+        except Exception as exc:
+            row["error"] = str(exc)
+        rows.append(row)
+    return rows
+
+
+def failed_plugins() -> List[Dict[str, str]]:
+    """Entry-point plugins that raised during load, in attempted-load order.
+
+    Diagnostic companion to :func:`loaded_plugins`. Each entry is
+    ``{"name": <ep.name>, "error": <str(exc)>}``. The
+    warning-and-continue posture of :func:`load_plugins` means a broken
+    plugin never takes down the host process, but until this helper existed
+    the only way to know a plugin had *tried and failed* was tailing daemon
+    logs — a bad experience when an operator installs ``clawmetry-pro``,
+    restarts the daemon, and sees ``loaded_plugins() == []`` with no obvious
+    signal for whether the wheel is even installed. Now the pair of
+    ``loaded_plugins()`` + ``failed_plugins()`` answers the triage question
+    directly.
+
+    Returns a SHALLOW COPY of the per-entry dicts so callers can freely
+    mutate them without corrupting the registry. Entries appear in the
+    order the loader attempted them. Cleared on every :func:`load_plugins`
+    re-entry so a reloaded daemon does not report stale failures. Only the
+    exception's ``str`` is captured — no traceback — so paths / secrets in
+    frames never leak into ``GET /api/extensions``. Never raises.
+    """
+    with _lock:
+        return [dict(entry) for entry in _failed_plugins]

@@ -73,6 +73,39 @@ PROVIDER_MAP: dict[str, dict] = {
         "input_per_1m": 2.50,
         "output_per_1m": 10.00,
     },
+    "api.x.ai": {
+        "name": "xai",
+        # grok-4 baseline; overrides below cover the mini / code-fast tiers
+        "input_per_1m": 3.00,
+        "output_per_1m": 15.00,
+    },
+    "api.kimi.com": {
+        "name": "moonshot",
+        # kimi-k2.6 baseline (cache-MISS input), per
+        # platform.kimi.ai/docs/pricing/* (2026-08-18); overrides below cover
+        # the k3 / k2.7-code / k2.5 / moonshot-v1 tiers. Cache-hit input is
+        # ~6x cheaper and is not billed here — callers pass uncached input, so
+        # a cached-heavy session is under-, never over-charged.
+        "input_per_1m": 0.95,
+        "output_per_1m": 4.00,
+    },
+    "api.moonshot.ai": {
+        "name": "moonshot",
+        "input_per_1m": 0.95,
+        "output_per_1m": 4.00,
+    },
+    "api.moonshot.cn": {
+        "name": "moonshot",
+        "input_per_1m": 0.95,
+        "output_per_1m": 4.00,
+    },
+    "api.deepseek.com": {
+        "name": "deepseek",
+        # deepseek-v4-flash baseline, per api-docs.deepseek.com/quick_start/
+        # pricing (2026-08-14); overrides below cover the pro tier
+        "input_per_1m": 0.14,
+        "output_per_1m": 0.28,
+    },
 }
 
 # Model-specific overrides (provider, model_prefix) -> (input_per_1m, output_per_1m)
@@ -121,6 +154,38 @@ MODEL_OVERRIDES: dict[tuple[str, str], tuple[float, float]] = {
     ("mistral", "mistral-medium"): (0.70, 2.10),
     ("mistral", "mistral-large"): (2.00, 6.00),
     ("mistral", "codestral"): (0.20, 0.60),
+    # xAI Grok family, per x.ai/pricing (2026-08). Longest-prefix wins in
+    # _get_rates so "grok-4-latest" hits "grok-4"; "grok-code-fast-1" hits
+    # its own dedicated entry rather than falling through to the grok-4 rate.
+    ("xai", "grok-4"): (3.00, 15.00),
+    ("xai", "grok-4-heavy"): (3.00, 15.00),
+    ("xai", "grok-4-latest"): (3.00, 15.00),
+    ("xai", "grok-3"): (3.00, 15.00),
+    ("xai", "grok-3-latest"): (3.00, 15.00),
+    ("xai", "grok-3-mini"): (0.30, 0.50),
+    ("xai", "grok-code-fast-1"): (0.20, 1.50),
+    ("xai", "grok-2"): (2.00, 10.00),
+    ("xai", "grok-2-vision"): (2.00, 10.00),
+    ("xai", "grok-2-latest"): (2.00, 10.00),
+    # DeepSeek official API, per api-docs.deepseek.com/quick_start/pricing
+    # (2026-08-14; cache-miss input rates — cache-hit input is ~50x cheaper,
+    # so callers that pass uncached input only slightly underbill). Note the
+    # docs announce peak/off-peak billing from 2026-08-16 (off-peak = half);
+    # these are the peak rates.
+    # Moonshot / Kimi, per platform.kimi.ai/docs/pricing/chat-* (2026-08-18;
+    # cache-MISS input rates — cache-hit input is $0.30 / $0.19 / $0.16 / $0.10
+    # respectively). _get_rates picks the LONGEST matching prefix, so
+    # "kimi-k2.7-code-highspeed" beats "kimi-k2.7-code".
+    ("moonshot", "kimi-k3"): (3.00, 15.00),
+    ("moonshot", "kimi-k2.7-code"): (0.95, 4.00),
+    ("moonshot", "kimi-k2.7-code-highspeed"): (1.90, 8.00),
+    ("moonshot", "kimi-k2.6"): (0.95, 4.00),
+    ("moonshot", "kimi-k2.5"): (0.60, 3.00),
+    ("moonshot", "moonshot-v1-8k"): (0.20, 2.00),
+    ("moonshot", "moonshot-v1-32k"): (1.00, 3.00),
+    ("moonshot", "moonshot-v1-128k"): (2.00, 5.00),
+    ("deepseek", "deepseek-v4-flash"): (0.14, 0.28),
+    ("deepseek", "deepseek-v4-pro"): (0.435, 0.87),
 }
 
 
@@ -256,6 +321,11 @@ def provider_for_model(model: str) -> str:
     # treating it as free/local.
     if "mistral" in m or "mixtral" in m or "codestral" in m:
         return "mistral"
+    # Ollama `name:tag` format (e.g. qwen3:8b, deepseek-r1:latest). Hosted
+    # API ids never use colon-tag without a provider prefix; the colon with no
+    # slash is a strong signal that the model is running locally on Ollama.
+    if ":" in m and "/" not in m:
+        return "local"
     return ""
 
 
@@ -368,6 +438,9 @@ TTS_PROVIDER_RATES: dict[str, float] = {
     "azure":      0.016,   # Azure Cognitive Services Neural TTS
     "amazon":     0.016,   # Amazon Polly Neural voices
     "polly":      0.016,
+    "fish-audio": 0.015,   # Fish Audio S2.1 hosted streaming TTS (~$0.015/1K chars, #4429)
+    "fish":       0.015,   # Short alias
+    "fish-s2-pro": 0.0,    # Fish S2 Pro local reference-voice (self-hosted, no per-call API cost)
 }
 
 

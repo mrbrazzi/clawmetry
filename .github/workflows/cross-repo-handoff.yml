@@ -27,10 +27,9 @@ jobs:
 
       # CLOUD_REPO_PAT is NOT exposed to pull_request runs from a fork (GitHub
       # withholds repo secrets from fork PRs to prevent exfiltration). Without it
-      # the private clawmetry-cloud checkout below cannot authenticate, so this
-      # cross-repo test can only run on same-repo PRs and on push to main. Detect
-      # that here and skip the cloud-dependent steps (job still goes green) so a
-      # fork contributor's PR is not blocked by an inaccessible private repo.
+      # neither clawmetry-cloud nor clawmetry-landing (both private) can be
+      # checked out. All four C4 tiers (T1-T4) still run via inline stubs;
+      # the private checkouts provide higher-fidelity T3/T4 when PAT is present.
       - name: Detect cloud-repo access
         id: access
         env:
@@ -40,8 +39,19 @@ jobs:
             echo "available=true" >> "$GITHUB_OUTPUT"
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=C4 skipped (fork PR)::CLOUD_REPO_PAT is not available to PRs from forks, so the private clawmetry-cloud repo cannot be checked out. The cross-repo handoff test is skipped on this run; it still runs on same-repo PRs and on push to main."
+            echo "::notice title=C4 cloud checkout unavailable::CLOUD_REPO_PAT is not set (fork PR or secret not configured). T2/T3/T4 will use inline stubs -- all four tiers still run."
           fi
+
+      # clawmetry-landing is a private repo -- requires CLOUD_REPO_PAT (which
+      # covers all repos owned by vivekchand). Gated on access.available so fork
+      # PRs skip gracefully; the test falls back to its inline stub in that case.
+      - name: Checkout clawmetry-landing
+        if: steps.access.outputs.available == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: vivekchand/clawmetry-landing
+          token: ${{ secrets.CLOUD_REPO_PAT }}
+          path: landing
 
       # Cloud repo provides run_cloud.py stub + DaemonSim wire-format simulator.
       - name: Checkout clawmetry-cloud
@@ -59,7 +69,7 @@ jobs:
           import pathlib
           p = pathlib.Path("cloud/tests/e2e_browser/run_cloud.py")
           if not p.exists():
-              print("run_cloud.py not found — skipping patch")
+              print("run_cloud.py not found -- skipping patch")
               exit(0)
           t = p.read_text()
           t = t.replace(
@@ -73,42 +83,92 @@ jobs:
           print("patched _throttle_patched: added node_id kwarg")
           EOF
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
-      - name: Install deps
-        if: steps.access.outputs.available == 'true'
+      - name: Install base deps
         run: |
           python -m pip install --upgrade pip
-          # Install only what the test needs (avoids duckdb version-pin in requirements.txt)
-          pip install flask pytest requests cryptography
-          # Cloud deps (psycopg2 is never called -- DB is monkey-patched --
-          # but it must be importable for 'import db' to succeed)
+          pip install flask pytest requests cryptography waitress
+
+      - name: Install cloud deps
+        if: steps.access.outputs.available == 'true'
+        run: |
+          # psycopg2 must be importable (DB is monkey-patched, never called)
           pip install psycopg2-binary
           pip install -r cloud/requirements.txt || true
-          pip install waitress
 
       - name: Run C4 cross-repo handoff
-        if: steps.access.outputs.available == 'true'
         env:
           CLAWMETRY_E2E_STUB_AUTH: "1"
+          LANDING_CHECKOUT_PATH: ${{ github.workspace }}/landing/clawmetry-landing
         run: |
           cd "${{ github.workspace }}"
           python -m pytest oss/tests/test_e2e_cross_repo_handoff.py \
-            -v --tb=short
+            -v --tb=short \
+            --junitxml=/tmp/junit-c4-${{ github.run_id }}.xml
+
+      # Post a Markdown fidelity table to the Actions job summary so every
+      # PR reviewer can see at a glance whether C4 ran with real apps or
+      # inline stubs. In stub mode a one-liner call-to-action links to the
+      # tracking issue so the gap is visible without digging into logs.
+      # Tracking: vivekchand/clawmetry#3970 (C4)
+      - name: Write C4 fidelity summary
+        if: always()
+        run: |
+          {
+            echo "## C4 Cross-Repo Handoff: Fidelity Report"
+            echo ""
+            if [ "${{ steps.access.outputs.available }}" = "true" ]; then
+              echo "**Mode: REAL APPS** -- CLOUD_REPO_PAT configured"
+              echo ""
+              echo "| Tier | What was tested |"
+              echo "|------|------------------|"
+              echo "| T1 | Real clawmetry-landing (run_landing.py) |"
+              echo "| T2 | Real clawmetry-cloud (run_cloud.py) |"
+              echo "| T3 | Real DaemonSim from cloud checkout |"
+              echo "| T4 | Real DaemonSim + AES-256-GCM cache_push |"
+            else
+              echo "**Mode: STUB** -- CLOUD_REPO_PAT not set (fork PR or secret not configured)"
+              echo ""
+              echo "| Tier | What was tested | Full-fidelity equivalent |"
+              echo "|------|-----------------|-------------------------|"
+              echo "| T1 | Inline landing stub | Real app via run_landing.py |"
+              echo "| T2 | Inline cloud stub | Real app via run_cloud.py |"
+              echo "| T3 | InlineDaemonSim | Real DaemonSim from cloud checkout |"
+              echo "| T4 | InlineDaemonSim + cache_push | Real DaemonSim + AES-256-GCM payload |"
+              echo ""
+              echo "> **To upgrade C4 to real-apps mode:** set the \`CLOUD_REPO_PAT\` repository"
+              echo "> secret (Contents read on clawmetry-cloud + clawmetry-landing)."
+              echo "> See [tracking issue #3970](https://github.com/vivekchand/clawmetry/issues/3970)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload JUnit results
+        if: always() && steps.access.outputs.available == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-c4-${{ github.run_id }}
+          path: /tmp/junit-c4-${{ github.run_id }}.xml
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Dump server logs on failure
         if: failure()
         run: |
           echo "=== cloud server log ==="
           cat /tmp/c4-cloud.log 2>/dev/null | tail -200 || true
+          echo "=== landing server log ==="
+          cat /tmp/c4-landing.log 2>/dev/null | tail -200 || true
 
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: c4-handoff-logs
-          path: /tmp/c4-cloud.log
+          path: |
+            /tmp/c4-cloud.log
+            /tmp/c4-landing.log
           if-no-files-found: warn
           retention-days: 7
